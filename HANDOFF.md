@@ -1,6 +1,66 @@
-# Handoff notes (2026-10-08, end of third session)
+# Handoff notes (2026-10-08, end of fourth session)
 
 Read this first if you are a new agent (or future me) picking up Layover.
+
+## Fourth session (evening): the T-pose fix is implemented and running; needs the user's eyes
+
+**What was built (committed as "Spider-Man 2 T-pose fix"):** `shims/d3d12shim/sm2_skin.c`, a new module
+of the d3d12 shim, on by default for Spider-Man2.exe. It keeps every GPU-skinned model's GPU data in
+the first 1 GB of the 2046 MB ManagedBuffer pool so the 4-byte typed views (Metal limit 2^28
+elements) can read it. Mechanism, all through the game's own allocator:
+- Inline detours (jmp rel32 to trampolines allocated below the exe image; `install_hook` checks the
+  expected 5 bytes first) on: the model handler's "data arrived" step exe+0x2b24750 (args: mgr,
+  model, slot), `D3DBufferManager::CreateSubHeap` exe+0x2c5a0d0, `AllocateBuffer` exe+0x2c59d80,
+  `FreeBuffer` exe+0x2c5a860. No INT3 logpoints any more; the hooks are stable at full speed.
+- At the game's first CreateSubHeap (its 526 MB impostor heap, right after pool creation) we first
+  create our own 640 MB subheap (pool offset [132 MB, 772 MB)), then allocate a temporary "plug"
+  that fills up to 1 GB so the impostor heap lands at [1024 MB, 1550 MB); the plug is freed at the
+  next AllocateBuffer. Resulting layout: [0,132) small allocs, [132,772) skinned models, [772,1024)
+  general carve, [1024,1550) impostors, [1550,2046) general carve.
+- Model loading pre-allocates a blob per model before the data is read (nothing says "skinned"
+  there). The loader DMA's the asset's GPU segment into a CPU mirror of the pool ([mgr+0xb20] +
+  offset). When the data has arrived (exe+0x2b24750) the CPU segment (a DAT1 section table) is
+  loaded and the blob is NOT yet uploaded: the function registers subsets from the blob's mirror
+  address and then calls UploadToGpu. Our pre-hook looks for section tag 0xc5354b60 ("Model Skin
+  Data"; comes with joints 0x15df9d3b and skin batches 0xdcc88a19); if present and the blob ends
+  above 1 GB, it allocates a new blob from our subheap (AllocateBuffer with the heap as preferred
+  D3DHeapAlloc), memcpy's the mirror bytes, frees the old record (deferred, exe+0x2c5a800) and
+  patches slot+0x90 (IABuffer*) and [slot+0x28]+0x18 (mirror address). Frees resolve the owning
+  allocator by address, so relocated blobs free back into our heap.
+- NOT skinned-flag based: the "Model Built" flags word (first qword of section 0x283d0383) has bit 1
+  = skinned only after the build; at arrival time it is never set. The tag test is what works.
+
+**Measured (run 6, save loaded, standing in the city):** 972 skinned of 11656 model arrivals; 412
+moved, 560 already below 1 GB, 0 failed. Live bytes: small 126/132 MB, skin heap 299/640 MB (275
+blobs), carve-low 251/252, impostor 69 (high-water 174) of 526, carve-high 413/496. Stable at
+~79 fps for 10+ minutes, no minidumps. The pool's "high-water 2045 MB" line is just the top carve
+region being used; when the main allocator is exhausted the game's AllocSmall falls back to the
+subheaps, so the skin heap's spare space is not lost.
+
+**Not yet verified:** the user has not seen this build (they left; the earlier runs they saw had
+the flag-bit detection that matched nothing). Verify by eye: main menu characters, then the city.
+Also check distant buildings (impostor heap now above 1 GB; if they look wrong, try
+`LAYOVER_PLUG=0` with `LAYOVER_IMPOSTOR_MB=320`, which keeps impostors low but caps them; the
+observed impostor request was 416 MB in run 4, so expect trouble there).
+
+**Knobs (d3d12shim.env in the prefix's windows/system32, or env):** LAYOVER_SKIN_MB (default 640,
+0 = off), LAYOVER_IMPOSTOR_MB (0 = don't cap), LAYOVER_PLUG (1), LAYOVER_SKIN_LOG (1 = per-model
+lines, 2 = survey of every model: name, flags, size, offset, section tags). Stats every 5 s in the
+`pool:` line plus a `live MB:` line per region (from the manager's record table at [mgr+0x538],
+index allocator at mgr+0x510 with capacity @+0x18 / used @+0x1c).
+
+**Driving the game without the user:** `scratch drive.sh` pattern (see tools/dev/drive.sh): launch
+`start steam://rungameid/2651280` via run_in_prefix.py --no-shim, poll winlist.exe for class
+GameNxApp, `sendkey.exe --focus GameNxApp ENTER` (Play), wait for "[Save] Processing Slot 1" in
+the game log (main menu), then a plain ENTER loads the save (Continue is the default item). A
+kill with pkill does not block the next launch. Screenshots: the game's window is a `wine`
+1728x1079 window (list with tools/dev/wincap, Swift) but `screencapture -l` fails without Screen
+Recording permission, so visuals still need the user.
+
+**Corrections to earlier notes:** the "four reserved class subheaps 32/32/96/416 MB" never run in
+this configuration (only one CreateSubHeap call happens: the impostor heap), which is why
+LAYOVER_SUBHEAP_MB had no effect. The stock layout is [0,128) small region, [128,654) impostor
+heap, carve from ~658 MB.
 
 ## Third session (evening): what changed, what was learned, what is next
 
