@@ -1,0 +1,1446 @@
+#!/usr/bin/env python3
+"""
+Layover - play Windows Steam games on an Apple Silicon Mac, even at 30,000 ft.
+
+Our own launcher built on free, open components:
+  * Wine 10.0 (Sikarugir build by Gcenx, with Highball's msync/focus/audio fixes),
+    runs x86_64 Windows apps under Rosetta 2
+  * DXMT       Direct3D 10/11 -> Metal (Highball fork of 3Shain/dxmt)
+  * D3DMetal   Apple's Direct3D 11/12 -> Metal from the Game Porting Toolkit
+               (non-commercial license; shipped inside the Sikarugir runtime bundle)
+  * Windows Steam client installed inside a Wine prefix
+
+Everything lives in ~/Library/Application Support/Layover. Delete that folder
+to uninstall completely. No sudo, nothing touches /usr or /Library.
+
+Usage:  layover <command> [options]      (run `layover help` for the list)
+"""
+
+import argparse
+import datetime as _dt
+import hashlib
+import json
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.request
+
+APP_NAME = "Layover"
+VERSION = "0.1.0"
+
+HOME = os.path.expanduser("~")
+ROOT = os.path.join(HOME, "Library", "Application Support", APP_NAME)
+CACHE = os.path.join(ROOT, "downloads")
+ENGINES = os.path.join(ROOT, "engines")
+RENDERERS = os.path.join(ROOT, "renderers")
+PREFIX = os.path.join(ROOT, "prefixes", "steam")
+LOGS = os.path.join(ROOT, "logs")
+CONFIG_PATH = os.path.join(ROOT, "config.json")
+TOOLS = os.path.join(ROOT, "tools")
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+# Pinned components, taken from Highball's engine manifest x64-sikarugir10.0_6-r19
+# (github.com/gauthierpiarrette/highball, spike/engines; that project's default engine, where
+# Windows Steam is verified). Every archive is a public GitHub release asset; the sha256 is
+# checked before anything is unpacked.
+ENGINE_ID = "sikarugir10.0_6"
+COMPONENTS = {
+    "wine": {"label": "Wine 10.0 (Sikarugir build by Gcenx)", "url": 'https://github.com/Sikarugir-App/Engines/releases/download/v1.0/WS12WineSikarugir10.0_6.tar.xz', "sha256": '9da7ee0cbf386522f3a9906943726d9c3c125dbbd9ab120e3cde80e88d6091b2', "size": 166304096},
+    "runtime": {"label": "runtime libraries + D3DMetal 3.0 (Sikarugir Template 1.0.11)", "url": 'https://github.com/Sikarugir-App/Wrapper/releases/download/v1.0/Template-1.0.11.tar.xz', "sha256": '9fa15479e7ff6abd99c1d07be285fb95f41fc6991586502427152b1f7d6ccb8a', "size": 84533420},
+    "dxmt": {"label": "DXMT (Highball fork, 2026-09-30)", "url": 'https://github.com/gauthierpiarrette/highball-engine/releases/download/dxmt-highball-20260930T161516Z-a444716/dxmt-highball-20260930T161516Z-a444716.tar.gz', "sha256": '96feaf5d98d3c6cdc3edea9503e2891d435df8d5bfdf7d3f6998a56ec62bbd58', "size": 18923969},
+    "moltenvk": {"label": "MoltenVK 1.4.1 (Highball patch)", "url": 'https://github.com/gauthierpiarrette/highball/releases/download/engine-components/moltenvk-1.4.1-shadow-import-1-x86_64.tar.gz', "sha256": 'fbed7b80d6dc2aeaba6fa7047c1fe64827d5004c28029fb43c2bc34f80c35228', "size": 1674937},
+    "msync": {"label": "msync leak fix for wineserver/ntdll (Highball)", "url": 'https://github.com/gauthierpiarrette/highball-engine/releases/download/wine10-msync-20261001/wine10-msync-20261001.tar.xz', "sha256": 'c5f47326fab52d92bd072225c385365da12e615ac2b732dd51c6d085570fcac9', "size": 434740},
+    "winemac": {"label": "Mac driver focus fix (Highball)", "url": 'https://github.com/gauthierpiarrette/highball-engine/releases/download/winemac-focus-20260930/winemac-focus-20260930.tar.xz', "sha256": '0192214d7d5c7cc8acd13dcacb0c27e8313ef0c64c51b91a93deff0a851a8974', "size": 162192},
+    "audiobuf": {"label": "audio buffer fix (Highball)", "url": 'https://github.com/gauthierpiarrette/highball-engine/releases/download/audiobuf-20261001/audiobuf-20261001.tar.xz', "sha256": '037da88d5da0226b3e06778a2038a40d13bb278b8ff859b07eb0261b63a6f268', "size": 2232},
+}
+STEAM_SETUP_URL = "https://cdn.fastly.steamstatic.com/client/installer/SteamSetup.exe"
+
+ENGINE_DIR = os.path.join(ENGINES, ENGINE_ID)
+WINE_RES = os.path.join(ENGINE_DIR, "engine")            # bin/, lib/, share/
+FRAMEWORKS = os.path.join(ENGINE_DIR, "frameworks")       # dylibs, GStreamer, MoltenVK
+ENGINE_RENDERERS = os.path.join(ENGINE_DIR, "renderers")  # dxmt/wine, d3dmetal/{wine,external}
+WINE_BIN = os.path.join(WINE_RES, "bin")
+WINE = os.path.join(WINE_BIN, "wine")
+WINESERVER = os.path.join(WINE_BIN, "wineserver")
+LEGACY_ENGINES = [os.path.join(ENGINES, "wine-staging-11.18"), os.path.join(ENGINES, "cx26.3")]  # earlier engines; removed by setup
+
+STEAM_DIR_WIN = r"C:\Program Files (x86)\Steam"
+STEAM_DIR = os.path.join(PREFIX, "drive_c", "Program Files (x86)", "Steam")
+STEAM_EXE = os.path.join(STEAM_DIR, "steam.exe")
+NATIVE_STEAM_DIR = os.path.join(HOME, "Library", "Application Support", "Steam")
+NATIVE_STEAM_APP = "/Applications/Steam.app"
+
+RENDERER_CHOICES = ("auto", "dxmt", "d3dmetal", "wined3d")
+RENDERER_HELP = {
+    "auto": "Pick per game: D3DMetal if the game uses DirectX 12, else DXMT (the default).",
+    "dxmt": "DirectX 10/11 → Metal. Best for most DirectX 11 games.",
+    "d3dmetal": "Apple's DirectX 11/12 → Metal. Needed for DirectX-12-only games.",
+    "wined3d": "Wine's own OpenGL path. Slow; last resort when a game shows nothing.",
+}
+
+DEFAULT_CONFIG = {
+    "renderer": "auto",        # auto | dxmt | d3dmetal | wined3d
+    "msync": True,             # Mach semaphore sync (faster), with esync as fallback
+    "metal_hud": False,        # Apple's FPS overlay
+    "advertise_avx": True,     # Rosetta: tell games AVX exists (needed by some engines)
+    "retina": False,           # High-res mode (crisper, but some games mis-scale)
+    # -cef-disable-gpu: Steam's web UI can't GPU-render under Wine (otherwise 15 crash/retry cycles).
+    # -noverifyfiles etc: stop Steam's startup self-check from overwriting the web-helper wrapper
+    # (see WRAPPER below). `layover update-steam` runs an update with these off.
+    "steam_args": ["-cef-disable-gpu"],
+    "fps_cap": 0,              # cap frame rate (0 = off); smoother + cooler on battery
+    "audiobuf": True,          # insert Highball's CoreAudio buffer fix (off if it causes trouble)
+    "webhelper_wrapper": False,  # single-process CEF wrapper: needed on the old Wine Staging engine, not on this one
+    "games": {},               # per-appid overrides: {"renderer": ..., "msync": ..., "fps_cap": ..., "env": {...}}
+}
+
+MICROSOFT_VID = 0x045E
+
+
+# --------------------------------------------------------------------------- helpers
+class C:
+    B = "\033[1m"; G = "\033[32m"; Y = "\033[33m"; R = "\033[31m"; D = "\033[2m"; X = "\033[0m"
+
+
+def tty():
+    return sys.stdout.isatty()
+
+
+def paint(s, col):
+    return f"{col}{s}{C.X}" if tty() else s
+
+
+def ok(msg): print(paint("  ✓ ", C.G) + msg)
+def warn(msg): print(paint("  ! ", C.Y) + msg)
+def bad(msg): print(paint("  ✗ ", C.R) + msg)
+def info(msg): print(paint("  · ", C.D) + msg)
+def head(msg): print("\n" + paint(msg, C.B))
+
+
+def die(msg, code=1):
+    bad(msg)
+    sys.exit(code)
+
+
+def run(cmd, **kw):
+    kw.setdefault("text", True)
+    kw.setdefault("capture_output", True)
+    return subprocess.run(cmd, **kw)
+
+
+def sh(cmd):
+    r = run(cmd)
+    return r.stdout.strip()
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                cfg.update(json.load(f))
+        except (OSError, ValueError) as e:
+            warn(f"config.json unreadable ({e}); using defaults")
+    return cfg
+
+
+def save_config(cfg):
+    os.makedirs(ROOT, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def ensure_dirs():
+    for d in (ROOT, CACHE, ENGINES, RENDERERS, LOGS, TOOLS, os.path.dirname(PREFIX)):
+        os.makedirs(d, exist_ok=True)
+
+
+# --------------------------------------------------------------------------- system facts
+def mac_version():
+    return sh(["sw_vers", "-productVersion"])
+
+
+def chip():
+    return sh(["sysctl", "-n", "machdep.cpu.brand_string"])
+
+
+def is_apple_silicon():
+    return sh(["uname", "-m"]) == "arm64"
+
+
+def rosetta_installed():
+    return subprocess.run(["/usr/bin/pgrep", "-q", "oahd"]).returncode == 0 or \
+        os.path.exists("/Library/Apple/usr/share/rosetta/rosetta")
+
+
+def free_disk(path=HOME):
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize
+
+
+def battery():
+    out = sh(["pmset", "-g", "batt"])
+    m = re.search(r"(\d+)%;\s*(\w[\w ]*?);", out)
+    return (int(m.group(1)), m.group(2)) if m else (None, None)
+
+
+def engine_ready():
+    return os.path.isfile(WINE) and os.access(WINE, os.X_OK)
+
+
+def engine_version():
+    if not engine_ready():
+        return None
+    return sh([WINE, "--version"])
+
+
+def steam_installed():
+    return os.path.isfile(STEAM_EXE)
+
+
+def prefix_running():
+    """True if wineserver for our prefix is alive."""
+    r = run(["pgrep", "-f", WINESERVER])
+    return r.returncode == 0
+
+
+def steam_running():
+    r = run(["pgrep", "-f", "steam.exe"])
+    return r.returncode == 0
+
+
+def native_steam_running():
+    r = run(["pgrep", "-x", "steam_osx"])
+    return r.returncode == 0
+
+
+# --------------------------------------------------------------------------- downloads
+def download(url, dest, expected_sha=None, label=None):
+    """Download with a progress line. Reuses the cached file if its hash matches."""
+    label = label or os.path.basename(dest)
+    if os.path.exists(dest) and (expected_sha is None or sha256(dest) == expected_sha):
+        ok(f"{label} already downloaded")
+        return dest
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = dest + ".part"
+    info(f"downloading {label}")
+    req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{VERSION}"})
+    with urllib.request.urlopen(req) as resp, open(tmp, "wb") as f:
+        total = int(resp.headers.get("Content-Length") or 0)
+        got = 0
+        last = 0
+        while True:
+            chunk = resp.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
+            got += len(chunk)
+            if tty() and (time.time() - last > 0.2):
+                pct = f"{got * 100 // total}%" if total else ""
+                sys.stdout.write(f"\r    {human(got)} / {human(total) if total else '?'} {pct}   ")
+                sys.stdout.flush()
+                last = time.time()
+    if tty():
+        sys.stdout.write("\r" + " " * 60 + "\r")
+    if expected_sha:
+        actual = sha256(tmp)
+        if actual != expected_sha:
+            os.remove(tmp)
+            die(f"{label}: checksum mismatch\n      expected {expected_sha}\n      got      {actual}\n"
+                "    The upstream file changed or the download was corrupted. Not installing it.")
+    os.replace(tmp, dest)
+    ok(f"{label} downloaded ({human(os.path.getsize(dest))})")
+    return dest
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def extract(archive, dest):
+    os.makedirs(dest, exist_ok=True)
+    # macOS tar handles .xz and .gz and keeps symlinks/permissions intact.
+    r = run(["tar", "-xf", archive, "-C", dest])
+    if r.returncode != 0:
+        die(f"extract failed: {r.stderr.strip()}")
+
+
+# --------------------------------------------------------------------------- renderer choice
+def game_uses_dx12(game):
+    """Look at the game's executables for a DirectX 12 import. Crude (string scan of the
+    import tables) but it is what other launchers do too, and it is cached per AppID."""
+    lib = game.get("library")
+    installdir = game.get("installdir")
+    if not lib or not installdir:
+        return None
+    root = os.path.join(os.path.dirname(lib), "steamapps", "common", installdir) if not lib.endswith("steamapps") else os.path.join(lib, "common", installdir)
+    if not os.path.isdir(root):
+        return None
+    hits = {"d3d12": False, "d3d11": False}
+    for dirpath, dirs, files in os.walk(root):
+        if dirpath[len(root):].count(os.sep) > 2:
+            dirs[:] = []
+            continue
+        for fn in files:
+            if not fn.lower().endswith(".exe"):
+                continue
+            fp = os.path.join(dirpath, fn)
+            try:
+                if os.path.getsize(fp) < 512 * 1024:
+                    continue
+                with open(fp, "rb") as f:
+                    blob = f.read(64 << 20).lower()
+            except OSError:
+                continue
+            if b"d3d12.dll" in blob:
+                hits["d3d12"] = True
+            if b"d3d11.dll" in blob:
+                hits["d3d11"] = True
+    if hits["d3d12"]:
+        return True
+    if hits["d3d11"]:
+        return False
+    return None
+
+
+def resolve_renderer(cfg, game=None, games=None):
+    """Turn 'auto' into a concrete renderer. With a specific game: that game's need. Without
+    one (plain `layover steam`): D3DMetal if any installed game needs DirectX 12, so that
+    launching from inside Steam's own UI works for everything installed."""
+    g = cfg["games"].get(str(game), {}) if game else {}
+    choice = g.get("renderer") or cfg.get("renderer") or "auto"
+    if choice != "auto":
+        return choice
+    games = games if games is not None else [x for x in all_games() if x["where"] == "windows"]
+    targets = [x for x in games if str(x["appid"]) == str(game)] if game else games
+    for x in targets:
+        cached = cfg["games"].get(x["appid"], {}).get("dx12")
+        if cached is None:
+            cached = game_uses_dx12(x)
+            if cached is not None:
+                cfg["games"].setdefault(x["appid"], {})["dx12"] = cached
+                save_config(cfg)
+        if cached:
+            return "d3dmetal"
+    return "dxmt"
+
+
+# --------------------------------------------------------------------------- wine plumbing
+def wine_env(cfg, game=None, extra=None):
+    """Environment for running anything in the Steam prefix.
+
+    Mirrors what Highball does for this engine: runtime dylibs come from frameworks/ via the
+    DYLD fallback paths, and a renderer is an overlay directory put in front of the engine's
+    own DLLs with WINEDLLPATH_PREPEND (a CrossOver feature this build keeps)."""
+    g = cfg["games"].get(str(game), {}) if game else {}
+    renderer = (extra or {}).pop("LAYOVER_RENDERER", None) or resolve_renderer(cfg, game)
+    if renderer not in RENDERER_CHOICES or renderer == "auto":
+        renderer = "dxmt"
+    msync = g.get("msync", cfg["msync"])
+    gst = os.path.join(FRAMEWORKS, "GStreamer.framework", "Versions", "1.0")
+    env = dict(os.environ)
+    env.update({
+        "WINEPREFIX": PREFIX,
+        "WINEDEBUG": "-all",
+        "WINE_LARGE_ADDRESS_AWARE": "1",
+        "GST_DEBUG": "1",
+        "DYLD_FALLBACK_FRAMEWORK_PATH": FRAMEWORKS,
+        "DYLD_FALLBACK_LIBRARY_PATH": FRAMEWORKS + ":" + os.path.join(gst, "lib"),
+        "GST_PLUGIN_PATH": os.path.join(gst, "lib", "gstreamer-1.0"),
+        "CX_FWD_COMPAT_GL_CTX": "1",
+        "DXMT_ALLOW_CROSS_PROCESS_SWAPCHAIN": "1",   # Steam overlay + DXMT
+        "MVK_CONFIG_LOG_LEVEL": "0",
+        "WINEDLLOVERRIDES": "winemenubuilder.exe=d",
+        "PATH": WINE_BIN + ":" + env.get("PATH", ""),
+    })
+    env["WINEMSYNC"] = "1" if msync else "0"
+    env["WINEESYNC"] = "0"
+    audiobuf = os.path.join(FRAMEWORKS, "libhbaudiobuf.dylib")
+    if cfg.get("audiobuf", True) and os.path.exists(audiobuf):
+        env["DYLD_INSERT_LIBRARIES"] = audiobuf   # caps CoreAudio buffer: fixes crackling at 48 kHz
+    if g.get("metal_hud", cfg["metal_hud"]):
+        env["MTL_HUD_ENABLED"] = "1"
+    if g.get("advertise_avx", cfg["advertise_avx"]):
+        env["ROSETTA_ADVERTISE_AVX"] = "1"
+    overlays = []
+    if renderer == "dxmt":
+        overlays = [os.path.join(ENGINE_RENDERERS, "dxmt", "wine")]
+    elif renderer == "d3dmetal":
+        ext = os.path.join(ENGINE_RENDERERS, "d3dmetal", "external")
+        overlays = [os.path.join(ENGINE_RENDERERS, "d3dmetal", "wine"), os.path.join(ENGINE_RENDERERS, "dxmt", "wine")]
+        env["CX_D3DMETALPATH"] = ext
+        env["DYLD_FALLBACK_LIBRARY_PATH"] += ":" + ext
+        env["DYLD_FALLBACK_FRAMEWORK_PATH"] += ":" + ext
+    if overlays:
+        env["WINEDLLPATH_PREPEND"] = ":".join(overlays)
+    fps = g.get("fps_cap", cfg.get("fps_cap", 0)) or 0
+    if fps and renderer in ("dxmt", "d3dmetal"):
+        env["DXMT_CONFIG"] = f"d3d11.preferredMaxFrameRate={fps};"
+        if renderer == "d3dmetal":
+            env["D3DM_MAX_FPS"] = str(fps)
+    env["LAYOVER_RENDERER"] = renderer
+    for k, v in (g.get("env") or {}).items():
+        env[k] = str(v)
+    if extra:
+        env.update(extra)
+    return env
+
+
+def wine(cfg, args, game=None, wait=True, log=None, extra_env=None, cwd=None):
+    env = wine_env(cfg, game, extra_env)
+    out = open(log, "ab") if log else subprocess.DEVNULL
+    p = subprocess.Popen([WINE] + args, env=env, stdout=out, stderr=subprocess.STDOUT,
+                         cwd=cwd, start_new_session=not wait)
+    if wait:
+        p.wait()
+        return p.returncode
+    return p
+
+
+def wineserver_wait(cfg):
+    subprocess.run([WINESERVER, "-w"], env=wine_env(cfg), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def wineserver_kill(cfg):
+    subprocess.run([WINESERVER, "-k"], env=wine_env(cfg), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def reg_add(cfg, key, name, value, kind="REG_SZ"):
+    return wine(cfg, ["reg", "add", key, "/v", name, "/t", kind, "/d", str(value), "/f"])
+
+
+def new_log(name):
+    os.makedirs(LOGS, exist_ok=True)
+    stamp = _dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    path = os.path.join(LOGS, f"{name}-{stamp}.log")
+    # keep the last 20 logs
+    old = sorted(p for p in os.listdir(LOGS) if p.endswith(".log"))
+    for p in old[:-20]:
+        try:
+            os.remove(os.path.join(LOGS, p))
+        except OSError:
+            pass
+    return path
+
+
+# --------------------------------------------------------------------------- engine assembly
+def renderer_installed(renderer):
+    if renderer == "auto":
+        return renderer_installed("dxmt") and renderer_installed("d3dmetal")
+    if renderer == "wined3d":
+        return engine_ready()
+    if renderer == "dxmt":
+        return os.path.isfile(os.path.join(ENGINE_RENDERERS, "dxmt", "wine", "x86_64-windows", "d3d11.dll"))
+    if renderer == "d3dmetal":
+        return os.path.isfile(os.path.join(ENGINE_RENDERERS, "d3dmetal", "wine", "x86_64-windows", "d3d12.dll")) and \
+            os.path.isdir(os.path.join(ENGINE_RENDERERS, "d3dmetal", "external", "D3DMetal.framework"))
+    return False
+
+
+def _same_file(a, b):
+    try:
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            return fa.read(1 << 16) == fb.read(1 << 16)
+    except OSError:
+        return False
+
+
+def assemble_engine():
+    """Download (cached) and lay out the engine the way Highball's installer does:
+         engines/<id>/engine/        Wine (bin, lib, share)  [+ patched wineserver, ntdll.so, winemac.so]
+         engines/<id>/frameworks/    runtime dylibs, GStreamer, MoltenVK, audiobuf
+         engines/<id>/renderers/     dxmt/wine, d3dmetal/{wine,external}
+    """
+    paths = {}
+    for key, comp in COMPONENTS.items():
+        paths[key] = download(comp["url"], os.path.join(CACHE, os.path.basename(comp["url"])), comp["sha256"], comp["label"])
+    staging = ENGINE_DIR + ".partial"
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(os.path.join(staging, "renderers"), exist_ok=True)
+    info("unpacking the engine (about a minute)")
+    for key in COMPONENTS:
+        extract(paths[key], os.path.join(staging, ".x-" + key))
+    x = lambda key, *rest: os.path.join(staging, ".x-" + key, *rest)
+    # Wine (Sikarugir engine tarballs wrap it in wswine.bundle/)
+    shutil.move(x("wine", "wswine.bundle"), os.path.join(staging, "engine"))
+    # runtime frameworks (+ D3DMetal) from the Sikarugir template
+    tpl = next(d for d in os.listdir(x("runtime")) if d.endswith(".app"))
+    shutil.move(x("runtime", tpl, "Contents", "Frameworks"), os.path.join(staging, "frameworks"))
+    d3dm = os.path.join(staging, "frameworks", "renderer", "d3dmetal")
+    if os.path.isdir(d3dm):
+        shutil.move(d3dm, os.path.join(staging, "renderers", "d3dmetal"))
+    shutil.rmtree(os.path.join(staging, "frameworks", "renderer"), ignore_errors=True)
+    i386 = os.path.join(staging, "renderers", "d3dmetal", "wine", "i386-windows")
+    if os.path.islink(i386):
+        os.remove(i386)   # pointed at a sibling renderer we dropped; 32-bit D3DMetal is not a thing anyway
+    # DXMT (Highball fork)
+    os.makedirs(os.path.join(staging, "renderers", "dxmt"), exist_ok=True)
+    shutil.move(x("dxmt", "highball"), os.path.join(staging, "renderers", "dxmt", "wine"))
+    # patched MoltenVK, audio buffer library, msync fix, Mac driver fix
+    shutil.copy2(x("moltenvk", "libMoltenVK.dylib"), os.path.join(staging, "frameworks", "libMoltenVK.dylib"))
+    shutil.copy2(x("audiobuf", "libhbaudiobuf.dylib"), os.path.join(staging, "frameworks", "libhbaudiobuf.dylib"))
+    shutil.copy2(x("msync", "wineserver"), os.path.join(staging, "engine", "bin", "wineserver"))
+    shutil.copy2(x("msync", "ntdll.so"), os.path.join(staging, "engine", "lib", "wine", "x86_64-unix", "ntdll.so"))
+    shutil.copy2(x("winemac", "winemac.so"), os.path.join(staging, "engine", "lib", "wine", "x86_64-unix", "winemac.so"))
+    os.chmod(os.path.join(staging, "engine", "bin", "wineserver"), 0o755)
+    # link runtime dylibs into engine/lib like Highball does (belt and braces next to DYLD fallback)
+    lib = os.path.join(staging, "engine", "lib")
+    for base in (os.path.join(staging, "frameworks"), os.path.join(staging, "frameworks", "GStreamer.framework", "Versions", "1.0", "lib")):
+        if not os.path.isdir(base):
+            continue
+        rel = os.path.relpath(base, lib)
+        for name in os.listdir(base):
+            if name.endswith(".dylib") and not os.path.lexists(os.path.join(lib, name)):
+                os.symlink(os.path.join(rel, name), os.path.join(lib, name))
+    for key in COMPONENTS:
+        shutil.rmtree(x(key), ignore_errors=True)
+    shutil.rmtree(ENGINE_DIR, ignore_errors=True)
+    os.rename(staging, ENGINE_DIR)
+    run(["xattr", "-dr", "com.apple.quarantine", ENGINE_DIR])
+    with open(os.path.join(ENGINE_DIR, "manifest.json"), "w") as f:
+        json.dump({"id": ENGINE_ID, "components": COMPONENTS, "assembled": _dt.datetime.now().isoformat()}, f, indent=2)
+
+
+# --------------------------------------------------------------------------- steam web-helper wrapper
+# Steam's UI is a Chromium (CEF) process. Under Wine on Apple Silicon its renderer paints
+# the window black and its network service trips over winsock. Forcing CEF into
+# "--disable-gpu --single-process" fixes both (finding from notpop/steam-on-m1-wine, MIT).
+# Steam ignores its own -cef-single-process flag nowadays, so we rename Valve's
+# steamwebhelper.exe to steamwebhelper_real.exe and drop in a tiny wrapper that adds the
+# flags and execs the real one. Steam's startup verification would restore the original,
+# hence the -noverifyfiles family of flags in steam_args.
+WRAPPER_SRC_DIR = os.path.join(HERE, "wrapper")
+WRAPPER_EXE = os.path.join(WRAPPER_SRC_DIR, "steamwebhelper.exe")
+WRAPPER_MAX_SIZE = 500_000   # Valve's helper is ~7 MB; ours is ~150 KB
+MINGW_GCC = "/opt/homebrew/bin/x86_64-w64-mingw32-gcc"
+
+
+WRAPPER_INSTALLED = os.path.join(TOOLS, "steamwebhelper.exe")
+
+
+def wrapper_binary():
+    """Path to the compiled wrapper. A copy is kept under Application Support because macOS
+    may refuse Terminal access to files in Documents (Files & Folders privacy); builds it with
+    mingw-w64 if no prebuilt copy exists."""
+    os.makedirs(TOOLS, exist_ok=True)
+    try:
+        if os.path.exists(WRAPPER_EXE) and 0 < os.path.getsize(WRAPPER_EXE) < WRAPPER_MAX_SIZE:
+            if not os.path.exists(WRAPPER_INSTALLED) or os.path.getsize(WRAPPER_INSTALLED) != os.path.getsize(WRAPPER_EXE):
+                shutil.copy2(WRAPPER_EXE, WRAPPER_INSTALLED)
+    except PermissionError:
+        if not os.path.exists(WRAPPER_INSTALLED):
+            warn("macOS blocked reading the wrapper from the Documents folder.")
+            warn("Allow Terminal in System Settings → Privacy & Security → Files and Folders → Documents, or run `layover setup` once from the original session.")
+    if os.path.exists(WRAPPER_INSTALLED):
+        return WRAPPER_INSTALLED
+    src = os.path.join(WRAPPER_SRC_DIR, "src", "steamwebhelper-wrapper.c")
+    if not os.path.exists(src):
+        return None
+    if not os.path.exists(MINGW_GCC):
+        info("installing the mingw-w64 cross compiler to build the Steam web-helper wrapper (one time, ~1.5 GB)")
+        subprocess.run(["brew", "install", "mingw-w64"])
+    if not os.path.exists(MINGW_GCC):
+        return None
+    r = run([MINGW_GCC, "-O2", "-municode", "-DUNICODE", "-D_UNICODE", "-o", WRAPPER_INSTALLED, src,
+             "-static", "-lshell32", "-mwindows"])
+    if r.returncode != 0:
+        warn("wrapper build failed: " + r.stderr[-400:])
+        return None
+    return WRAPPER_INSTALLED
+
+
+def install_webhelper_wrapper(quiet=True):
+    """Make sure every cef.win* dir has: steamwebhelper.exe = our wrapper, steamwebhelper_real.exe = Valve's.
+    Safe to call before every launch; it heals whatever state Steam's updater left behind."""
+    cef_root = os.path.join(STEAM_DIR, "bin", "cef")
+    if not os.path.isdir(cef_root):
+        return False
+    wrapper = wrapper_binary()
+    if not wrapper:
+        warn("no web-helper wrapper available; Steam's window may be black")
+        return False
+    done = False
+    for d in os.listdir(cef_root):
+        cef = os.path.join(cef_root, d)
+        target = os.path.join(cef, "steamwebhelper.exe")
+        real = os.path.join(cef, "steamwebhelper_real.exe")
+        if not os.path.isfile(target):
+            continue
+        target_is_valve = os.path.getsize(target) > WRAPPER_MAX_SIZE
+        real_is_valve = os.path.isfile(real) and os.path.getsize(real) > WRAPPER_MAX_SIZE
+        if target_is_valve:
+            # Steam restored/updated its helper: keep the newest Valve copy as _real.
+            shutil.move(target, real)
+            real_is_valve = True
+        if not real_is_valve:
+            warn(f"{d}: Valve's steamwebhelper is missing; run `layover update-steam` to restore it")
+            continue
+        if not os.path.isfile(target) or not _same_file(wrapper, target) or os.path.getsize(target) != os.path.getsize(wrapper):
+            shutil.copy2(wrapper, target)
+        done = True
+    if done and not quiet:
+        ok("Steam web-helper wrapper in place")
+    return done
+
+
+def remove_webhelper_wrapper():
+    cef_root = os.path.join(STEAM_DIR, "bin", "cef")
+    if not os.path.isdir(cef_root):
+        return
+    for d in os.listdir(cef_root):
+        cef = os.path.join(cef_root, d)
+        target = os.path.join(cef, "steamwebhelper.exe")
+        real = os.path.join(cef, "steamwebhelper_real.exe")
+        if os.path.isfile(real) and os.path.getsize(real) > WRAPPER_MAX_SIZE:
+            shutil.move(real, target)
+
+
+# --------------------------------------------------------------------------- steam / vdf
+def parse_vdf(text):
+    """Minimal Valve KeyValues parser (enough for appmanifest/loginusers/libraryfolders)."""
+    tokens = re.findall(r'"((?:[^"\\]|\\.)*)"|([{}])', text)
+    stack = [{}]
+    key = None
+    for s, b in tokens:
+        if b == "{":
+            new = {}
+            stack[-1][key] = new
+            stack.append(new)
+            key = None
+        elif b == "}":
+            stack.pop()
+        else:
+            if key is None:
+                key = s
+            else:
+                stack[-1][key] = s
+                key = None
+    return stack[0]
+
+
+def steam_libraries(steamapps):
+    libs = [steamapps] if os.path.isdir(steamapps) else []
+    lf = os.path.join(steamapps, "libraryfolders.vdf")
+    if os.path.exists(lf):
+        try:
+            with open(lf, errors="replace") as f:
+                data = parse_vdf(f.read()).get("libraryfolders", {})
+            for v in data.values():
+                if isinstance(v, dict) and v.get("path"):
+                    p = v["path"]
+                    if p.startswith("C:\\") or p.startswith("c:\\"):
+                        p = os.path.join(PREFIX, "drive_c", p[3:].replace("\\", "/"))
+                    p = os.path.join(p, "steamapps")
+                    if os.path.isdir(p) and os.path.realpath(p) not in map(os.path.realpath, libs):
+                        libs.append(p)
+        except OSError:
+            pass
+    return libs
+
+
+def installed_games(steamapps):
+    games = []
+    for lib in steam_libraries(steamapps):
+        if not os.path.isdir(lib):
+            continue
+        for fn in sorted(os.listdir(lib)):
+            if fn.startswith("appmanifest_") and fn.endswith(".acf"):
+                try:
+                    with open(os.path.join(lib, fn), errors="replace") as f:
+                        st = parse_vdf(f.read()).get("AppState", {})
+                except OSError:
+                    continue
+                flags = int(st.get("StateFlags", "0") or 0)
+                games.append({
+                    "appid": st.get("appid", fn[12:-4]),
+                    "name": st.get("name", "?"),
+                    "size": int(st.get("SizeOnDisk", "0") or 0),
+                    "ready": flags == 4,
+                    "flags": flags,
+                    "needs_update": bool(flags & (2 | 256 | 1024)) or flags not in (4,),
+                    "library": lib,
+                    "installdir": st.get("installdir", ""),
+                })
+    return games
+
+
+def all_games():
+    out = []
+    if steam_installed():
+        for g in installed_games(os.path.join(STEAM_DIR, "steamapps")):
+            g["where"] = "windows"
+            out.append(g)
+    if os.path.isdir(os.path.join(NATIVE_STEAM_DIR, "steamapps")):
+        for g in installed_games(os.path.join(NATIVE_STEAM_DIR, "steamapps")):
+            g["where"] = "mac"
+            out.append(g)
+    return out
+
+
+def find_game(query, games):
+    q = query.strip().lower()
+    exact = [g for g in games if g["appid"] == q or g["name"].lower() == q]
+    if exact:
+        return exact[0]
+    subs = [g for g in games if q in g["name"].lower()]
+    if len(subs) == 1:
+        return subs[0]
+    if not subs:
+        return None
+    print("  Which one?")
+    for i, g in enumerate(subs, 1):
+        print(f"    {i}. {g['name']}  ({g['where']}, {g['appid']})")
+    try:
+        pick = int(input("  > ")) - 1
+        return subs[pick]
+    except (ValueError, IndexError, EOFError):
+        return None
+
+
+def loginusers_path(where):
+    base = STEAM_DIR if where == "windows" else NATIVE_STEAM_DIR
+    return os.path.join(base, "config", "loginusers.vdf")
+
+
+def steam_accounts(where):
+    p = loginusers_path(where)
+    if not os.path.exists(p):
+        return {}
+    with open(p, errors="replace") as f:
+        return parse_vdf(f.read()).get("users", {})
+
+
+def set_offline_mode(where, offline):
+    """Flip Steam's remembered 'WantsOfflineMode' so it boots straight into offline mode."""
+    p = loginusers_path(where)
+    if not os.path.exists(p):
+        return False
+    with open(p, errors="replace") as f:
+        text = f.read()
+    if '"WantsOfflineMode"' not in text:
+        return False
+    val = "1" if offline else "0"
+    text = re.sub(r'("WantsOfflineMode"\s+")\d(")', rf'\g<1>{val}\2', text)
+    text = re.sub(r'("SkipOfflineModeWarning"\s+")\d(")', rf'\g<1>{val}\2', text)
+    with open(p, "w") as f:
+        f.write(text)
+    return True
+
+
+# --------------------------------------------------------------------------- controller
+def xbox_controllers():
+    """Return list of dicts for connected Xbox controllers (USB or Bluetooth)."""
+    found = []
+    # USB (wired USB-C). macOS 15+ has a native driver for wired Xbox pads.
+    r = run(["system_profiler", "SPUSBDataType", "-json"])
+    try:
+        data = json.loads(r.stdout or "{}")
+    except ValueError:
+        data = {}
+
+    def walk(items):
+        for it in items or []:
+            name = it.get("_name", "")
+            vid = it.get("vendor_id", "")
+            if "Xbox" in name or "Controller" in name and ("0x045e" in vid.lower() or "Microsoft" in it.get("manufacturer", "")):
+                found.append({"name": name, "link": "USB", "battery": None})
+            walk(it.get("_items"))
+    walk(data.get("SPUSBDataType"))
+
+    # Bluetooth
+    r = run(["system_profiler", "SPBluetoothDataType", "-json"])
+    try:
+        bt = json.loads(r.stdout or "{}").get("SPBluetoothDataType", [{}])[0]
+    except (ValueError, IndexError):
+        bt = {}
+    for entry in bt.get("device_connected", []) or []:
+        for name, props in entry.items():
+            minor = (props.get("device_minorType") or "").lower()
+            vid = (props.get("device_vendorID") or "").lower()
+            if "xbox" in name.lower() or "gamepad" in minor or vid == "0x045e":
+                lvl = props.get("device_batteryLevelMain") or props.get("device_batteryLevel")
+                found.append({"name": name, "link": "Bluetooth", "battery": lvl})
+    return found
+
+
+def paired_but_disconnected():
+    r = run(["system_profiler", "SPBluetoothDataType", "-json"])
+    try:
+        bt = json.loads(r.stdout or "{}").get("SPBluetoothDataType", [{}])[0]
+    except (ValueError, IndexError):
+        return []
+    names = []
+    for entry in bt.get("device_not_connected", []) or []:
+        for name, props in entry.items():
+            minor = (props.get("device_minorType") or "").lower()
+            vid = (props.get("device_vendorID") or "").lower()
+            if "xbox" in name.lower() or "gamepad" in minor or vid == "0x045e":
+                names.append(name)
+    return names
+
+
+def bluetooth_on():
+    out = sh(["system_profiler", "SPBluetoothDataType"])
+    m = re.search(r"State:\s*(\w+)", out)
+    return (m.group(1).lower() == "on") if m else None
+
+
+PADTEST_SWIFT = r'''
+import Foundation
+import GameController
+let secs = Double(CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "15") ?? 15
+print("Press buttons / move sticks on the controller. Testing for \(Int(secs))s...")
+var seen = Set<String>()
+func hook(_ gc: GCController) {
+    let name = gc.vendorName ?? "controller"
+    print("Connected: \(name)  battery: \(gc.battery.map { "\(Int($0.batteryLevel*100))%" } ?? "n/a")")
+    guard let pad = gc.extendedGamepad else { print("  (no extended gamepad profile)"); return }
+    pad.valueChangedHandler = { _, element in
+        var label = "?"
+        if let b = element as? GCControllerButtonInput { label = (b.localizedName ?? b.aliases.first ?? "button") + (b.isPressed ? " down" : " up") }
+        else if let d = element as? GCControllerDirectionPad { label = String(format: "%@ %.2f,%.2f", d.localizedName ?? "pad", d.xAxis.value, d.yAxis.value) }
+        else if let a = element as? GCControllerAxisInput { label = String(format: "%@ %.2f", a.localizedName ?? "axis", a.value) }
+        if !seen.contains(label) { seen.insert(label); print("  \(label)") }
+    }
+}
+NotificationCenter.default.addObserver(forName: .GCControllerDidConnect, object: nil, queue: .main) { n in if let gc = n.object as? GCController { hook(gc) } }
+GCController.startWirelessControllerDiscovery {}
+for gc in GCController.controllers() { hook(gc) }
+if GCController.controllers().isEmpty { print("No controller connected yet (plug in / pair, then it will show up).") }
+RunLoop.main.run(until: Date(timeIntervalSinceNow: secs))
+print(GCController.controllers().isEmpty ? "RESULT: no controller seen" : "RESULT: controller OK (\(seen.count) distinct inputs seen)")
+'''
+
+
+def padtest(seconds):
+    exe = os.path.join(TOOLS, "padtest")
+    src = os.path.join(TOOLS, "padtest.swift")
+    os.makedirs(TOOLS, exist_ok=True)
+    if not os.path.exists(exe):
+        with open(src, "w") as f:
+            f.write(PADTEST_SWIFT)
+        info("compiling controller test tool (first run only)")
+        r = run(["swiftc", "-O", "-o", exe, src])
+        if r.returncode != 0:
+            bad("could not compile the controller test (needs Xcode Command Line Tools)")
+            print(r.stderr[-800:])
+            return
+    subprocess.run([exe, str(seconds)])
+
+
+# --------------------------------------------------------------------------- commands
+def cmd_doctor(args):
+    head(f"{APP_NAME} {VERSION} — doctor")
+    cfg = load_config()
+    if is_apple_silicon():
+        ok(f"{chip()}, macOS {mac_version()}")
+    else:
+        bad("Intel Mac detected — Layover is built for Apple Silicon")
+    ok("Rosetta 2 installed") if rosetta_installed() else bad("Rosetta 2 missing → softwareupdate --install-rosetta --agree-to-license")
+    ver = engine_version()
+    ok(f"engine: {ver}") if ver else bad("engine not installed → layover setup")
+    for r in RENDERER_CHOICES:
+        (ok if renderer_installed(r) else bad)(f"renderer {r}: " + RENDERER_HELP[r])
+    if os.path.isdir(os.path.join(PREFIX, "drive_c")):
+        ok("Steam prefix exists")
+    else:
+        bad("Steam prefix missing → layover setup")
+    if steam_installed():
+        accts = steam_accounts("windows")
+        who = ", ".join(v.get("PersonaName") or v.get("AccountName") or "?" for v in accts.values()) or "nobody logged in yet"
+        ok(f"Windows Steam installed ({who})")
+    else:
+        bad("Windows Steam not installed → layover setup")
+    if steam_installed():
+        real = os.path.join(STEAM_DIR, "bin", "cef", "cef.win64", "steamwebhelper_real.exe")
+        info("Steam web-helper wrapper " + ("active" if os.path.isfile(real) else "off") + " (layover config webhelper_wrapper on|off)")
+    if os.path.isdir(NATIVE_STEAM_APP):
+        ok("native Mac Steam also present (for Mac-native games)")
+    fd = free_disk()
+    (ok if fd > 50 << 30 else warn)(f"free disk: {human(fd)}")
+    pads = xbox_controllers()
+    if pads:
+        for p in pads:
+            ok(f"controller: {p['name']} via {p['link']}" + (f", battery {p['battery']}" if p['battery'] else ""))
+    else:
+        info("no Xbox controller connected right now (layover controller)")
+    info(f"renderer default: {cfg['renderer']}, msync: {'on' if cfg['msync'] else 'off'}")
+    info(f"data: {ROOT}")
+    print()
+
+
+def cmd_setup(args):
+    head(f"{APP_NAME} setup")
+    if not is_apple_silicon():
+        die("Layover needs an Apple Silicon Mac.")
+    major = int(mac_version().split(".")[0])
+    if major < 14:
+        die("macOS 14 Sonoma or newer is required (DXMT needs Metal 3).")
+    ensure_dirs()
+    cfg = load_config()
+    save_config(cfg)
+
+    # 1. Rosetta
+    if rosetta_installed():
+        ok("Rosetta 2 present")
+    else:
+        info("installing Rosetta 2 (Apple will ask you to agree to its license)")
+        r = subprocess.run(["softwareupdate", "--install-rosetta", "--agree-to-license"])
+        if r.returncode != 0 or not rosetta_installed():
+            die("Rosetta install failed. Run manually:  softwareupdate --install-rosetta --agree-to-license")
+        ok("Rosetta 2 installed")
+
+    # 2. Engine (Wine + runtime + DXMT + D3DMetal in one go)
+    if engine_ready() and renderer_installed("dxmt") and renderer_installed("d3dmetal") and not args.reinstall:
+        ok(f"engine present: {engine_version()}")
+    else:
+        info("D3DMetal (inside the runtime bundle) is Apple-licensed for non-commercial use only:")
+        info("  https://github.com/user-attachments/files/23971305/License.pdf")
+        assemble_engine()
+        if not engine_ready():
+            die("engine layout unexpected after extraction")
+        ok(f"engine installed: {engine_version()}")
+    for r in RENDERER_CHOICES:
+        (ok if renderer_installed(r) else bad)(f"renderer {r}")
+    for old in LEGACY_ENGINES:
+        if os.path.isdir(old):
+            if steam_running():
+                info(f"old engine {os.path.basename(old)} still in use by the running Steam; removed on the next setup")
+            else:
+                shutil.rmtree(old, ignore_errors=True)
+                shutil.rmtree(RENDERERS, ignore_errors=True)
+                info(f"removed old engine {os.path.basename(old)}")
+
+    # 4. Prefix
+    if os.path.isdir(os.path.join(PREFIX, "drive_c")) and not args.reinstall:
+        ok("Steam prefix present")
+    else:
+        info("creating the Windows environment (prefix) — about 30 seconds")
+        os.makedirs(PREFIX, exist_ok=True)
+        log = new_log("setup")
+        env = wine_env(cfg)
+        r = subprocess.run([WINE, "wineboot", "--init"], env=env, stdout=open(log, "ab"), stderr=subprocess.STDOUT)
+        wineserver_wait(cfg)
+        if r.returncode != 0 or not os.path.isdir(os.path.join(PREFIX, "drive_c")):
+            die(f"prefix creation failed, see {log}")
+        reg_add(cfg, r"HKCU\Software\Wine\Mac Driver", "RetinaMode", "y" if cfg["retina"] else "n")
+        # Steam's web UI is happier at Windows 10; wineboot default is already win10, set explicitly.
+        wine(cfg, ["winecfg", "-v", "win10"])
+        wineserver_wait(cfg)
+        ok("prefix ready")
+
+    # 5. Steam
+    if steam_installed() and not args.reinstall:
+        ok("Windows Steam present")
+    else:
+        setup_exe = download(STEAM_SETUP_URL, os.path.join(CACHE, "SteamSetup.exe"), None, "Steam installer")
+        info("installing Steam silently")
+        log = new_log("steam-install")
+        wine(cfg, [setup_exe, "/S"], log=log)
+        wineserver_wait(cfg)
+        if not steam_installed():
+            die(f"Steam install failed, see {log}")
+        ok("Windows Steam installed")
+    if cfg.get("webhelper_wrapper", False):
+        install_webhelper_wrapper(quiet=False)
+
+    print()
+    ok(paint("Setup complete.", C.B))
+    info("Next:  layover steam        (first launch downloads Steam's update, then shows the login window)")
+    info("Then:  install games in Steam as usual, and `layover games` / `layover play <name>`")
+    info("Before a flight:  layover flight")
+    print()
+    if not args.no_launch and tty():
+        try:
+            ans = input("  Launch Steam now? [Y/n] ").strip().lower()
+        except EOFError:
+            ans = "n"
+        if ans in ("", "y", "yes"):
+            cmd_steam(argparse.Namespace(offline=False, online=False, game=None, extra=[]))
+
+
+def require_setup():
+    if not engine_ready() or not steam_installed():
+        die("not set up yet → run: layover setup")
+
+
+STATE_PATH = os.path.join(ROOT, "running.json")
+
+
+def running_renderer():
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f).get("renderer")
+    except (OSError, ValueError):
+        return None
+
+
+def launch_steam(cfg, game=None, offline=None, extra_args=None):
+    """Start Windows Steam in our prefix (detached). Returns log path."""
+    if offline is not None:
+        set_offline_mode("windows", offline)
+    renderer = resolve_renderer(cfg, game)
+    if not renderer_installed(renderer):
+        die(f"renderer '{renderer}' is not installed → layover setup")
+    args = [STEAM_EXE] + list(cfg.get("steam_args") or []) + list(extra_args or [])
+    if cfg.get("webhelper_wrapper", False):
+        install_webhelper_wrapper()
+        # keep Steam's self-check from putting its own helper back over the wrapper
+        args += ["-noverifyfiles", "-nobootstrapupdate", "-skipinitialbootstrap", "-norepairfiles"]
+    else:
+        remove_webhelper_wrapper()
+    log = new_log("steam")
+    if game:
+        args += ["-applaunch", str(game)]
+    wine(cfg, args, game=game, wait=False, log=log, cwd=STEAM_DIR, extra_env={"LAYOVER_RENDERER": renderer})
+    with open(STATE_PATH, "w") as f:
+        json.dump({"renderer": renderer, "started": _dt.datetime.now().isoformat(), "game": game}, f)
+    return log
+
+
+def cmd_steam(args):
+    require_setup()
+    cfg = load_config()
+    offline = True if args.offline else (False if args.online else None)
+    if steam_running():
+        if offline is not None:
+            warn("Steam is already running; offline/online can only be set on launch. Use Steam's menu → Go Offline.")
+        else:
+            ok("Steam is already running")
+        return
+    if native_steam_running():
+        warn("native Mac Steam is running. Two Steam clients on one account kick each other offline")
+        warn("('Session Replaced' → installs fail with 'no internet connection'). Quit Mac Steam first.")
+    log = launch_steam(cfg, offline=offline, extra_args=args.extra)
+    ok(f"Steam starting ({'offline' if offline else 'online' if offline is False else 'last mode'}), renderer {running_renderer()}")
+    info("first launch after setup: Steam updates itself (1–3 min) and then shows the sign-in window")
+    info(f"log: {log}")
+
+
+def cmd_update_steam(args):
+    """Let Steam verify/update itself (the normal launch skips that so our wrapper survives)."""
+    require_setup()
+    cfg = load_config()
+    if steam_running():
+        info("closing Steam")
+        wineserver_kill(cfg)
+        time.sleep(3)
+    remove_webhelper_wrapper()
+    log = new_log("steam-update")
+    info("running Steam's updater; this can take a few minutes. Close Steam when it finishes.")
+    wine(cfg, [STEAM_EXE, "-forcesteamupdate", "-cef-disable-gpu"], log=log)
+    wineserver_wait(cfg)
+    install_webhelper_wrapper(quiet=False)
+    ok("Steam updated; wrapper reinstalled")
+
+
+def cmd_games(args):
+    cfg = load_config()
+    games = all_games()
+    if not games:
+        info("no games installed yet. Open Steam (layover steam) and install some.")
+        return
+    head("Installed games")
+    for g in sorted(games, key=lambda x: x["name"].lower()):
+        state = paint("ready", C.G) if g["ready"] else paint("needs update/validation", C.Y)
+        where = "Windows" if g["where"] == "windows" else "Mac   "
+        rend = ""
+        if g["where"] == "windows":
+            dx = cfg["games"].get(g["appid"], {}).get("dx12")
+            rend = f"  [{resolve_renderer(cfg, g['appid'], games)}" + (" (DX12)" if dx else "") + "]"
+        print(f"  {where}  {g['appid']:>8}  {g['name']:<45} {human(g['size']):>9}  {state}{rend}")
+    print()
+
+
+def cmd_play(args):
+    cfg = load_config()
+    games = all_games()
+    g = find_game(args.game, games)
+    if not g:
+        die(f"no installed game matches '{args.game}' (layover games)")
+    if g["where"] == "mac":
+        ok(f"launching {g['name']} in native Mac Steam")
+        subprocess.run(["open", f"steam://rungameid/{g['appid']}"])
+        return
+    require_setup()
+    renderer = resolve_renderer(cfg, g["appid"])
+    if steam_running() and running_renderer() not in (None, renderer):
+        info(f"{g['name']} uses the {renderer} renderer; Steam is running with {running_renderer()}. Restarting Steam.")
+        wineserver_kill(cfg)
+        for _ in range(30):
+            if not steam_running():
+                break
+            time.sleep(1)
+    if steam_running():
+        wine(cfg, ["start", f"steam://rungameid/{g['appid']}"], game=g["appid"], wait=False)
+        ok(f"asked Steam to launch {g['name']} ({renderer})")
+    else:
+        offline = True if args.offline else None
+        log = launch_steam(cfg, game=g["appid"], offline=offline)
+        ok(f"starting Steam → {g['name']} ({renderer}); log: {log}")
+
+
+def cmd_install(args):
+    require_setup()
+    cfg = load_config()
+    appid = args.appid
+    if not appid.isdigit():
+        die("give the numeric Steam AppID (it's in the store page URL, e.g. store.steampowered.com/app/1245620)")
+    url = f"steam://install/{appid}"
+    if steam_running():
+        wine(cfg, ["start", url], wait=False)
+    else:
+        launch_steam(cfg, extra_args=[url])
+    ok(f"asked Steam to install app {appid}")
+
+
+def cmd_controller(args):
+    head("Xbox controller")
+    bt = bluetooth_on()
+    (ok if bt else warn)(f"Bluetooth is {'on' if bt else 'off'}")
+    pads = xbox_controllers()
+    if pads:
+        for p in pads:
+            ok(f"connected: {p['name']} via {p['link']}" + (f" (battery {p['battery']})" if p['battery'] else ""))
+    else:
+        bad("no Xbox controller connected")
+        paired = paired_but_disconnected()
+        if paired:
+            info("paired before but asleep: " + ", ".join(paired) + " — press the Xbox button to wake it")
+        print()
+        print(paint("  Connect by cable (most reliable, and charges the pad):", C.B))
+        print("    USB-C cable from the controller to the Mac. macOS 15 has a native driver;")
+        print("    approve the 'allow accessory to connect' prompt the first time.")
+        print(paint("  Pair over Bluetooth (no cable on the tray table):", C.B))
+        print("    1. Hold the Xbox button until it lights, then hold the small Pair button")
+        print("       on top until the Xbox light flashes fast.")
+        print("    2. System Settings → Bluetooth → 'Xbox Wireless Controller' → Connect.")
+        print("    3. Next time, just press the Xbox button; it reconnects on its own.")
+        print("    Bluetooth works in airplane mode (Wi-Fi off is enough for the airline).")
+        if args.open_settings or (tty() and not args.test):
+            subprocess.run(["open", "x-apple.systempreferences:com.apple.BluetoothSettings"])
+    print()
+    print("  Inside Windows Steam: Settings → Controller → enable 'Xbox controller support'.")
+    print("  Steam Input then maps the pad for every game; wired and Bluetooth both work.")
+    if args.test:
+        print()
+        padtest(args.seconds)
+    print()
+
+
+def cmd_flight(args):
+    """Pre-flight: make sure everything works with zero internet."""
+    head("Pre-flight checklist")
+    problems = 0
+    cfg = load_config()
+
+    if engine_ready() and steam_installed():
+        ok("engine + Windows Steam installed")
+    else:
+        bad("not set up (layover setup) — you need Wi-Fi for that")
+        problems += 1
+
+    accts = steam_accounts("windows")
+    if accts:
+        ok("Windows Steam has a remembered login (offline mode needs this)")
+    else:
+        bad("nobody has logged into Windows Steam yet — log in once while online")
+        problems += 1
+
+    games = all_games()
+    win = [g for g in games if g["where"] == "windows"]
+    mac = [g for g in games if g["where"] == "mac"]
+    if win or mac:
+        for g in win + mac:
+            if g["ready"]:
+                ok(f"{g['name']} ({'Windows' if g['where']=='windows' else 'Mac'}) installed")
+            else:
+                warn(f"{g['name']} needs an update/validation — launch it once while online")
+                problems += 1
+    else:
+        bad("no games installed")
+        problems += 1
+    info("tip: launch each game once while online so Steam caches its config and shader data")
+
+    pads = xbox_controllers()
+    if pads:
+        for p in pads:
+            lvl = p["battery"]
+            ok(f"controller {p['name']} ({p['link']}){', battery ' + str(lvl) if lvl else ''}")
+            if lvl and str(lvl).rstrip('%').isdigit() and int(str(lvl).rstrip('%')) < 40:
+                warn("controller battery is low — charge it or bring a USB-C cable")
+    else:
+        warn("no controller connected now — pair/plug it before boarding (layover controller)")
+        if paired_but_disconnected():
+            info("it is already paired; press the Xbox button to reconnect")
+
+    pct, state = battery()
+    if pct is not None:
+        (ok if pct >= 80 else warn)(f"MacBook battery {pct}% ({state})")
+    fd = free_disk()
+    (ok if fd > 10 << 30 else warn)(f"free disk {human(fd)}")
+
+    # Offline mode
+    if args.online:
+        for where in ("windows", "mac"):
+            if set_offline_mode(where, False):
+                ok(f"{where} Steam set back to online mode")
+        return
+    if steam_running() or native_steam_running():
+        if args.go or args.set_offline:
+            info("closing Steam to switch it to offline mode")
+            if steam_running():
+                wineserver_kill(cfg)
+            if native_steam_running():
+                subprocess.run(["osascript", "-e", 'tell application "Steam" to quit'], capture_output=True)
+            for _ in range(30):
+                if not steam_running() and not native_steam_running():
+                    break
+                time.sleep(1)
+        else:
+            warn("Steam is running. Use its menu Steam → Go Offline, or run: layover flight --set-offline")
+    if args.go or args.set_offline:
+        if set_offline_mode("windows", True):
+            ok("Windows Steam will start in OFFLINE mode")
+        if set_offline_mode("mac", True):
+            ok("Mac Steam will start in OFFLINE mode")
+        info("to go back online later: layover flight --online  (or Steam menu → Go Online)")
+    else:
+        info("to switch Steam to offline mode now: layover flight --set-offline")
+
+    print()
+    if problems:
+        warn(f"{problems} thing(s) to fix while you still have Wi-Fi")
+    else:
+        ok(paint("Cleared for takeoff.", C.B))
+    if args.go:
+        if problems:
+            warn("launching anyway")
+        log = launch_steam(cfg, offline=True)
+        ok(f"Steam starting offline; log: {log}")
+    print()
+
+
+def cmd_renderer(args):
+    cfg = load_config()
+    if args.game is None:
+        for r in RENDERER_CHOICES:
+            info(f"{r:<9} {RENDERER_HELP[r]}")
+        info(f"default renderer: {cfg['renderer']}")
+        for appid, g in cfg["games"].items():
+            if "renderer" in g:
+                info(f"  {appid}: {g['renderer']}")
+        return
+    if args.game == "default":
+        cfg["renderer"] = args.renderer
+        save_config(cfg)
+        ok(f"default renderer → {args.renderer}")
+        return
+    g = find_game(args.game, all_games())
+    if not g:
+        die(f"no installed game matches '{args.game}'")
+    cfg["games"].setdefault(g["appid"], {})["renderer"] = args.renderer
+    save_config(cfg)
+    ok(f"{g['name']} → {args.renderer}  (applies next time Steam is launched)")
+
+
+def cmd_config(args):
+    cfg = load_config()
+    if args.key is None:
+        print(json.dumps({k: v for k, v in cfg.items() if k != "games"}, indent=2))
+        return
+    if args.key not in DEFAULT_CONFIG or args.key == "games":
+        die(f"unknown setting '{args.key}'. Settings: " + ", ".join(k for k in DEFAULT_CONFIG if k != 'games'))
+    val = args.value
+    if isinstance(DEFAULT_CONFIG[args.key], bool):
+        val = val.lower() in ("1", "true", "on", "yes", "y")
+    elif isinstance(DEFAULT_CONFIG[args.key], list):
+        val = val.split()
+    cfg[args.key] = val
+    save_config(cfg)
+    ok(f"{args.key} = {val}")
+
+
+def cmd_kill(args):
+    cfg = load_config()
+    if engine_ready():
+        wineserver_kill(cfg)
+    ok("Steam is fully quit (closing its window only hides it to the tray; use this or Steam → Exit)")
+
+
+def cmd_logs(args):
+    if not os.path.isdir(LOGS):
+        info("no logs yet")
+        return
+    files = sorted(os.listdir(LOGS))
+    if not files:
+        info("no logs yet")
+        return
+    p = os.path.join(LOGS, files[-1])
+    print(f"--- {p}")
+    with open(p, errors="replace") as f:
+        print(f.read()[-6000:])
+    steam_logs = os.path.join(STEAM_DIR, "logs")
+    if os.path.isdir(steam_logs):
+        info(f"Steam's own logs: {steam_logs}")
+
+
+def cmd_winecfg(args):
+    require_setup()
+    wine(load_config(), ["winecfg"], wait=False)
+    ok("opened winecfg (Wine's settings window)")
+
+
+def cmd_uninstall(args):
+    if not os.path.isdir(ROOT):
+        info("nothing installed")
+        return
+    size = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(ROOT) for f in fs if os.path.exists(os.path.join(r, f)))
+    warn(f"this deletes {ROOT} ({human(size)}) including Steam and every installed game in it")
+    if not args.yes:
+        try:
+            if input("  type 'delete' to confirm: ").strip() != "delete":
+                info("cancelled")
+                return
+        except EOFError:
+            return
+    if engine_ready():
+        wineserver_kill(load_config())
+        time.sleep(1)
+    shutil.rmtree(ROOT, ignore_errors=True)
+    ok("removed")
+
+
+def cmd_menu(args):
+    items = [
+        ("Launch Steam (Windows games)", lambda: cmd_steam(argparse.Namespace(offline=False, online=False, extra=[]))),
+        ("Launch Steam OFFLINE (on the plane)", lambda: cmd_steam(argparse.Namespace(offline=True, online=False, extra=[]))),
+        ("List installed games", lambda: cmd_games(None)),
+        ("Play a game", lambda: cmd_play(argparse.Namespace(game=input("  game name: "), offline=False))),
+        ("Controller check", lambda: cmd_controller(argparse.Namespace(test=False, seconds=15, open_settings=False))),
+        ("Controller input test (15 s)", lambda: cmd_controller(argparse.Namespace(test=True, seconds=15, open_settings=False))),
+        ("Pre-flight checklist", lambda: cmd_flight(argparse.Namespace(go=False, set_offline=False, online=False))),
+        ("Pre-flight + set offline + launch", lambda: cmd_flight(argparse.Namespace(go=True, set_offline=True, online=False))),
+        ("Back online (after the flight)", lambda: cmd_flight(argparse.Namespace(go=False, set_offline=False, online=True))),
+        ("Doctor (health check)", lambda: cmd_doctor(None)),
+        ("Setup / repair", lambda: cmd_setup(argparse.Namespace(reinstall=False, d3dmetal=False, no_launch=True))),
+        ("Stop Steam", lambda: cmd_kill(None)),
+    ]
+    while True:
+        head(f"✈  {APP_NAME}")
+        for i, (label, _) in enumerate(items, 1):
+            print(f"  {i:>2}. {label}")
+        print("   q. quit")
+        try:
+            choice = input("\n  > ").strip().lower()
+        except EOFError:
+            return
+        if choice in ("q", "quit", "exit", ""):
+            return
+        if choice.isdigit() and 1 <= int(choice) <= len(items):
+            try:
+                items[int(choice) - 1][1]()
+            except SystemExit:
+                pass
+            except KeyboardInterrupt:
+                print()
+        else:
+            warn("pick a number")
+
+
+# --------------------------------------------------------------------------- main
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="layover", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"{APP_NAME} {VERSION}")
+    sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("setup", help="install engine, renderers, Windows Steam (needs internet)")
+    s.add_argument("--reinstall", action="store_true", help="redo every step")
+    s.add_argument("--d3dmetal", action="store_true", help=argparse.SUPPRESS)  # kept for old scripts; D3DMetal is always installed now
+    s.add_argument("--no-launch", action="store_true", help="don't offer to launch Steam at the end")
+    s.set_defaults(fn=cmd_setup)
+
+    s = sub.add_parser("steam", help="launch Windows Steam")
+    s.add_argument("--offline", action="store_true", help="start in offline mode")
+    s.add_argument("--online", action="store_true", help="start in online mode")
+    s.add_argument("extra", nargs="*", help="extra steam.exe arguments")
+    s.set_defaults(fn=cmd_steam)
+
+    sub.add_parser("games", help="list installed games (Windows prefix + native Mac Steam)").set_defaults(fn=cmd_games)
+    sub.add_parser("update-steam", help="let the Steam client update itself (normal launches skip this)").set_defaults(fn=cmd_update_steam)
+
+    s = sub.add_parser("play", help="launch a game by name or AppID")
+    s.add_argument("game")
+    s.add_argument("--offline", action="store_true", help="start Steam offline if it isn't running")
+    s.set_defaults(fn=cmd_play)
+
+    s = sub.add_parser("install", help="start downloading a game by Steam AppID")
+    s.add_argument("appid")
+    s.set_defaults(fn=cmd_install)
+
+    s = sub.add_parser("controller", help="detect / pair / test the Xbox controller")
+    s.add_argument("--test", action="store_true", help="live input test using Apple's GameController framework")
+    s.add_argument("--seconds", type=int, default=15)
+    s.add_argument("--open-settings", action="store_true", help="open Bluetooth settings")
+    s.set_defaults(fn=cmd_controller)
+
+    s = sub.add_parser("flight", help="pre-flight checklist, offline mode, launch")
+    s.add_argument("--set-offline", action="store_true", help="switch both Steams to offline mode (restarts Steam if open)")
+    s.add_argument("--go", action="store_true", help="set offline and launch Steam")
+    s.add_argument("--online", action="store_true", help="switch Steam back to online mode")
+    s.set_defaults(fn=cmd_flight)
+
+    s = sub.add_parser("renderer", help="show or set the graphics backend (default or per game)")
+    s.add_argument("game", nargs="?", help="game name/AppID, or 'default'")
+    s.add_argument("renderer", nargs="?", choices=RENDERER_CHOICES)
+    s.set_defaults(fn=lambda a: cmd_renderer(a) if (a.game is None or a.renderer) else die("usage: layover renderer <game|default> <dxmt|wined3d|d3dmetal>"))
+
+    s = sub.add_parser("config", help="show or change a setting (msync, metal_hud, advertise_avx, retina, fps_cap, steam_args)")
+    s.add_argument("key", nargs="?")
+    s.add_argument("value", nargs="?", help="for steam_args, quote the whole list, e.g. \"-cef-disable-gpu -noverifyfiles\"")
+    s.set_defaults(fn=lambda a: cmd_config(a) if (a.key is None or a.value is not None) else die("usage: layover config <key> <value>"))
+
+    sub.add_parser("doctor", help="health check").set_defaults(fn=cmd_doctor)
+    sub.add_parser("kill", help="stop Steam and the Windows prefix").set_defaults(fn=cmd_kill)
+    sub.add_parser("quit", help="same as kill: fully quit Steam (closing its window only hides it)").set_defaults(fn=cmd_kill)
+    sub.add_parser("logs", help="show the latest launch log").set_defaults(fn=cmd_logs)
+    sub.add_parser("winecfg", help="open Wine's settings window for the prefix").set_defaults(fn=cmd_winecfg)
+    s = sub.add_parser("uninstall", help="remove Layover and everything it installed")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(fn=cmd_uninstall)
+    sub.add_parser("menu", help="interactive menu").set_defaults(fn=cmd_menu)
+    sub.add_parser("help", help="show help").set_defaults(fn=lambda a: p.print_help())
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if len(argv) >= 3 and argv[0] == "config" and argv[2].startswith("-"):
+        argv.insert(2, "--")   # let values like "-cef-disable-gpu" through argparse
+    args = p.parse_args(argv)
+    if not args.cmd:
+        cmd_menu(args) if tty() else p.print_help()
+        return
+    try:
+        args.fn(args)
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
