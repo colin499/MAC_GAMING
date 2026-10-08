@@ -24,6 +24,10 @@ Read this first if you are a new agent (or future me) picking up Layover.
 
 ## Next steps
 
+0. Spider-Man 2 T-pose: root cause found, fix blocked; see the section below for the two strategies.
+   The d3d12 shim is installed by `layover setup`/every launch and inert unless games.2651280.env sets
+   LAYOVER_MANAGED_MB / LAYOVER_VRAM_MB / LAYOVER_LOGPOINTS / LAYOVER_D3D12_LOG / LAYOVER_TSSHIM.
+   Dev tools: tools/dev (run_in_prefix.py direct launch, sendkey.c, winlist.c, minidump.py).
 1. Spider-Man 2 runs; next: play-test performance/stability, fps_cap, controller, offline mode.
    `./layover play "spider"` auto-detects DX12 → D3DMetal and restarts Steam with that renderer.
    - If Steam shows a "controller recommended" interstitial and the launch hangs, Highball's
@@ -91,6 +95,146 @@ Read this first if you are a new agent (or future me) picking up Layover.
   showed "DirectX 12 support not detected ... Apple M4 Pro". The `D3D12/` Agility SDK folder and
   `*_dx12.dll` files are also treated as DX12 markers now. Scanning a half-downloaded game yields
   nothing, which is fine because unknown results are not cached.
+
+- Spider-Man 2 writes its own log to `~/Documents/Marvel's Spider-Man 2/Marvel's Spider-Man 2.log`
+  (the prefix's Documents is a symlink to the real ~/Documents). It records the adapter, every
+  graphics setting, and a `[Render] Working set ... fps:` line once a minute. Read this before
+  Layover's own logs: D3DMetal's stderr is empty on Steam-launched runs. The game's prefs live in
+  `~/Documents/Marvel's Spider-Man 2/<steamid>/prefs-autosave.save` (binary; change them in-game).
+- First play session (2026-10-08 13:36): menu 86 fps, then 30 → 10 → 10 → 22 → 39 → 43 fps per minute
+  through the opening cinematic and first gameplay at the game's defaults (1728x1117 fullscreen,
+  preset High, RT off, FSR "Dynamic" upscale with a 30 fps dynamic-resolution target, VSync on at
+  120 Hz). ioreg showed the GPU at 83-99 % and one game thread pegged at ~98 % CPU: GPU-bound, with
+  the render thread spinning. D3DMetal's shader cache (`$TMPDIR/../C/d3dm/Spider-Man2.exe/
+  shaders.cache`, 255 MB after the session, bytecode/stage caches still growing at 13:42) was
+  being filled the whole time, so the first run of any scene also stalls on pipeline compiles.
+  Fixes are in-game: preset Medium, fixed FSR Quality instead of Dynamic, dynamic-res target off or
+  60, VSync off (or `layover config fps_cap 30` for even pacing via D3DM_MAX_FPS).
+- The game logs `[NxStorage] DirectStorage initialization failed` (dstorage.dll, after "Graphics
+  device supports GPU decompression") and falls back to Win32 I/O + CPU decompression under
+  Rosetta. Not diagnosed yet; a candidate cause for streaming hitches/pop-in. D3DMetal also
+  reports "Is UMA: No" and no tiled resources.
+- D3DMetal 3.0 env knobs (from `strings` on the framework): D3DM_ALLOW_HOOKING, D3DM_BOUNDS_CHECK,
+  D3DM_DEVICE_DESCRIPTION/ID/REVISION/SUBSYS, D3DM_VENDOR_ID, D3DM_DXIL_PROCESS_DEBUG_INFORMATION,
+  D3DM_ENABLE_ASYNC_COMMIT, D3DM_ENABLE_METALFX, D3DM_NVNGX_PATH, D3DM_EXE_OVERRIDE,
+  D3DM_FLUSH_POS_INF_TO_NAN, D3DM_FORCE_RTZ_TEXWRITE, D3DM_IGNORE_D3D11_RENDER_BARRIERS,
+  D3DM_LOD_BIAS, D3DM_MIN_LOD_CLAMP, D3DM_MULTITHREADED_INTERFACE_ENABLE, D3DM_NO_WINDOW,
+  D3DM_NOT_IMPLEMENTED, D3DM_POSITION_INVARIANCE, D3DM_RETAIN_REFERENCES, D3DM_SAMPLE_NAN_TO_ZERO,
+  D3DM_SHOW_HUD_STATS, D3DM_SUPPORT_DXR, D3DM_WAIT_ON_RESET. Untested except the identity ones;
+  D3DM_SHOW_HUD_STATS and D3DM_ENABLE_METALFX (+ D3DM_NVNGX_PATH, DLSS→MetalFX?) are the ones to try.
+
+## Spider-Man 2 T-pose: ROOT CAUSE FOUND (2026-10-08 ~16:30, second session)
+
+Symptom: skinned characters stuck in their bind pose under D3DMetal (all of them on every launch by
+the end of the first session; intermittent at first; CodeWeavers' tip page says switching suits
+brings animation back).
+
+### Cause
+The game (Nixxes/Insomniac engine, build v2.810.0.0) creates ONE 2046 MB default-heap buffer, its
+"ManagedBuffer" pool (vertex/index/skin data, joint remaps ...), and at start-up creates typed
+buffer views over the WHOLE pool: SRVs R32G32B32A32_UINT, R8G8B8A8_UNORM, R16G16B16A16_SINT,
+R16G16B16A16_FLOAT, R10G10B10A2_UNORM, R32_UINT, R32G32_UINT, a RAW view, and UAVs R32_UINT,
+R16_UINT, R32G32B32A32_UINT (shim log, run1). A typed buffer is a Metal texture buffer, whose width
+is capped at 2^28 = 268,435,456 elements. The 4-byte views over 2046 MB have 536 M elements and the
+R16_UINT UAV 1073 M, so D3DMetal clamps them ("Texture buffer size larger than device limit,
+limiting size") to the first 1 GB (512 MB for R16). Any mesh whose vertex data the game's
+sub-allocator places above the clamp reads zeros for its RGBA8 weights/indices and RGB10A2
+normals -> bind pose. Allocation placement explains the intermittency and the suit-switch cure.
+A/B with the user's eyes: pool 2046 MB -> menu characters T-pose; pool 1022 MB -> they animate.
+
+### Fix mechanism (works; stability still open, see below)
+`shims/d3d12shim/d3d12.c` = our d3d12.dll in front of D3DMetal's, derived from Highball's tsshim
+(same export forwarding + in-place vtable patching of ID3D12Device / command list / queue; the
+timestamp serving is kept behind LAYOVER_TSSHIM=1). With LAYOVER_MANAGED_MB=<n> it rewrites the
+game's named-budget table in memory before the pool is created. Facts about that table:
+- The size comes from `D3DBufferManager` looking up "ManagedBuffer" (string at 0x145d63210) via a
+  CRC32-keyed table at exe+0xc3d9838: entries 0x20 bytes {name ptr @0, ?, hash @0xc, value @0x10,
+  shared ptr @0x18}; count at table+8; the table pointer may be stored as a negative offset relative
+  to the table (the game's accessor at 0x14309ef30). Only two code sites reference the name
+  (0x142c5aea0 pool creation, 0x142c59ed5 the [mgr+0xbb4]!=0 re-read path); no other hard-coded
+  2046 MB in .text. Other budgets seen: TextureAlloc 2858, AssetHeap 1548, InitAllocator 1050,
+  XMemGpuWC 2750, ModelSkinMatrixBuffer 32, Physics 512 (dump in the shim log).
+- The shim patches at D3D12CreateDevice (also retried from CreateCommandQueue/Signature/QueryHeap),
+  only in Spider-Man2.exe, only when the entry's name string is "ManagedBuffer"; it refuses values
+  outside 256..2046 MB. With 1022 the heap is 1022 MB and every 4-byte view has 267,911,168
+  elements (< 2^28); the R16_UINT UAV is still clamped at 512 MB.
+- `layover` installs the overlay (renderers/d3d12shim/wine: d3d12.dll + d3d12_d3dmetal.dll copy of
+  D3DMetal's + x86_64-unix/d3d12_d3dmetal.so symlink + system32 placeholder) via
+  install_d3d12_shim() and sets WINEDLLOVERRIDES d3d12=b;d3d12_d3dmetal=b plus GAME_FIXES env
+  (LAYOVER_MANAGED_MB=1022) whenever D3DMetal is the renderer (config `d3d12_shim`).
+
+### Where it stands (17:15): fix mechanism proven, full fix blocked by a hardware limit
+Runs with the user watching (pool size via LAYOVER_MANAGED_MB; "system-memory mode" = LAYOVER_VRAM_MB=2048,
+which makes the engine print "Managed Buffer Location: System Memory", put the pool in a CPU-visible
+custom heap and create a SEPARATE 120 MB "Managed UAV buffer" for GPU-written data, so the R32_UINT /
+R16_UINT UAVs then fit):
+
+| pool | GPU-write UAVs | save load | characters |
+| 2046 (stock) | on the pool, clamped | fine | T-pose |
+| 1535 | on the pool, clamped | fine | T-pose |
+| 1022 / 1024 (also with Very Low LOD, also system-memory mode) | fit | crash 10-30 s in (3x same site) | animate (menu) |
+| 2046, system-memory mode | separate, fit | fine, 1-3 min of play | T-pose |
+| 4092, system-memory mode | separate, fit | fine | T-pose (8-byte views now clamped too) |
+
+Conclusions:
+- The T-pose comes from the skinning INPUT side: a 4-byte typed SRV over the pool (RGBA8 weights/
+  indices, RGB10A2 or R32_UINT; the engine's view names are MainVBPosView/MainVBNrmTanView/
+  MainColorVBView/MainPaintVBView/GlobalManagedBufferRaw; SkinVBPosView/SkinVBNrmTanView are the
+  skinned outputs). Static geometry renders fine above 1 GB, so it is fetched raw or through 8-byte views.
+- The pool cannot be <= 1 GB: with 1024 the shim's high-water tracker shows the pool fully spanned at
+  the main menu and the city load then corrupts memory (crash at exe+0x2942416 in a joint-remap builder
+  reading a skeleton object full of 0xAAAA/0x5556 vertex-like data, or exe+0x3081a60 in a binary search
+  over a garbage table). No OOM text reaches the game log: the allocator's failure branches print
+  through 0x143084b40 ("D3DManagedBufferAuditPrintReport disabled."), not the log file.
+- Metal's 2^28-element texture-buffer limit is HARDWARE: with -[MTLTextureDescriptorInternal
+  validateWithDevice:] swizzled to a no-op, a 2^29-wide texture buffer is created but reads above
+  element 2^28 return 0 and widths that are not a power of two break in-range reads too (scratch
+  mtltest/texbuf.swift). D3DMetal queries -[MTLDevice maxTextureBufferWidth] (268435456) in
+  D3DMDevice::GetTextureBufferSizeLimit and clamps in D3DMBuffer::GetView. The D3DMetal binary HAS
+  symbols (nm works): IRCompilerSupportRGB32TypedBuffers / IRCompilerSupportUnAlignedTypedBuffers
+  are Apple shader-converter options; no generic "typed buffer via raw loads" emulation exists.
+- The game's named budgets are NOT derived from the DXGI video-memory figures (same table with a 4 GB
+  cap). The in-game LOD/crowd/hair settings do not shrink the pool need below 1 GB.
+
+### What a full fix needs (pick one)
+1. Steer the typed-read data into the first 1 GB of a 2046 MB pool: the engine's D3DBufferManager
+   allocates per request with a DXGI_FORMAT and a name (AllocateBuffer(D3DHeapAlloc*, DXGI_FORMAT,
+   size, data, name, DataCopy, MemoryLocation)); AllocSmall (0x142c59720) takes a request struct
+   {mgr, preferred subheap ptr, size ptr, align ptr}: < 64 KB -> small region at mgr+0x540 (when
+   [mgr+0xbb9]), else mgr->vtbl[+0x30] (carve from the pool), else the subheap list [mgr+0xb78]/
+   [mgr+0xb80]. Subheaps are created by 0x142c5a0d0 -> 0x142c5b3b0(mgr, subheap, size, flags)
+   (failure logs "D3D Managed Buffer was unable to allocate %d bytes for SubHeap"). If 4-byte-typed
+   allocations use their own subheap class, pre-creating that class's subheaps at init (low offsets)
+   would pin them under 1 GB. Use the shim's logpoints (LAYOVER_LOGPOINTS=rva,rva; LAYOVER_LOGPOINTS_MAX)
+   to log rcx/rdx/r8/r9 and the 5th stack arg as a string at those entries first.
+2. Move the typed window instead of the data: patch D3DMetal's GetView so an oversized view's texture
+   starts at (size - 1 GB) and the descriptor's textureViewOffsetInElements wraps negative (the
+   converter adds it to the index). Covers [1 GB, 2 GB) only; content streamed into holes below 1 GB
+   would T-pose again, so it needs (1) anyway.
+3. Ask Apple: D3DMetal needs typed buffer views above 2^28 elements emulated through raw loads.
+
+### Tooling built this session (scratchpad tools/, disposable; the shim source is in the repo)
+- tools/run.py: direct launch of any exe in the prefix with D3DMetal + the shim; --env K=V; it copies
+  the running wineserver's WINEMSYNC (Steam was started with msync off at 13:53, so a mismatched
+  launch fails with "msync_init Failed to open msync shared memory").
+- The game shows a LAUNCHER window first (class GameNxApp, 792x447, idle in NtUserWaitMessage until
+  Play). tools/sendkey.exe presses keys via SendInput inside Wine (needs the window foreground;
+  `--focus GameNxApp` + SetForegroundWindow did not find the fullscreen window); Enter = Play.
+  A stray Enter at the main menu once hit "Quit".
+- tools/winlist.exe lists visible Wine windows (class/title/children) - the way to see dialogs.
+- `screencapture` captures the wrong Space when the game is fullscreen; `osascript` key events are
+  not authorized for this host app. The user sits at the machine and reports by eye.
+- Minidumps (~/Documents/Marvel's Spider-Man 2/*.mdmp) parse with a 40-line python (streams 4/5/6)
+  for registers + return addresses; objdump -d --start-address on the 194 MB exe takes ~30 s.
+- shims/vramcap (dxgi wrapper) DOES reach the game but the game then crashes at Play inside Wine's
+  RtlVirtualUnwind2 (ntdll+0x38314) whenever it is loaded. Superseded: the d3d12 shim's
+  LAYOVER_VRAM_MB patches D3DMetal's shared IDXGIAdapter vtable in place at DLL load (the game resolves
+  CreateDXGIFactory dynamically, so IAT hooks miss) and works.
+- Logging mode of the shim (LAYOVER_D3D12_LOG=<win path>, LAYOVER_D3D12_VERBOSE=1): feature
+  queries (hex), pools, views >= 2^24 elements or RGB32, pipelines (failures), command signatures,
+  ExecuteIndirect, 5-second counters. Findings from it: no PSO failures, no mesh shaders, no
+  stream PSOs; the RGB32 typed SRV is an 8 MB buffer (699,050 x float3), unrelated; command
+  signatures are plain DRAW/DRAW_INDEXED/DISPATCH; timestamp heap 1 M entries, frequency 60.
 
 ## Useful references
 
