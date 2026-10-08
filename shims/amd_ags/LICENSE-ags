@@ -1,0 +1,3 @@
+amd_ags.h is the AMD GPU Services (AGS) 6.1.0 public header, Copyright (c) AMD, MIT licensed:
+https://github.com/GPUOpen-LibrariesAndSDKs/AGS_SDK (ags_lib/inc/amd_ags.h, tag v6.1.0).
+amd_ags_x64.cpp is Layover's own replacement runtime (same MIT terms).

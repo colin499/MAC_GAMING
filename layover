@@ -96,6 +96,12 @@ DEFAULT_CONFIG = {
     "fps_cap": 0,              # cap frame rate (0 = off); smoother + cooler on battery
     "audiobuf": True,          # insert Highball's CoreAudio buffer fix (off if it causes trouble)
     "webhelper_wrapper": False,  # single-process CEF wrapper: needed on the old Wine Staging engine, not on this one
+    # What D3DMetal calls the GPU. "apple": the adapter Wine registered in the prefix's registry
+    # (vendor 0x106B "Apple M4 Pro"), so games that cross-check DXGI against the registry's
+    # display-adapter driver entry (Spider-Man 2: "No installed graphics card has been detected")
+    # find it. "amd": D3DMetal's own "AMD Compatibility Mode" (vendor 0x1002), for games that
+    # insist on an AMD/NVIDIA/Intel vendor; our AGS replacement covers AMD's driver library then.
+    "d3dmetal_identity": "apple",
     "games": {},               # per-appid overrides: {"renderer": ..., "msync": ..., "fps_cap": ..., "env": {...}}
 }
 
@@ -284,8 +290,10 @@ def extract(archive, dest):
 
 # --------------------------------------------------------------------------- renderer choice
 def game_uses_dx12(game):
-    """Look at the game's executables for a DirectX 12 import. Crude (string scan of the
-    import tables) but it is what other launchers do too, and it is cached per AppID."""
+    """Does this game need DirectX 12? Looks for the Agility SDK folder (D3D12/) or a
+    *_dx12.dll next to the executables, then string-scans every .exe for its d3d12.dll /
+    d3d11.dll imports. The scan reads whole files: Spider-Man 2's exe is 194 MB and its
+    import table sits past the first 64 MB. Result is cached per AppID once known."""
     lib = game.get("library")
     installdir = game.get("installdir")
     if not lib or not installdir:
@@ -298,21 +306,32 @@ def game_uses_dx12(game):
         if dirpath[len(root):].count(os.sep) > 2:
             dirs[:] = []
             continue
+        if any(d.lower() == "d3d12" for d in dirs):      # DirectX 12 Agility SDK ships here
+            hits["d3d12"] = True
         for fn in files:
-            if not fn.lower().endswith(".exe"):
+            low = fn.lower()
+            if low.endswith("_dx12.dll") or low == "d3d12core.dll":
+                hits["d3d12"] = True
+            if not low.endswith(".exe"):
                 continue
             fp = os.path.join(dirpath, fn)
             try:
                 if os.path.getsize(fp) < 512 * 1024:
                     continue
                 with open(fp, "rb") as f:
-                    blob = f.read(64 << 20).lower()
+                    tail = b""
+                    while True:
+                        chunk = f.read(16 << 20)
+                        if not chunk:
+                            break
+                        blob = (tail + chunk).lower()
+                        if b"d3d12.dll" in blob:
+                            hits["d3d12"] = True
+                        if b"d3d11.dll" in blob:
+                            hits["d3d11"] = True
+                        tail = chunk[-16:]
             except OSError:
                 continue
-            if b"d3d12.dll" in blob:
-                hits["d3d12"] = True
-            if b"d3d11.dll" in blob:
-                hits["d3d11"] = True
     if hits["d3d12"]:
         return True
     if hits["d3d11"]:
@@ -343,6 +362,27 @@ def resolve_renderer(cfg, game=None, games=None):
 
 
 # --------------------------------------------------------------------------- wine plumbing
+D3DMETAL_IDENTITIES = ("apple", "amd")
+
+
+def registered_gpu():
+    """(vendor, device, description) of the display adapter Wine registered in the prefix
+    registry (HKLM\\System\\CurrentControlSet\\Enum\\PCI). Parsed from system.reg so no
+    Wine process is needed. None if the prefix has not booted yet."""
+    try:
+        with open(os.path.join(PREFIX, "system.reg"), encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    for m in re.finditer(r"^\[System\\\\(?:CurrentControlSet|ControlSet001)\\\\Enum\\\\PCI\\\\VEN_([0-9A-Fa-f]{4})&DEV_([0-9A-Fa-f]{4})[^\]]*\] \d+\n((?:[^\n]*\n)*?)\n", text, re.M):
+        body = m.group(3)
+        if '"Class"="Display"' not in body:
+            continue
+        desc = re.search(r'"DeviceDesc"="([^"]*)"', body)
+        return int(m.group(1), 16), int(m.group(2), 16), (desc.group(1) if desc else "Apple GPU")
+    return None
+
+
 def wine_env(cfg, game=None, extra=None):
     """Environment for running anything in the Steam prefix.
 
@@ -388,6 +428,14 @@ def wine_env(cfg, game=None, extra=None):
         env["CX_D3DMETALPATH"] = ext
         env["DYLD_FALLBACK_LIBRARY_PATH"] += ":" + ext
         env["DYLD_FALLBACK_FRAMEWORK_PATH"] += ":" + ext
+        if os.path.isfile(ags_shim_overlay_path()):
+            env["WINEDLLOVERRIDES"] += ";amd_ags_x64=b"   # our AGS replacement beats the game's copy
+        if g.get("d3dmetal_identity", cfg.get("d3dmetal_identity", "apple")) == "apple":
+            gpu = registered_gpu()
+            if gpu:
+                env["D3DM_VENDOR_ID"] = "0x%04x" % gpu[0]
+                env["D3DM_DEVICE_ID"] = "0x%04x" % gpu[1]
+                env["D3DM_DEVICE_DESCRIPTION"] = gpu[2]
     if overlays:
         env["WINEDLLPATH_PREPEND"] = ":".join(overlays)
     fps = g.get("fps_cap", cfg.get("fps_cap", 0)) or 0
@@ -533,6 +581,52 @@ MINGW_GCC = "/opt/homebrew/bin/x86_64-w64-mingw32-gcc"
 
 
 WRAPPER_INSTALLED = os.path.join(TOOLS, "steamwebhelper.exe")
+
+# AMD AGS replacement. D3DMetal presents itself as an AMD GPU, so games that bundle AMD's
+# AGS runtime (amd_ags_x64.dll) initialise it; the real one needs AMD's ADL driver library and
+# fails under Wine, which Spider-Man 2 reports as "No installed graphics card has been
+# detected". Our build answers from DXGI and creates DX12 devices with plain D3D12CreateDevice.
+# It is marked as a Wine builtin and selected with WINEDLLOVERRIDES amd_ags_x64=b when D3DMetal
+# is the renderer (see shims/amd_ags).
+AGS_SHIM_SRC_DIR = os.path.join(HERE, "shims", "amd_ags")
+AGS_SHIM_DLL = os.path.join(AGS_SHIM_SRC_DIR, "amd_ags_x64.dll")
+AGS_SHIM_INSTALLED = os.path.join(TOOLS, "amd_ags_x64.dll")
+MINGW_GXX = "/opt/homebrew/bin/x86_64-w64-mingw32-g++"
+
+
+def ags_shim_binary():
+    """Path to the AGS replacement DLL, kept under Application Support like the wrapper."""
+    os.makedirs(TOOLS, exist_ok=True)
+    try:
+        if not os.path.exists(AGS_SHIM_DLL) and os.path.exists(MINGW_GXX) and os.path.isdir(AGS_SHIM_SRC_DIR):
+            subprocess.run(["make", "-s", "-C", AGS_SHIM_SRC_DIR], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if os.path.exists(AGS_SHIM_DLL) and os.path.getsize(AGS_SHIM_DLL) > 0:
+            if not os.path.exists(AGS_SHIM_INSTALLED) or os.path.getsize(AGS_SHIM_INSTALLED) != os.path.getsize(AGS_SHIM_DLL):
+                shutil.copy2(AGS_SHIM_DLL, AGS_SHIM_INSTALLED)
+    except PermissionError:
+        pass   # Documents not readable from this session; use whatever copy exists
+    return AGS_SHIM_INSTALLED if os.path.exists(AGS_SHIM_INSTALLED) else None
+
+
+def ags_shim_overlay_path():
+    return os.path.join(ENGINE_RENDERERS, "d3dmetal", "wine", "x86_64-windows", "amd_ags_x64.dll")
+
+
+def install_ags_shim(quiet=True):
+    """Put the AGS replacement into the D3DMetal overlay. Safe to call before every launch."""
+    target = ags_shim_overlay_path()
+    if not os.path.isdir(os.path.dirname(target)):
+        return False
+    src = ags_shim_binary()
+    if not src:
+        if not quiet:
+            warn("AGS replacement DLL not available; DX12 games that bundle AMD AGS may complain about the graphics card")
+        return False
+    if not os.path.isfile(target) or os.path.getsize(target) != os.path.getsize(src):
+        shutil.copy2(src, target)
+    if not quiet:
+        ok("AMD AGS replacement in place (D3DMetal overlay)")
+    return True
 
 
 def wrapper_binary():
@@ -858,6 +952,7 @@ def cmd_doctor(args):
     ok(f"engine: {ver}") if ver else bad("engine not installed → layover setup")
     for r in RENDERER_CHOICES:
         (ok if renderer_installed(r) else bad)(f"renderer {r}: " + RENDERER_HELP[r])
+    (ok if os.path.isfile(ags_shim_overlay_path()) else warn)("AMD AGS replacement in D3DMetal overlay (DX12 games that bundle amd_ags_x64.dll)")
     if os.path.isdir(os.path.join(PREFIX, "drive_c")):
         ok("Steam prefix exists")
     else:
@@ -882,6 +977,8 @@ def cmd_doctor(args):
     else:
         info("no Xbox controller connected right now (layover controller)")
     info(f"renderer default: {cfg['renderer']}, msync: {'on' if cfg['msync'] else 'off'}")
+    gpu = registered_gpu()
+    info(f"D3DMetal identity: {cfg.get('d3dmetal_identity', 'apple')}" + (f" (registry GPU: {gpu[2]}, {gpu[0]:04x}:{gpu[1]:04x})" if gpu else " (no GPU registered in the prefix yet)"))
     info(f"data: {ROOT}")
     print()
 
@@ -947,6 +1044,8 @@ def cmd_setup(args):
         ok("prefix ready")
 
     # 5. Steam
+    install_ags_shim(quiet=False)
+
     if steam_installed() and not args.reinstall:
         ok("Windows Steam present")
     else:
@@ -1006,6 +1105,7 @@ def launch_steam(cfg, game=None, offline=None, extra_args=None):
         args += ["-noverifyfiles", "-nobootstrapupdate", "-skipinitialbootstrap", "-norepairfiles"]
     else:
         remove_webhelper_wrapper()
+    install_ags_shim()
     log = new_log("steam")
     if game:
         args += ["-applaunch", str(game)]
@@ -1273,6 +1373,8 @@ def cmd_config(args):
         val = val.lower() in ("1", "true", "on", "yes", "y")
     elif isinstance(DEFAULT_CONFIG[args.key], list):
         val = val.split()
+    elif args.key == "d3dmetal_identity" and val not in D3DMETAL_IDENTITIES:
+        die("d3dmetal_identity must be one of: " + ", ".join(D3DMETAL_IDENTITIES))
     cfg[args.key] = val
     save_config(cfg)
     ok(f"{args.key} = {val}")
@@ -1412,7 +1514,7 @@ def main(argv=None):
     s.add_argument("renderer", nargs="?", choices=RENDERER_CHOICES)
     s.set_defaults(fn=lambda a: cmd_renderer(a) if (a.game is None or a.renderer) else die("usage: layover renderer <game|default> <dxmt|wined3d|d3dmetal>"))
 
-    s = sub.add_parser("config", help="show or change a setting (msync, metal_hud, advertise_avx, retina, fps_cap, steam_args)")
+    s = sub.add_parser("config", help="show or change a setting (msync, metal_hud, advertise_avx, retina, fps_cap, steam_args, d3dmetal_identity)")
     s.add_argument("key", nargs="?")
     s.add_argument("value", nargs="?", help="for steam_args, quote the whole list, e.g. \"-cef-disable-gpu -noverifyfiles\"")
     s.set_defaults(fn=lambda a: cmd_config(a) if (a.key is None or a.value is not None) else die("usage: layover config <key> <value>"))

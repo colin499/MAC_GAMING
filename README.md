@@ -13,6 +13,7 @@ No CrossOver, no subscriptions, nothing needs an admin password.
 | D3DMetal 3.0 | Apple's Direct3D 11/12 → Metal, from the Game Porting Toolkit; needed for DirectX-12-only games. Non-commercial license. | shipped in the Sikarugir runtime bundle |
 | Runtime bundle | GStreamer (video), MoltenVK, gnutls and friends | github.com/Sikarugir-App/Wrapper |
 | Windows Steam client | Downloaded from Valve and installed into the Wine prefix | steampowered.com |
+| AMD AGS replacement (`shims/amd_ags/`) | 100 KB stand-in for AMD's `amd_ags_x64.dll`. D3DMetal poses as an AMD GPU, so games that bundle AGS (Spider-Man 2, other Nixxes ports) call it; the real one needs AMD's driver and fails, which the game reports as "No installed graphics card". Installed into the D3DMetal overlay and forced with `WINEDLLOVERRIDES amd_ags_x64=b`. | Layover's own, against AMD's MIT header |
 | Web-helper wrapper (`wrapper/`, optional) | 150 KB shim that starts Steam's Chromium UI in single-process mode; needed on plain WineHQ builds, off by default on this engine (`layover config webhelper_wrapper on`) | from notpop/steam-on-m1-wine (MIT) |
 
 Everything is installed under `~/Library/Application Support/Layover`.
@@ -72,6 +73,7 @@ After landing: `./layover flight --online` (or Steam menu → Go Online).
 ```bash
 ./layover renderer                        # show the choices and per-game settings
 ./layover renderer default auto           # auto | dxmt | d3dmetal | wined3d
+./layover config d3dmetal_identity apple  # apple (default) | amd: what D3DMetal calls the GPU
 ./layover renderer "cyberpunk" wined3d    # force one game (Steam restarts if needed)
 ```
 
@@ -81,6 +83,13 @@ with D3DMetal if any installed game needs it, so launching from Steam's own UI w
 all of them. The renderer is chosen when Steam starts; `layover play` restarts Steam
 automatically if a game needs a different one. If a game shows nothing or crashes on
 launch, try the other Metal renderer first, then `wined3d`.
+
+Under D3DMetal the GPU is reported as the adapter Wine registered in the prefix (vendor 0x106B,
+"Apple M4 Pro") rather than D3DMetal's stock "AMD Compatibility Mode". Spider-Man 2 cross-checks
+the DXGI adapter against the registry's display-adapter driver entry and otherwise stops with
+"No installed graphics card has been detected"; the Apple identity makes that lookup succeed.
+`./layover config d3dmetal_identity amd` restores the AMD identity for games that insist on a
+known desktop vendor (Layover's AGS replacement then stands in for AMD's driver library).
 
 Other settings (`./layover config`): `msync` (faster sync, on), `metal_hud` (FPS overlay), `fps_cap`
 (cap frame rate, e.g. 60, for cooler and quieter play on battery),
@@ -118,6 +127,7 @@ and dxmt.report for DXMT-specific game notes.
 ```
 layover            the program (Python 3, no dependencies beyond macOS)
 wrapper/           steamwebhelper wrapper: prebuilt .exe plus C source (rebuilds with brew's mingw-w64)
+shims/amd_ags/     AMD AGS replacement DLL: prebuilt .dll plus C++ source and AMD's header (make rebuilds it)
 Layover.command    double-click launcher for the menu
 ~/Library/Application Support/Layover/
   engines/sikarugir10.0_6/  engine/ (Wine), frameworks/ (runtime), renderers/ (dxmt, d3dmetal)

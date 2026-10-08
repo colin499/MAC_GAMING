@@ -14,15 +14,18 @@ Read this first if you are a new agent (or future me) picking up Layover.
   d3dmetal → "AMD Compatibility Mode" + D3D12 device OK, wined3d → fake GeForce fallback.
 - Steam signs in within ~15 s on this engine with NO web-helper wrapper. The wrapper (`wrapper/`) is kept
   as an opt-in (`layover config webhelper_wrapper on`) because the first engine needed it.
-- The user owns Marvel's Spider-Man 2 (AppID 2651280, DirectX-12-only, ~97 GB). It was still downloading
-  (~81/97 GB) when this session ended. **Nobody has run a game yet.** That is the next milestone.
+- Marvel's Spider-Man 2 (AppID 2651280, DirectX-12-only, 108 GB installed) **runs** as of 2026-10-08 13:35:
+  the user saw the game on screen under D3DMetal after the two start-up fixes below (DX12 detection,
+  D3DMetal identity). First start is slow (shader compile; D3DMetal caches under
+  ~/Library/Caches/d3dm/Spider-Man2.exe). D3DMetal logs a few unsupported calls (pipeline-statistics
+  queries, EnumerateMetaCommands, R32G32B32 typed buffers) that are harmless.
 - Two older engine folders may still exist under `engines/` (`wine-staging-11.18`, `cx26.3`, ~2.3 GB);
   `layover setup` deletes them when Steam is not running.
 
 ## Next steps
 
-1. When the download finishes: `./layover play "spider"` (auto-detects DX12 → D3DMetal, restarts Steam
-   with that renderer). First launch compiles shaders; expect a dark screen for 1–2 min.
+1. Spider-Man 2 runs; next: play-test performance/stability, fps_cap, controller, offline mode.
+   `./layover play "spider"` auto-detects DX12 → D3DMetal and restarts Steam with that renderer.
    - If Steam shows a "controller recommended" interstitial and the launch hangs, Highball's
      `SteamLaunchNotice.swift` documents a workaround: mark notices as seen in the user's
      `localconfig.vdf` under `UserLocalConfigStore/WebStorage` while Steam is closed.
@@ -58,6 +61,36 @@ Read this first if you are a new agent (or future me) picking up Layover.
 - Terminal.app lacks Files & Folders access to Documents; anything Layover needs at runtime must be
   copied under `~/Library/Application Support/Layover` (the wrapper exe is, see `tools/`).
 - `brew install mingw-w64` (1.5 GB) is installed; use it for tiny Windows test programs.
+- Spider-Man 2's second start-up dialog, "No installed graphics card has been detected ... monitor
+  connected", is an OK/Cancel WARNING (MB_OKCANCEL; OK continues) from the game's "Querying GPU
+  Driver Info" step: it builds PCI\VEN_xxxx&DEV_xxxx&SUBSYS_...&REV_.. from the DXGI adapter desc
+  and looks for that device's driver entry in HKLM\System\CurrentControlSet (Enum\PCI →
+  Control\Class\{4d36e968-...}\0000 → DriverVersion). Wine registers the real GPU there
+  (VEN_106B&DEV_03F1 "Apple M4 Pro", DriverVersion 31.0.10.1000) while D3DMetal's DXGI reports
+  VEN_1002&DEV_66AF "AMD Compatibility Mode", so the lookup fails. Fix: D3DMetal honours
+  D3DM_VENDOR_ID / D3DM_DEVICE_ID / D3DM_DEVICE_DESCRIPTION (hex strings); Layover now sets them
+  from system.reg (`registered_gpu()`, config `d3dmetal_identity` = apple|amd). With the Apple
+  identity the game creates its device, loads Streamline/FidelityFX/XeSS and the PlayStation pad
+  library and continues; the DirectX 12 check (D3D12CreateDevice at FL 11_0) passes either way.
+  Found with WINEDEBUG=+relay (RelayInclude in HKCU\Software\Wine\Debug), objdump of the function
+  around the MessageBoxW return address, and the exe's own log strings.
+- shims/amd_ags is a replacement for AMD's AGS 6.1 runtime (builtin-signed, forced with
+  WINEDLLOVERRIDES amd_ags_x64=b under D3DMetal). It was built while chasing the dialog; it was
+  not the cause but it does make agsInitialize succeed (verified with a test exe) and is kept for
+  the `amd` identity. D3DMetal writes its diagnostics to stderr as "[D3DMetal:LOG:...]" lines.
+- Direct launches for debugging: put `steam_appid.txt` (2651280) next to Spider-Man2.exe and run
+  the exe with `wine` under wine_env() while Steam is up; no Steam restart or cloud-sync click
+  per iteration. Remove the file afterwards.
+- One Steam-launched start (13:29) sat idle at 736 MB for 3+ minutes with no window, every thread
+  parked in a wait, before data loading began; the next starts (direct and via Steam) reached 4 GB
+  within 25 s. Not understood; if it recurs, `layover quit` and relaunch.
+- Steam shows a "cloud sync failed" prompt for a game whose previous process was killed (every
+  `layover quit` while a game runs); the next launch waits for a click on it.
+- DX12 auto-detection must scan WHOLE executables: Spider-Man2.exe is 194 MB and its `d3d12.dll`
+  import string sits at byte ~140 M. A 64 MB cap missed it, Steam started under DXMT, and the game
+  showed "DirectX 12 support not detected ... Apple M4 Pro". The `D3D12/` Agility SDK folder and
+  `*_dx12.dll` files are also treated as DX12 markers now. Scanning a half-downloaded game yields
+  nothing, which is fine because unknown results are not cached.
 
 ## Useful references
 
