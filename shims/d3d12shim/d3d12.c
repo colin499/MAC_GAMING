@@ -1,6 +1,8 @@
 // Layover d3d12shim: a d3d12.dll that sits in front of D3DMetal's. Three jobs, all opt-in by env:
 //   LAYOVER_MANAGED_MB=<n>  Spider-Man 2 fix: shrink the game's "ManagedBuffer" GPU pool so its typed
 //                           buffer views fit Metal's 2^28-element limit (see try_patch_budget).
+//   LAYOVER_SKIN_MB=<n>     Spider-Man 2 T-pose fix: keep skinned models' GPU data in the first 1 GB of
+//                           the pool (sm2_skin.c; default 256 MB, 0 = off; LAYOVER_SKIN_LOG=1 per model).
 //   LAYOVER_TSSHIM=1        serve timestamp queries from the CPU clock (Highball's tsshim fix).
 //   LAYOVER_D3D12_LOG=<win path>  log what the game asks of D3D12 (feature queries, pools, views,
 //                           pipelines, command signatures, counters); LAYOVER_D3D12_VERBOSE=1 for all.
@@ -38,6 +40,18 @@ static FILE *log_out(void)
 #define NOTE(...) do { EnterCriticalSection(&log_lock); FILE *f_ = log_out(); SYSTEMTIME st_; GetLocalTime(&st_); \
     fprintf(f_, "%02u:%02u:%02u.%03u [%lu] ", st_.wHour, st_.wMinute, st_.wSecond, st_.wMilliseconds, (unsigned long)GetCurrentThreadId()); \
     fprintf(f_, __VA_ARGS__); fputc('\n', f_); fflush(f_); LeaveCriticalSection(&log_lock); } while (0)
+
+#include <stdarg.h>
+void shim_note(const char *fmt, ...)
+{
+    char buf[1024]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
+    NOTE("%s", buf);
+}
+static int readable(const void *p, SIZE_T n);
+int shim_readable(const void *p, SIZE_T n) { return readable(p, n); }
+void sm2_skin_install(void);
+void sm2_skin_stats(char *out, size_t cap);
+void sm2_skin_note_copy(UINT64 doff, UINT64 n);
 
 static HMODULE load_real(void)
 {
@@ -80,7 +94,7 @@ static DWORD WINAPI stats_thread(LPVOID arg)
 {
     for (;;) {
         Sleep(5000);
-        if (pool_res) NOTE("pool: high-water %llu MB of %llu, copies %ld, past-end %ld", (unsigned long long)(pool_hw >> 20), (unsigned long long)(pool_width >> 20), pool_copies, pool_oob);
+        if (pool_res) { char sk[300]; sm2_skin_stats(sk, sizeof sk); NOTE("pool: high-water %llu MB of %llu, copies %ld, past-end %ld | %s", (unsigned long long)(pool_hw >> 20), (unsigned long long)(pool_width >> 20), pool_copies, pool_oob, sk); }
         LOG("stats: execlists=%ld dispatch=%ld dispatchmesh=%ld draw=%ld drawidx=%ld execind=%ld copybuf=%ld setpso=%ld map=%ld barrier=%ld | views srv_buf=%ld uav_buf=%ld srv_tex=%ld uav_tex=%ld | pso gfx=%ld cs=%ld gen=%ld FAIL=%ld | res buf=%ld tex=%ld",
             c_execlists, c_dispatch, c_dispatchmesh, c_draw, c_drawidx, c_execind, c_copybuf, c_setpso, c_map, c_barrier, c_srv_buf, c_uav_buf, c_srv_tex, c_uav_tex, c_pso_gfx, c_pso_cs, c_pso_gen, c_pso_fail, c_res_buf, c_res_tex);
     }
@@ -578,6 +592,7 @@ static void STDMETHODCALLTYPE hook_CopyBufferRegion(ID3D12GraphicsCommandList *l
     if (pool_res && d == pool_res) {
         LONG64 end = (LONG64)(doff + n), prev;
         InterlockedIncrement(&pool_copies);
+        sm2_skin_note_copy(doff, n);
         do { prev = pool_hw; if (end <= prev) break; } while (InterlockedCompareExchange64(&pool_hw, end, prev) != prev);
         if (end > prev && (end >> 26) != (prev >> 26)) NOTE("pool high-water mark %llu MB (copies into pool: %ld)", (unsigned long long)(end >> 20), pool_copies);
         if ((UINT64)end > pool_width) { LONG k = InterlockedIncrement(&pool_oob); if (k <= 10) NOTE("COPY PAST POOL END: dst offset %llu + %llu bytes > %llu MB pool (src %p+%llu)", (unsigned long long)doff, (unsigned long long)n, (unsigned long long)(pool_width >> 20), (void *)s, (unsigned long long)soff); }
@@ -758,6 +773,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         RESOLVE(D3D12SerializeVersionedRootSignature); RESOLVE(GetBehaviorValue);
         install_vram_cap();
         install_logpoints();
+        sm2_skin_install();
         { char exe[MAX_PATH]; GetModuleFileNameA(NULL, exe, sizeof exe); LOG("d3dlog loaded in %s (pid %lu) tsshim=%d verbose=%d", exe, (unsigned long)GetCurrentProcessId(), tsshim, verbose); }
         CreateThread(NULL, 0, stats_thread, NULL, 0, NULL);   // 5-second pool usage line always; the rest only when logging
     }
