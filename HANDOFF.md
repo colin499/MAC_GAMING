@@ -1,6 +1,62 @@
-# Handoff notes (2026-10-08, end of first session)
+# Handoff notes (2026-10-08, end of second session)
 
 Read this first if you are a new agent (or future me) picking up Layover.
+
+## START HERE: the one open task is Spider-Man 2's T-pose, and here is the plan
+
+**What you inherit.** The game runs on Layover (Wine + D3DMetal). Characters are frozen in their bind
+pose. The cause is known and proven (section "ROOT CAUSE FOUND" below): the game puts all geometry
+in one 2046 MB pool and reads skinning inputs through 4-byte *typed* buffer views over the whole
+pool; Metal hardware caps such a view at 2^28 elements = the first 1 GB, so anything placed above
+1 GB reads zeros. Shrinking the pool to 1 GB (the shim can do it) animates everything but the city
+load needs more than 1 GB and the game crashes. Every other shortcut has been tried and is listed
+under "Where it stands"; do not repeat them.
+
+**The plan (path 1): keep the 2046 MB pool, make the typed-read data land in its first 1 GB.**
+The engine's `D3DBufferManager` sub-allocates the pool itself, so the placement is decided by game
+code we can patch in memory from `shims/d3d12shim` (it already patches the game's budget table and
+hooks D3DMetal's vtables; it has an INT3 logpoint facility and a D3D12 call trace). Steps:
+
+1. Map the allocator. Set logpoints (env `LAYOVER_LOGPOINTS=rva,rva,...`, hex RVAs relative to the
+   exe base 0x140000000; `LAYOVER_LOGPOINTS_MAX=200` to log more hits) on:
+   - `0x2c5b8b0` AllocateBuffer(mgr, D3DHeapAlloc* req, DXGI_FORMAT fmt=r8d, data=r9, name=[rsp+0x28]
+     (logged as s5), DataCopy, MemoryLocation) - the public entry; logs the FORMAT and NAME of each
+     allocation. Expect names like the g_GlobalSrv_* view names or asset names.
+   - `0x2c59720` AllocSmall(request*) where rcx -> {mgr @0, subheap ptr @8, size ptr @0x10,
+     align ptr @0x18}; it returns the pool offset in rax. Log entry and the return (set a logpoint on
+     the `ret` at the end of the function, or on its callers' return addresses) to learn offset per
+     (format, name).
+   - `0x2c5a0d0` subheap creation (mgr, size=edx, flags=r8d, r9d) -> `0x2c5b3b0`; subheaps are the
+     per-class regions carved from the pool (list at mgr+0xb78, count mgr+0xb80).
+   Run the game (see "Tooling" for the direct launch; the user presses Play and Continue), load the
+   save, and correlate: which formats/names get offsets above 0x40000000 (1 GB) and which subheap
+   they come from. Pool offsets are also visible from the shim's CopyBufferRegion tracker
+   (`pool high-water mark` lines; add per-copy logging if offsets are needed).
+2. Pick the steering patch. Likely options, cheapest first:
+   a. If skinned-mesh vertex data has its own subheap class: pre-create / enlarge that class's
+      subheaps at init so they are carved first (low offsets). A logpoint at 0x2c5b3b0 shows the
+      creation order and sizes; the shim could call the game's own subheap-create function early.
+   b. If classes are mixed: hook AllocSmall and, for requests whose format is a 4-byte typed one
+      (DXGI 28/24/42 or whatever step 1 shows), retry from a reserved low region (reserve the first
+      N MB at pool creation by issuing a dummy allocation that is freed into a private free list).
+   c. Fallback: two pools. Patch the pool-creation path (0x142c5ae84, CreateHeap at 0x1431dd14c)
+      so the typed SRVs/UAVs are created over a second 1 GB buffer and typed allocations go there.
+      Harder: GPU virtual addresses must stay consistent for raw views.
+3. Verify with the user: pool stays 2046 MB in the shim log, no "limiting size" effect on skinned
+   data (characters animate), save loads, 5+ minutes of play, suit switch still fine.
+
+Everything you need to run this loop: `tools/dev/run_in_prefix.py` (direct launch with the shim and
+env; put `steam_appid.txt` containing 2651280 beside Spider-Man2.exe first and remove it after),
+`tools/dev/sendkey.c` (Enter = Play on the launcher window, class GameNxApp), `tools/dev/minidump.py`
+(crash registers + stack from ~/Documents/Marvel's Spider-Man 2/*.mdmp), `objdump -d --start-address`
+on the 194 MB exe (~30 s per call), and the shim's `LAYOVER_D3D12_LOG=Z:\path` trace. The user sits at
+the machine, presses Play/Continue when asked and reports "T-pose" or "animates" by eye; screenshots
+from this session capture the wrong Space. Keep Steam running (the wineserver is up with msync OFF;
+the launch script copies that). Each run costs 2-3 minutes.
+
+Traps: the vramcap dxgi wrapper crashes the game (don't use; the shim's LAYOVER_VRAM_MB replaced it);
+a `ps | grep` pattern that matches your own shell's command line kills your shell; a stray Enter at
+the main menu hits Quit; the game's crash dialog needs `crs-handler.exe` killed too.
 
 ## State right now
 
