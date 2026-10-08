@@ -203,6 +203,39 @@ static void try_patch_budget(const char *where)
     if (hit) budget_done = 1; else NOTE("no ManagedBuffer entry among %d budgets (%s); game build changed? fix not applied", count, where);
 }
 
+// ---- Spider-Man 2 allocation steering (LAYOVER_SUBHEAP_MB) --------------------------------------
+// The ManagedBuffer manager reserves four class subheaps at the bottom of the 2046 MB pool: 32, 32,
+// 96 and 416 MB (= 576 MB), and only a small part is ever used, so skinned-mesh data is carved ABOVE
+// them and climbs past the 1 GB typed-view limit -> T-pose. Shrinking the big two (96 + 416 MB) pulls
+// the carve region down so skinned data lands in the first 1 GB while the pool keeps its full size
+// (no exhaustion crash). The immediates "mov edx, 0x06000000 / 0x1a000000" precede the subheap-create
+// calls in the two D3DBufferManagerDX12 class-setup functions (build v2.810.0.0). LAYOVER_SUBHEAP_MB
+// is the new size (MB) for the 416 MB class; the 96 MB class is scaled to a quarter of it.
+static int subheap_done;
+static void patch_one_imm(UINT8 *at, UINT32 was, UINT32 now, const char *tag)
+{
+    DWORD old;
+    if (!readable(at, 4) || *(UINT32 *)at != was) { NOTE("subheap imm %s at %p not the expected %#x (found %#x); skipped", tag, at, was, readable(at, 4) ? *(UINT32 *)at : 0); return; }
+    if (VirtualProtect(at, 4, PAGE_EXECUTE_READWRITE, &old)) { *(UINT32 *)at = now; VirtualProtect(at, 4, old, &old); FlushInstructionCache(GetCurrentProcess(), at, 4); NOTE("subheap imm %s: %u MB -> %u MB", tag, was >> 20, now >> 20); }
+}
+static void try_patch_subheaps(const char *where)
+{
+    char v[32], exepath[MAX_PATH]; UINT8 *exe; const char *base; UINT32 big, small;
+    if (subheap_done) return;
+    if (!GetEnvironmentVariableA("LAYOVER_SUBHEAP_MB", v, sizeof v)) { subheap_done = 1; return; }
+    GetModuleFileNameA(NULL, exepath, sizeof exepath); base = strrchr(exepath, '\\'); base = base ? base + 1 : exepath;
+    if (_stricmp(base, "Spider-Man2.exe")) { subheap_done = 1; return; }
+    big = (UINT32)atoi(v) << 20; if (big < (16u << 20) || big > (416u << 20)) { NOTE("LAYOVER_SUBHEAP_MB=%s ignored (16..416)", v); subheap_done = 1; return; }
+    small = big / 4; if (small < (16u << 20)) small = (16u << 20);
+    exe = (UINT8 *)GetModuleHandleA(NULL);
+    // operand is the 4 bytes right after the 0xba (mov edx, imm32) opcode
+    patch_one_imm(exe + 0x2cbacce + 1, 0x06000000, small, "fn1.96M");
+    patch_one_imm(exe + 0x2cbad05 + 1, 0x1a000000, big,   "fn1.416M");
+    patch_one_imm(exe + 0x2cbb339 + 1, 0x06000000, small, "fn2.96M");
+    patch_one_imm(exe + 0x2cbb389 + 1, 0x1a000000, big,   "fn2.416M");
+    subheap_done = 1;
+}
+
 // ---- VRAM cap (LAYOVER_VRAM_MB): what DXGI tells the game about video memory ---------------------
 // D3DMetal reports Metal's recommended working set (75% of RAM) as dedicated video memory and twice
 // that as the budget; the game sizes its memory budgets from it. We patch the exe's import table for
@@ -290,7 +323,12 @@ static void install_vram_cap(void)
 #define MAX_LP 16
 static struct { UINT8 *addr; UINT8 orig; volatile LONG hits; } lps[MAX_LP]; static int n_lp; static long lp_max = 50;
 static DWORD lp_tls;
-static void lp_write(UINT8 *a, UINT8 b) { DWORD old; VirtualProtect(a, 1, PAGE_EXECUTE_READWRITE, &old); *a = b; VirtualProtect(a, 1, old, &old); FlushInstructionCache(GetCurrentProcess(), a, 1); }
+static CRITICAL_SECTION lp_lock; static int lp_lock_ready;
+// Serialize every byte flip: without this, one thread can restore the page to read-only (its second
+// VirtualProtect) while another thread's *a=b is still writing the code byte, which faults on the
+// now read-only page and crashes the game. The single-byte write itself is atomic, so a thread that
+// executes the address concurrently always sees a valid 0xCC or the original byte, never garbage.
+static void lp_write(UINT8 *a, UINT8 b) { DWORD old; if (lp_lock_ready) EnterCriticalSection(&lp_lock); VirtualProtect(a, 1, PAGE_EXECUTE_READWRITE, &old); *a = b; VirtualProtect(a, 1, old, &old); FlushInstructionCache(GetCurrentProcess(), a, 1); if (lp_lock_ready) LeaveCriticalSection(&lp_lock); }
 static LONG CALLBACK lp_handler(EXCEPTION_POINTERS *ep)
 {
     CONTEXT *c = ep->ContextRecord; DWORD code = ep->ExceptionRecord->ExceptionCode; int i;
@@ -299,9 +337,13 @@ static LONG CALLBACK lp_handler(EXCEPTION_POINTERS *ep)
         for (i = 0; i < n_lp; i++) if (lps[i].addr == pc) {
             LONG h = InterlockedIncrement(&lps[i].hits); UINT64 *sp = (UINT64 *)c->Rsp; UINT8 *exe = (UINT8 *)GetModuleHandleA(NULL);
             if (h <= lp_max || (h % 1000) == 0) {
-                char str[96] = ""; const char *sa = (const char *)sp[5];   // 5th stack-passed arg ([rsp+0x28]) as a string, if it is one
+                char str[96] = "", str6[96] = "", ext[200] = ""; const char *sa = (const char *)sp[5], *sb = (const char *)sp[6];   // 5th/6th stack-passed args as strings, if they are
                 if (sa && readable(sa, 96)) { int k; for (k = 0; k < 95 && sa[k] >= 0x20 && sa[k] < 0x7f; k++) str[k] = sa[k]; str[k] = 0; }
-                NOTE("logpoint exe+0x%llx hit %ld: rcx=%llx rdx=%llx r8=%llx r9=%llx rax=%llx ret=exe+0x%llx s5='%s'", (unsigned long long)(pc - exe), h, (unsigned long long)c->Rcx, (unsigned long long)c->Rdx, (unsigned long long)c->R8, (unsigned long long)c->R9, (unsigned long long)c->Rax, (unsigned long long)(sp[0] - (UINT64)exe), str);
+                if (sb && readable(sb, 96)) { int k; for (k = 0; k < 95 && sb[k] >= 0x20 && sb[k] < 0x7f; k++) str6[k] = sb[k]; str6[k] = 0; }
+                { const UINT8 *ra = (const UINT8 *)c->Rax;   // fields of whatever rax points at (allocation record / subheap), if readable
+                  if (ra && readable(ra, 0x20)) snprintf(ext, sizeof ext, " rax[10]=%x rax[14]=%x rax[1c]=%x", *(UINT32 *)(ra + 0x10), *(UINT32 *)(ra + 0x14), *(UINT32 *)(ra + 0x1c));
+                  if (ra && readable(ra, 0x4f8)) snprintf(ext + strlen(ext), sizeof ext - strlen(ext), " rax[4d0]=%llx rax[4f0]=%x rax[4f4]=%x", (unsigned long long)*(UINT64 *)(ra + 0x4d0), *(UINT32 *)(ra + 0x4f0), *(UINT32 *)(ra + 0x4f4)); }
+                NOTE("logpoint exe+0x%llx hit %ld: rcx=%llx rdx=%llx r8=%llx r9=%llx rax=%llx ret=exe+0x%llx s5='%s' s6='%s' s7=%llx s8=%llx%s", (unsigned long long)(pc - exe), h, (unsigned long long)c->Rcx, (unsigned long long)c->Rdx, (unsigned long long)c->R8, (unsigned long long)c->R9, (unsigned long long)c->Rax, (unsigned long long)(sp[0] - (UINT64)exe), str, str6, (unsigned long long)sp[7], (unsigned long long)sp[8], ext);
             }
             lp_write(pc, lps[i].orig); c->EFlags |= 0x100; TlsSetValue(lp_tls, (void *)(UINT_PTR)(i + 1));
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -316,6 +358,7 @@ static void install_logpoints(void)
 {
     char v[512], *tok; UINT8 *exe = (UINT8 *)GetModuleHandleA(NULL);
     if (!GetEnvironmentVariableA("LAYOVER_LOGPOINTS", v, sizeof v)) return;
+    InitializeCriticalSection(&lp_lock); lp_lock_ready = 1;
     lp_tls = TlsAlloc(); AddVectoredExceptionHandler(1, lp_handler);
     { char m[16]; if (GetEnvironmentVariableA("LAYOVER_LOGPOINTS_MAX", m, sizeof m)) lp_max = atol(m); }
     for (tok = strtok(v, ","); tok && n_lp < MAX_LP; tok = strtok(NULL, ",")) {
@@ -328,7 +371,7 @@ static void install_logpoints(void)
 static HRESULT STDMETHODCALLTYPE hook_CreateQueryHeap(ID3D12Device *dev, const D3D12_QUERY_HEAP_DESC *desc, REFIID riid, void **out)
 {
     FakeHeap *h; HRESULT hr;
-    try_patch_budget("CreateQueryHeap");
+    try_patch_budget("CreateQueryHeap"); try_patch_subheaps("CreateQueryHeap");
     if (desc) LOG("CreateQueryHeap type=%d count=%u", (int)desc->Type, desc->Count);
     if (!tsshim || !desc || (desc->Type != D3D12_QUERY_HEAP_TYPE_TIMESTAMP && desc->Type != D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP))
         return real_CreateQueryHeap(dev, desc, riid, out);
@@ -469,7 +512,7 @@ static HRESULT STDMETHODCALLTYPE hook_CreatePipelineState(ID3D12Device2 *dev, co
 static HRESULT STDMETHODCALLTYPE hook_CreateCommandSignature(ID3D12Device *dev, const D3D12_COMMAND_SIGNATURE_DESC *d, ID3D12RootSignature *rs, REFIID riid, void **out)
 {
     HRESULT hr = real_CreateCommandSignature(dev, d, rs, riid, out);
-    try_patch_budget("CreateCommandSignature");
+    try_patch_budget("CreateCommandSignature"); try_patch_subheaps("CreateCommandSignature");
     char args[400] = ""; size_t o = 0; UINT i;
     if (d) for (i = 0; i < d->NumArgumentDescs && o < sizeof args - 40; i++) {
         const D3D12_INDIRECT_ARGUMENT_DESC *a = &d->pArgumentDescs[i];
@@ -671,7 +714,7 @@ HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL level, REF
     HRESULT hr;
     if (!fn) return E_FAIL;
     hr = fn(adapter, level, riid, out);
-    try_patch_budget("D3D12CreateDevice");
+    try_patch_budget("D3D12CreateDevice"); try_patch_subheaps("D3D12CreateDevice");
     LOG("D3D12CreateDevice adapter=%p level=0x%x out=%p hr=0x%lx -> %p", adapter, (unsigned)level, out, (unsigned long)hr, out ? *out : NULL);
     if (SUCCEEDED(hr) && out && *out) {
         ID3D12Device *dev = NULL; IUnknown *u = (IUnknown *)*out;
@@ -680,6 +723,21 @@ HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL level, REF
     return hr;
 }
 
+// Settings can also come from a d3d12shim.env file beside this DLL (KEY=VALUE lines): a game started
+// by Steam inherits Steam's environment, so per-run knobs cannot always be passed through env.
+static void load_env_file(void)
+{
+    char path[MAX_PATH], line[1024]; FILE *f; char *p;
+    if (!GetModuleFileNameA(self, path, sizeof path)) return;
+    p = strrchr(path, '\\'); if (!p) return; strcpy(p + 1, "d3d12shim.env");
+    f = fopen(path, "r"); if (!f) return;
+    while (fgets(line, sizeof line, f)) {
+        char *eq = strchr(line, '='), *nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
+        if (!eq || line[0] == '#') continue; *eq = 0;
+        if (GetEnvironmentVariableA(line, NULL, 0) == 0) SetEnvironmentVariableA(line, eq + 1);
+    }
+    fclose(f);
+}
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
     if (reason == DLL_PROCESS_ATTACH) {
@@ -689,6 +747,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         InitializeCriticalSection(&log_lock);
         InitializeCriticalSection(&ring_lock);
         QueryPerformanceFrequency(&f); qpc_freq = (UINT64)f.QuadPart;
+        load_env_file();
         tsshim = GetEnvironmentVariableA("LAYOVER_TSSHIM", v, sizeof v) == 1 && v[0] == '1';
         logging = GetEnvironmentVariableA("LAYOVER_D3D12_LOG", NULL, 0) > 0;
         verbose = GetEnvironmentVariableA("LAYOVER_D3D12_VERBOSE", v, sizeof v) == 1 && v[0] == '1';

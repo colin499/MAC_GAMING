@@ -1,6 +1,62 @@
-# Handoff notes (2026-10-08, end of second session)
+# Handoff notes (2026-10-08, end of third session)
 
 Read this first if you are a new agent (or future me) picking up Layover.
+
+## Third session (evening): what changed, what was learned, what is next
+
+**State of the game:** runs stably through Steam with the stock 2046 MB pool; characters still T-pose.
+No shim knobs are active (no `d3d12shim.env` files). The shim DLL in the engine overlay and in
+`tools/d3d12shim.dll` is the new build from this session (inert without knobs).
+
+**Environment facts that cost an hour:**
+- Wine processes started from an agent/terminal session cannot see `~/Documents` at all (macOS
+  folder access on the Wine binary), so the game said "Unable to write to the game's user folder"
+  and Steam cloud sync failed with I/O errors. Fix in place: the prefix's `users/colinlysik/Documents`
+  is now a REAL folder (the old symlink was renamed to `Documents.orig-link`) holding a copy of
+  `Marvel's Spider-Man 2/` (saves, prefs, log). Steam cloud sync works again. The game's log and
+  minidumps are now under the prefix, not `~/Documents`. Decide later whether to keep this.
+- Launch the game through the running Steam (`wine start steam://rungameid/2651280`, as
+  `run_in_prefix.py ... start steam://rungameid/2651280 --no-shim`), then drive the windows with
+  `winlist.exe`/`sendkey.exe` (Enter on "Steam Dialog" dismisses the launch notice; Enter on the
+  `GameNxApp` launcher = Play). The direct `Spider-Man2.exe` launch fails on the user-folder dialog.
+- Wine reports builtin DLLs under `C:\windows\system32`, so the shim's new settings file
+  `d3d12shim.env` (KEY=VALUE lines, read in DllMain, only sets variables that are unset) must be
+  placed in the prefix's `drive_c/windows/system32/`, not beside the DLL in the overlay. This is how
+  knobs reach a Steam-launched game (Steam's environment cannot be changed after launch).
+
+**Shim additions (shims/d3d12shim/d3d12.c):** settings file (above); `LAYOVER_SUBHEAP_MB=<n>`
+rewrites the four class-subheap sizes (32/32/96/416 MB) that the DX12 buffer manager reserves at
+pool start, in both setup functions; the logpoint byte-flip is now serialized by a lock (the crash
+at the logpoint address was a write to a code page another thread had just set back to read-only).
+Logpoints on the allocation hot path are still unusable: with the lock the game stalls (zero GPU
+work for minutes); without it the game crashes within a minute. Use them only on rare paths.
+
+**Measurements (single ManagedBuffer manager, object at exe+0xc0dc960, menu load, 6459 allocations,
+log in tools/dev/alloc-log-menu-2026-10-08.txt.gz, parser tools/dev/analyze2.py):**
+- caller exe+0x2b24936 (ModelManager / "Model Subset Gpu Registry", hash-named buffers): 2158
+  allocations, 532 MB, 444 of them end above 1 GB. All memloc 0, format 0. Size mix: 1177 < 64 KB,
+  444 in 64-256 KB, 357 in 256 KB-1 MB, 180 >= 1 MB. Nothing at the call distinguishes skinned
+  from static meshes.
+- caller exe+0x2e3d09e ("Heap Set", name "Asset"): 1362 allocations, 65 MB, 286 above 1 GB.
+- R16_UINT (format 57) allocations: 489, 2.2 MB total, all below 660 MB. Not involved.
+- Pool high-water with the stock layout: 1656 MB after the save loads (stable, no past-end copies).
+  With LAYOVER_SUBHEAP_MB=64 the four reserved subheaps shrink (16/16/64 MB effective), the game
+  still runs stably, high-water is still 1656 MB, and the user still sees T-pose: compaction of the
+  reserved region does not move the skinned data below 1 GB.
+- D3DMetal side is closed: `D3DMDevice::GetTextureBufferSizeLimit` uses a fixed
+  `kMaxTexBufferSize`; raw-load emulation exists only for RGB32 (`EnableRGB32TypedBuffersWA`).
+
+**The remaining plan (unchanged in substance, better targeted):** skinned-character meshes are a
+small fraction of the pool but are interleaved with static geometry by the same allocator. The fix
+is to recognise skinned models one level above the allocation call (the ModelManager code around
+exe+0x2b24700..0x2b24940 that builds a model's GPU data; the model object is in rbp there, with
+byte flags at +0x184 and +0x1a4 worth checking) and give their buffers a reserved region below
+1 GB, leaving static geometry free to use the rest of the 2046 MB. Verify by eye at the main menu
+(T-poses with the stock layout), then a save load and a few minutes of play.
+
+**Tools:** tools/dev/pe.py (capstone/pefile disassembler with string annotation; `python3 pe.py
+VA [nbytes]`), xref.py (rel32/rip-relative reference finder), ctx.py (call-site context),
+analyze2.py (allocation-log parser). Make a venv with `pip install capstone pefile numpy`.
 
 ## START HERE: the one open task is Spider-Man 2's T-pose, and here is the plan
 
