@@ -9,8 +9,14 @@
 // Fix: give skinned models their own region in the first 1 GB. The engine's own machinery does the
 // work; we only decide placement:
 //   * D3DBufferManager::CreateSubHeap (exe+0x2c5a0d0) carves a region out of the pool bottom-up.
-//     The game creates one 526 MB subheap early (impostors). Right before that call we create ours,
-//     so it sits around [128 MB, 128+N MB) and the impostor heap stays below 1 GB too.
+//     The game creates one 526 MB subheap early (impostors; their data is read through the typed
+//     views as well, so it must stay below 1 GB: measured peak use 193 MB over 3 hours). Right before
+//     that call we create ours and shrink the impostor heap to 16 MB, so the first 1 GB is: [0,132)
+//     small allocations, [132,1008) our shared heap (skinned models + impostor data, redirected in the
+//     AllocateBuffer hook while the heap keeps LAYOVER_SKIN_RESERVE_MB free for skinned models),
+//     [1008,1024) the game's own impostor heap (fallback). Static geometry (peak ~690 MB) goes above
+//     1 GB where raw reads work fine. Impostor frees name their heap as owner; the FreeBuffer hook
+//     clears that so the record is resolved by address.
 //   * Model loading pre-allocates the GPU blob before the data is read (one AllocateBuffer per
 //     model, nothing there says "skinned"). The loader DMA's the asset's GPU segment into a CPU
 //     mirror of the pool at the blob's offset. When the data has arrived, the model handler
@@ -107,20 +113,29 @@ typedef const UINT8 *(*PFN_FindSection)(const void *dat1, UINT tag);
 static PFN_Allocate g_alloc; static PFN_CreateSubHeap g_create_subheap; static PFN_FreeDeferred g_free_deferred; static PFN_FindSection g_find_section;
 static UINT8 *g_mgr;
 static void *skin_heap; static UINT64 skin_heap_lo, skin_heap_hi;   // our subheap and its pool-offset range
-static UINT skin_mb = 640; static UINT impostor_mb = 0; static int plug_on = 1; static int skin_log;
+static UINT skin_mb = 876; static UINT impostor_mb = 16; static UINT reserve_mb = 48; static int plug_on = 0; static int skin_log;
+static volatile LONG imp_redirected, imp_overflow;
 static void *plug;   // temporary block filling [skin heap end, 1 GB) while the game creates its impostor subheap, so that heap lands above 1 GB
 static void *imp_heap; static UINT64 imp_lo, imp_hi, imp_req; static volatile LONG64 imp_live, imp_peak, skin_peak; static volatile LONG imp_allocs;
 static volatile LONG st_models, st_skinned, st_moved, st_fail, st_already_low, st_freed; static volatile LONG64 st_live;
 static CRITICAL_SECTION skin_lock; static int in_create;
 
 static int in_skin_heap(UINT64 off) { return skin_heap && off >= skin_heap_lo && off < skin_heap_hi; }
+// exact live bytes inside our heap, from the manager's record table (index allocator at mgr+0x510: capacity @+0x18; records at [mgr+0x538], 0x20 bytes, byte +0x18 = live)
+static UINT64 skin_live_exact(void)
+{
+    int n = *(int *)(g_mgr + 0x528), i; UINT8 *tab = *(UINT8 **)(g_mgr + 0x538); UINT64 b = 0;
+    if (!tab || n <= 0 || n > 1000000 || !shim_readable(tab, (SIZE_T)n * 0x20)) return (UINT64)st_live;
+    for (i = 0; i < n; i++) { UINT8 *rec = tab + (SIZE_T)i * 0x20; if (rec[0x18] && in_skin_heap(*(UINT32 *)(rec + REC_OFF))) b += *(UINT32 *)(rec + REC_SIZE); }
+    return b;
+}
 
 static void create_skin_heap(const char *why)
 {
     UINT8 *h; UINT64 base, mirror;
     if (skin_heap || in_create || !skin_mb) return;
     in_create = 1;
-    h = g_create_subheap(g_mgr, skin_mb << 20, 0x2000, 0);
+    h = g_create_subheap(g_mgr, skin_mb << 20, 0x8000, 0);
     in_create = 0;
     if (!h) { SNOTE("skin heap: CreateSubHeap(%u MB) failed (%s); skinned models will not be steered", skin_mb, why); skin_mb = 0; return; }
     base = *(UINT64 *)(h + 0x4d0); mirror = *(UINT64 *)(g_mgr + MGR_MIRROR_BASE);
@@ -201,7 +216,17 @@ typedef void (*PFN_Free)(void *mgr, void *owner, void **rec);
 static void on_alloc(Regs *r)
 {
     if (!imp_heap) { resolve_imp_heap(); if (imp_heap && plug) { void *p = plug; plug = NULL; ((PFN_Free)(exe_base + RVA_FREE))(g_mgr, NULL, &p); SNOTE("plug released"); } }
-    if (imp_heap && (void *)r->rdx == imp_heap) { LONG64 v = InterlockedExchangeAdd64(&imp_live, (LONG64)(r->r9 & 0xffffffff)) + (LONG64)(r->r9 & 0xffffffff); InterlockedIncrement(&imp_allocs); if (v > imp_peak) imp_peak = v; }
+    if (imp_heap && (void *)r->rdx == imp_heap) {
+        UINT64 size = r->r9 & 0xffffffff; LONG64 v = InterlockedExchangeAdd64(&imp_live, (LONG64)size) + (LONG64)size; LONG k = InterlockedIncrement(&imp_allocs); if (v > imp_peak) imp_peak = v;
+        // impostor data is read through the typed views too: serve it from the shared low heap while that keeps a reserve for skinned models
+        if (skin_heap && (k % 16 == 0 || (UINT64)st_live + size + ((UINT64)reserve_mb << 20) > ((UINT64)skin_mb << 20))) st_live = (LONG64)skin_live_exact();   // resync the estimate (failed requests are never freed)
+        if (skin_heap && (UINT64)st_live + size + ((UINT64)reserve_mb << 20) <= ((UINT64)skin_mb << 20)) {
+            r->rdx = (UINT64)(UINT_PTR)skin_heap; InterlockedIncrement(&imp_redirected); { LONG64 w = InterlockedExchangeAdd64(&st_live, (LONG64)size) + (LONG64)size; if (w > skin_peak) skin_peak = w; }
+        } else { LONG o = InterlockedIncrement(&imp_overflow); if (o <= 10) SNOTE("impostor request of %llu KB not redirected: shared heap live %lld MB", (unsigned long long)(size >> 10), (long long)(st_live >> 20)); }
+        if (skin_log >= 2 && k <= 400) { UINT64 *sp = (UINT64 *)(r + 1); const char *nm = (const char *)sp[6]; char n[64] = ""; int i;
+            if (nm && shim_readable(nm, 64)) { for (i = 0; i < 63 && nm[i] >= 0x20 && nm[i] < 0x7f; i++) n[i] = nm[i]; n[i] = 0; }
+            SNOTE("impostor alloc %ld: size %llu fmt %llu data %p datacopy %llu memloc %llu ret exe+0x%llx name '%s'", k, (unsigned long long)size, (unsigned long long)(r->r8 & 0xffffffff), (void *)sp[5], (unsigned long long)sp[7], (unsigned long long)sp[8], (unsigned long long)(sp[0] - (UINT64)exe_base), n); }
+    }
 }
 
 // pre-hook on FreeBuffer: account for relocated blobs going away (rcx mgr, rdx owner, r8 -> rec)
@@ -210,7 +235,10 @@ static void on_free(Regs *r)
     UINT8 **pp = (UINT8 **)r->r8, *rec;
     if (!skin_heap || !pp || !shim_readable(pp, 8)) return;
     rec = *pp; if (!rec || !shim_readable(rec, 0x20) || !*(UINT8 *)(rec + REC_FLAG)) return;
-    if (in_skin_heap(*(UINT32 *)(rec + REC_OFF))) { InterlockedIncrement(&st_freed); InterlockedExchangeAdd64(&st_live, -(LONG64)*(UINT32 *)(rec + REC_SIZE)); }
+    if (in_skin_heap(*(UINT32 *)(rec + REC_OFF))) {
+        InterlockedIncrement(&st_freed); InterlockedExchangeAdd64(&st_live, -(LONG64)*(UINT32 *)(rec + REC_SIZE));
+        if (r->rdx && (void *)r->rdx != skin_heap) r->rdx = 0;   // the impostor code names its own heap as the owner; let FreeBuffer resolve ours by address
+    }
     else if (imp_heap && *(UINT32 *)(rec + REC_OFF) >= imp_lo && *(UINT32 *)(rec + REC_OFF) < imp_hi) InterlockedExchangeAdd64(&imp_live, -(LONG64)*(UINT32 *)(rec + REC_SIZE));
 }
 
@@ -242,7 +270,7 @@ void sm2_skin_stats(char *out, size_t cap)
 {
     if (!g_mgr) { out[0] = 0; return; }
     { char rg[300]; region_usage(rg, sizeof rg); shim_note("%s", rg); }
-    snprintf(out, cap, "skin: models %ld skinned %ld moved %ld (live %lld MB, peak %lld, heap %u MB) freed %ld low-already %ld failed %ld skin-hw %lld | impostor heap: hw %lld MB of %llu", st_models, st_skinned, st_moved, (long long)(st_live >> 20), (long long)(skin_peak >> 20), skin_mb, st_freed, st_already_low, st_fail, (long long)(skin_hw >> 20), (long long)(imp_hw >> 20), (unsigned long long)(imp_req >> 20));
+    snprintf(out, cap, "skin: models %ld skinned %ld moved %ld (live %lld MB, peak %lld, heap %u MB) freed %ld low-already %ld failed %ld skin-hw %lld heap-failed-bytes %llu | impostor: redirected %ld overflow %ld, own heap hw %lld MB of %llu failed-bytes %llu", st_models, st_skinned, st_moved, (long long)(st_live >> 20), (long long)(skin_peak >> 20), skin_mb, st_freed, st_already_low, st_fail, (long long)(skin_hw >> 20), (unsigned long long)(skin_heap ? *(UINT64 *)((UINT8 *)skin_heap + 0x4e0) : 0), imp_redirected, imp_overflow, (long long)(imp_hw >> 20), (unsigned long long)(imp_req >> 20), (unsigned long long)(imp_heap ? *(UINT64 *)((UINT8 *)imp_heap + 0x4e0) : 0));
 }
 
 void sm2_skin_install(void)
@@ -253,9 +281,10 @@ void sm2_skin_install(void)
     if (_stricmp(base, "Spider-Man2.exe")) return;
     if (GetEnvironmentVariableA("LAYOVER_SKIN_MB", v, sizeof v)) skin_mb = (UINT)atoi(v);
     if (!skin_mb) { SNOTE("LAYOVER_SKIN_MB=0: skinned-model steering off"); return; }
-    if (skin_mb < 32 || skin_mb > 768) { SNOTE("LAYOVER_SKIN_MB=%u out of range (32..768); using 512", skin_mb); skin_mb = 512; }
+    if (skin_mb < 32 || skin_mb > 892) { SNOTE("LAYOVER_SKIN_MB=%u out of range (32..892); using 876", skin_mb); skin_mb = 876; }
     if (GetEnvironmentVariableA("LAYOVER_IMPOSTOR_MB", v, sizeof v)) impostor_mb = (UINT)atoi(v);   // 0 = leave the game's 526 MB alone
     if (GetEnvironmentVariableA("LAYOVER_PLUG", v, sizeof v)) plug_on = atoi(v) != 0;
+    if (GetEnvironmentVariableA("LAYOVER_SKIN_RESERVE_MB", v, sizeof v)) reserve_mb = (UINT)atoi(v);
     skin_log = GetEnvironmentVariableA("LAYOVER_SKIN_LOG", v, sizeof v) >= 1 ? atoi(v) : 0;
     InitializeCriticalSection(&skin_lock);
     exe_base = (UINT8 *)GetModuleHandleA(NULL);

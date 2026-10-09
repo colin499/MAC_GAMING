@@ -13,7 +13,11 @@ for i in $(seq 1 30); do
   if grep -q "Steam Dialog\|class='#32770'" $S/winlist-$tag.log; then echo "$(ts) dialog: $(grep -m1 "Steam Dialog\|#32770" $S/winlist-$tag.log)"; fi
   : > $S/winlist-$tag.log
 done
-sleep 3; python3 run_in_prefix.py $S/sendkey-$tag.log "Z:$S/sendkey.exe" --focus GameNxApp ENTER --no-shim >/dev/null 2>&1; echo "$(ts) pressed Play"
+for k in 1 2 3 4; do
+  sleep 3; python3 run_in_prefix.py $S/sendkey-$tag.log "Z:$S/sendkey.exe" --focus GameNxApp ENTER --no-shim >/dev/null 2>&1; echo "$(ts) pressed Play ($k)"
+  sleep 15; : > $S/winlist-$tag.log; python3 run_in_prefix.py $S/winlist-$tag.log "Z:$S/winlist.exe" --no-shim >/dev/null 2>&1; sleep 2
+  grep -q "class='GameNxApp'" $S/winlist-$tag.log || break
+done
 start=$(date +%s)
 for i in $(seq 1 60); do sleep 5; if grep -q "Processing Slot 1" "$G" 2>/dev/null && [ $(stat -f %m "$G") -ge $start ]; then echo "$(ts) menu reached"; break; fi; done
 if [ "$cont" = "continue" ]; then sleep 15; python3 run_in_prefix.py $S/sendkey2-$tag.log "Z:$S/sendkey.exe" ENTER --no-shim >/dev/null 2>&1; echo "$(ts) pressed Enter at menu (Continue?)"; fi

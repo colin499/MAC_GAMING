@@ -37,8 +37,18 @@ blobs), carve-low 251/252, impostor 69 (high-water 174) of 526, carve-high 413/4
 region being used; when the main allocator is exhausted the game's AllocSmall falls back to the
 subheaps, so the skin heap's spare space is not lost.
 
-**Verified by the user (2026-10-08 evening): "so far it looks like it works super well".** Still worth
-checking over longer play: distant buildings (impostor heap now above 1 GB; if they look wrong, try
+**Verified by the user (2026-10-08 evening): "so far it looks like it works super well".** Then
+the user reported distant buildings looking bad: the impostor data is read through the typed views
+as well, so the plug layout (impostor heap above 1 GB) was wrong. CURRENT LAYOUT (run 10, 22:36):
+[0,132) small region, [132,1008) one shared 876 MB heap holding skinned models AND impostor data
+(the AllocateBuffer hook redirects impostor requests, which the game aims at its own heap, into
+ours while it keeps LAYOVER_SKIN_RESERVE_MB=48 free; the FreeBuffer hook clears the owner the
+impostor code passes so the record resolves by address), [1008,1024) the game's own impostor heap
+shrunk to 16 MB (fallback), static geometry above 1 GB. Measured at the save load: shared heap
+live 521-526 MB (peak 603), 528 skinned moved + 862 impostor blocks redirected, 0 refusals, 0
+failures, 69 fps. Lessons: a refused impostor allocation makes the game retry it every frame (run 9:
+850k requests, fps 47), so the shared heap must never refuse; live bytes must come from the record
+table (failed requests are never freed, an estimate drifts). Still to check by eye: distant buildings (impostor heap now above 1 GB; if they look wrong, try
 `LAYOVER_PLUG=0` with `LAYOVER_IMPOSTOR_MB=320`, which keeps impostors low but caps them; the
 observed impostor request was 416 MB in run 4, so expect trouble there).
 
