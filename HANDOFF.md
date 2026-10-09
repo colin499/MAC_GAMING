@@ -49,17 +49,17 @@ live 521-526 MB (peak 603), 528 skinned moved + 862 impostor blocks redirected, 
 failures, 69 fps. Lessons: a refused impostor allocation makes the game retry it every frame (run 9:
 850k requests, fps 47), so the shared heap must never refuse; live bytes must come from the record
 table (failed requests are never freed, an estimate drifts). The user confirmed characters AND distant buildings look right with this layout (morning of
-2026-10-09), BUT: during cinematics characters T-pose again. Log (sm2-skin-run10.log, 08:46): the
-shared heap started refusing allocations (even 69 KB) while holding only 547 MB of 876 MB (640
-records); skin-hw (copy high-water inside the heap) was 836 MB, so ~290 MB of freed holes were not
-being reused. After that every impostor request redirected into the heap failed too (7M retries,
-heap-failed-bytes in the TB). So the game's subheap allocator does not behave like a first-fit heap
-under alloc/free churn (or the CreateSubHeap "entries" argument, 0x8000 for ours, caps something).
-NEXT: read the allocator (ctor 0x143132510 sets the vtable; alloc 0x1431325f0 calls vtbl+0x18 after
-checking [alloc+0x40] max size and [alloc+0x38]/[alloc+0x30] chained allocators; init
-0x1431334a0(obj, base, size, policy, entries-derived, name, 0x2200, 0x10, 2)). Cheap experiments:
-entries 0x20000; two separate heaps (models / impostors) so impostor churn cannot fragment the
-model heap; or a periodic "compaction" is impossible (GPU addresses are cached). Also check by eye (impostor heap now above 1 GB; if they look wrong, try
+2026-10-09), BUT cinematics T-posed: the shared heap had filled up for real. Root cause (run 11,
+allocator-internal counters at heap+0xd0 bytes / +0x114 blocks vs the record table): the impostor
+system frees its records through FreeBufferDeferred with ITS heap as the owner, and the manager's
+frame function (ring processor inlined around exe+0x2c5b5ea) frees owned records straight through
+that owner's allocator, bypassing FreeBuffer and our hook; so every impostor block that we had
+redirected into our heap was "freed" against the 16 MB stub and leaked. Owner-less records (our
+relocated model blobs) are resolved by address there, so they were fine.
+FIX (run 12, 09:16): after the game creates its impostor subheap, the shim overwrites the impostor
+system's global heap pointer (exe+0xbf2dd80) with our heap, so impostor allocation and free both
+use the same allocator; the request-redirect code is now dormant. Verified: allocator bytes/blocks
+== record table (538 MB, 727 blocks), 0 failures. Also check by eye (impostor heap now above 1 GB; if they look wrong, try
 `LAYOVER_PLUG=0` with `LAYOVER_IMPOSTOR_MB=320`, which keeps impostors low but caps them; the
 observed impostor request was 416 MB in run 4, so expect trouble there).
 

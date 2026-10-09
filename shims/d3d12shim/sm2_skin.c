@@ -94,6 +94,7 @@ static int install_hook(UINT64 rva, const UINT8 *expect, int n, HookFn handler, 
 #define RVA_FREE           0x2c5a860   // FreeBuffer(mgr, owner_or_null, IABuffer **rec)
 #define RVA_FIND_SECTION   0x30a07a0   // SectionEntry *FindSection(const void *dat1, UINT tag): {tag, offset, size}
 #define RVA_MODEL_ARRIVED  0x2b24750   // model handler: data arrived (mgr, model, slot)
+#define RVA_IMPOSTOR_HEAP  0xbf2dd80   // qword: the impostor system's D3DHeapAlloc* (set right after its CreateSubHeap; used as alloc target and free owner)
 #define TAG_MODEL_BUILT    0x283d0383u
 #define TAG_MODEL_SKIN     0xc5354b60u  // "Model Skin Data": present (with joints 0x15df9d3b and skin batches 0xdcc88a19) exactly on GPU-skinned models
 #define MGR_MIRROR_BASE    0xb20       // qword: CPU mirror of the pool (allocation addresses are mirror addresses)
@@ -208,7 +209,14 @@ static void resolve_imp_heap(void)
     if (imp_heap || !skin_heap || !list || n < 1 || !shim_readable(list, n * 8)) return;
     for (i = 0; i < n; i++) if (list[i] && list[i] != skin_heap && shim_readable(list[i], 0x4f8)) {
         imp_heap = list[i]; imp_lo = *(UINT64 *)(list[i] + 0x4d0) - *(UINT64 *)(g_mgr + MGR_MIRROR_BASE); imp_hi = imp_lo + imp_req;
-        SNOTE("impostor subheap %p at pool offset [%llu MB, %llu MB)", imp_heap, (unsigned long long)(imp_lo >> 20), (unsigned long long)(imp_hi >> 20)); return;
+        SNOTE("impostor subheap %p at pool offset [%llu MB, %llu MB)", imp_heap, (unsigned long long)(imp_lo >> 20), (unsigned long long)(imp_hi >> 20));
+        // Point the impostor system at our heap instead. Its deferred frees are processed by the manager's
+        // frame function, which frees straight through the owner it recorded (bypassing FreeBuffer and our
+        // hook); with the owner being our heap, allocation and free both land in the same allocator.
+        { void **g = (void **)(exe_base + RVA_IMPOSTOR_HEAP);
+          if (shim_readable(g, 8) && *g == imp_heap) { DWORD old; if (VirtualProtect(g, 8, PAGE_READWRITE, &old)) { *g = skin_heap; VirtualProtect(g, 8, old, &old); SNOTE("impostor heap pointer redirected to the shared heap"); } else SNOTE("impostor heap pointer: VirtualProtect failed"); }
+          else SNOTE("impostor heap pointer global does not hold the heap (%p); redirect by request instead", *g); }
+        return;
     }
 }
 // pre-hook on AllocateBuffer (rcx mgr, rdx heap, r8 fmt, r9 size): impostor-heap accounting
@@ -237,6 +245,7 @@ static void on_free(Regs *r)
     rec = *pp; if (!rec || !shim_readable(rec, 0x20) || !*(UINT8 *)(rec + REC_FLAG)) return;
     if (in_skin_heap(*(UINT32 *)(rec + REC_OFF))) {
         InterlockedIncrement(&st_freed); InterlockedExchangeAdd64(&st_live, -(LONG64)*(UINT32 *)(rec + REC_SIZE));
+        { static volatile LONG nf; LONG k = InterlockedIncrement(&nf); if (skin_log && k <= 12) SNOTE("free in shared heap %ld: owner %p rec %p off %u MB size %u KB ret exe+0x%llx", k, (void *)r->rdx, (void *)rec, *(UINT32 *)(rec + REC_OFF) >> 20, *(UINT32 *)(rec + REC_SIZE) >> 10, (unsigned long long)(((UINT64 *)(r + 1))[0] - (UINT64)exe_base)); }
         if (r->rdx && (void *)r->rdx != skin_heap) r->rdx = 0;   // the impostor code names its own heap as the owner; let FreeBuffer resolve ours by address
     }
     else if (imp_heap && *(UINT32 *)(rec + REC_OFF) >= imp_lo && *(UINT32 *)(rec + REC_OFF) < imp_hi) InterlockedExchangeAdd64(&imp_live, -(LONG64)*(UINT32 *)(rec + REC_SIZE));
@@ -270,7 +279,7 @@ void sm2_skin_stats(char *out, size_t cap)
 {
     if (!g_mgr) { out[0] = 0; return; }
     { char rg[300]; region_usage(rg, sizeof rg); shim_note("%s", rg); }
-    snprintf(out, cap, "skin: models %ld skinned %ld moved %ld (live %lld MB, peak %lld, heap %u MB) freed %ld low-already %ld failed %ld skin-hw %lld heap-failed-bytes %llu | impostor: redirected %ld overflow %ld, own heap hw %lld MB of %llu failed-bytes %llu", st_models, st_skinned, st_moved, (long long)(st_live >> 20), (long long)(skin_peak >> 20), skin_mb, st_freed, st_already_low, st_fail, (long long)(skin_hw >> 20), (unsigned long long)(skin_heap ? *(UINT64 *)((UINT8 *)skin_heap + 0x4e0) : 0), imp_redirected, imp_overflow, (long long)(imp_hw >> 20), (unsigned long long)(imp_req >> 20), (unsigned long long)(imp_heap ? *(UINT64 *)((UINT8 *)imp_heap + 0x4e0) : 0));
+    snprintf(out, cap, "skin: models %ld skinned %ld moved %ld (live %lld MB, peak %lld, heap %u MB) freed %ld low-already %ld failed %ld skin-hw %lld heap-failed-bytes %llu alloc-internal: bytes %lld MB blocks %d freedesc %d | impostor: redirected %ld overflow %ld, own heap hw %lld MB of %llu failed-bytes %llu", st_models, st_skinned, st_moved, (long long)(st_live >> 20), (long long)(skin_peak >> 20), skin_mb, st_freed, st_already_low, st_fail, (long long)(skin_hw >> 20), (unsigned long long)(skin_heap ? *(UINT64 *)((UINT8 *)skin_heap + 0x4e0) : 0), (long long)(skin_heap ? *(INT64 *)((UINT8 *)skin_heap + 0xd0) >> 20 : 0), skin_heap ? *(int *)((UINT8 *)skin_heap + 0x114) : 0, skin_heap ? *(int *)((UINT8 *)skin_heap + 0x110) : 0, imp_redirected, imp_overflow, (long long)(imp_hw >> 20), (unsigned long long)(imp_req >> 20), (unsigned long long)(imp_heap ? *(UINT64 *)((UINT8 *)imp_heap + 0x4e0) : 0));
 }
 
 void sm2_skin_install(void)
