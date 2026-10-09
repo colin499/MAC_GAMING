@@ -1152,7 +1152,7 @@ def cmd_setup(args):
             ans = "n"
         if ans in ("", "y", "yes"):
             cmd_steam(argparse.Namespace(offline=False, online=False, game=None, extra=[]))
-
+    cmd_app(args)   # keep ~/Applications/Layover.app in sync
 
 def require_setup():
     if not engine_ready() or not steam_installed():
@@ -1510,6 +1510,96 @@ def cmd_uninstall(args):
     ok("removed")
 
 
+# --------------------------------------------------------------------------- the Finder app
+APP_DIR = os.path.expanduser("~/Applications/Layover.app")
+APP_SRC_ICON = os.path.join(HERE, "app", "Layover.icns")
+
+
+def osa(script):
+    """Run AppleScript, return its stdout (empty string if the user cancelled)."""
+    r = run(["osascript", "-e", script])
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def notify(title, text):
+    run(["osascript", "-e", f'display notification "{text}" with title "{title}"'])
+
+
+def cmd_app(args):
+    """Build ~/Applications/Layover.app: a double-clickable app (no Terminal) that launches a game."""
+    py = sys.executable if sys.executable and os.path.exists(sys.executable) else "/usr/bin/python3"
+    macos = os.path.join(APP_DIR, "Contents", "MacOS"); res = os.path.join(APP_DIR, "Contents", "Resources")
+    os.makedirs(macos, exist_ok=True); os.makedirs(res, exist_ok=True)
+    with open(os.path.join(APP_DIR, "Contents", "Info.plist"), "w") as f:
+        f.write(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleName</key><string>Layover</string>
+  <key>CFBundleDisplayName</key><string>Layover</string>
+  <key>CFBundleIdentifier</key><string>local.layover.launcher</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleExecutable</key><string>Layover</string>
+  <key>CFBundleIconFile</key><string>Layover</string>
+  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict></plist>
+""")
+    launcher = os.path.join(macos, "Layover")
+    with open(launcher, "w") as f:
+        f.write(f"""#!/bin/zsh
+# Layover.app: launches `layover app-launch` from the repo without a Terminal window.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+exec "{py}" "{os.path.join(HERE, 'layover')}" app-launch >> "{os.path.join(LOGS, 'app.log')}" 2>&1
+""")
+    os.chmod(launcher, 0o755)
+    if os.path.exists(APP_SRC_ICON):
+        shutil.copy2(APP_SRC_ICON, os.path.join(res, "Layover.icns"))
+    run(["touch", APP_DIR])   # make Finder notice the icon
+    ok(f"{APP_DIR} built (double-click it, or Spotlight → Layover)")
+    info("it lists your installed Windows games and launches the one you pick; Steam starts on its own if needed")
+
+
+def cmd_app_launch(args):
+    """What Layover.app runs: pick a game in a dialog, then play it. Errors go to a dialog, not a terminal."""
+    try:
+        cfg = load_config()
+        if not (engine_ready() and steam_installed()):
+            osa('display dialog "Layover is not set up yet. Open Terminal in the MAC_GAMING folder and run:  ./layover setup" buttons {"OK"} default button 1 with icon stop')
+            return
+        games = [g for g in all_games() if g["where"] == "windows"]
+        games.sort(key=lambda g: g["name"].lower())
+        names = [g["name"] for g in games if g["ready"]]
+        items = names + ["Open Steam", "Quit Steam"]
+        lst = ", ".join('"' + n.replace('"', "'") + '"' for n in items)
+        default = '"' + (names[0].replace('"', "'") if names else "Open Steam") + '"'
+        pick = osa(f'choose from list {{{lst}}} with title "Layover" with prompt "What do you want to play?" default items {{{default}}} OK button name "Launch"')
+        if not pick or pick == "false":
+            return
+        if pick == "Open Steam":
+            cmd_steam(argparse.Namespace(offline=False, online=False, extra=[]))
+            notify("Layover", "Steam is starting")
+            return
+        if pick == "Quit Steam":
+            cmd_kill(argparse.Namespace())
+            notify("Layover", "Steam closed")
+            return
+        g = next((g for g in games if g["name"].replace('"', "'") == pick), None)
+        if not g:
+            die(f"game '{pick}' not found")
+        notify("Layover", f"Launching {g['name']}" + ("" if steam_running() else " (starting Steam first, about 20 s)"))
+        cmd_play(argparse.Namespace(game=g["appid"], offline=False))
+    except SystemExit as e:
+        if e.code not in (0, None):
+            osa(f'display dialog "Layover could not launch that. See {LOGS}/app.log" buttons {{"OK"}} default button 1 with icon stop')
+        raise
+    except Exception as e:
+        msg = str(e).replace('"', "'")[:300]
+        osa(f'display dialog "Layover hit an error: {msg}" buttons {{"OK"}} default button 1 with icon stop')
+        raise
+
+
 def cmd_menu(args):
     items = [
         ("Launch Steam (Windows games)", lambda: cmd_steam(argparse.Namespace(offline=False, online=False, extra=[]))),
@@ -1607,6 +1697,8 @@ def main(argv=None):
     s = sub.add_parser("uninstall", help="remove Layover and everything it installed")
     s.add_argument("--yes", action="store_true")
     s.set_defaults(fn=cmd_uninstall)
+    sub.add_parser("app", help="build ~/Applications/Layover.app (double-click to play, no Terminal)").set_defaults(fn=cmd_app)
+    sub.add_parser("app-launch", help=argparse.SUPPRESS).set_defaults(fn=cmd_app_launch)
     sub.add_parser("menu", help="interactive menu").set_defaults(fn=cmd_menu)
     sub.add_parser("help", help="show help").set_defaults(fn=lambda a: p.print_help())
 

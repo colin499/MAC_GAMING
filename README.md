@@ -27,7 +27,10 @@ cd ~/Documents/BRAIN_FOOD/MAC_GAMING
 ./layover steam        # opens Windows Steam; first launch self-updates (1–3 min) then shows sign-in
 ```
 
-Or double-click `Layover.command` in Finder for a menu.
+**No Terminal needed after setup:** `./layover app` (setup does this too) puts **Layover.app** in
+`~/Applications`. Double-click it, or Cmd-Space → "Layover": a dialog lists your installed Windows
+games; pick one and it launches, starting Steam first if needed. Drag it to the Dock to keep it there.
+`Layover.command` still opens the text menu in Terminal.
 
 Sign in to Steam, install games as usual (they download into the Wine prefix),
 then:
