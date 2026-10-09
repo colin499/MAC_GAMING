@@ -1,6 +1,65 @@
-# Handoff notes (2026-10-09 morning, end of the fourth session)
+# Handoff notes (2026-10-09 afternoon, end of the fifth session)
 
 Read this first if you are a new agent (or future me) picking up Layover.
+
+## Fifth session (2026-10-09 afternoon): the "froze in the skills menu" report, retina, tidy-up
+
+**What the user saw:** the game "froze while trying to see the skills menu" (run 12, 15:06-15:14).
+**What the logs say:** no crash, no minidump. The game kept rendering at 104-116 fps (menu
+signature) from 15:11 until the user closed the window at 15:14:39, and the main thread handled
+that close ("[GameWindow] Window close requested" on the main thread). Steam's
+`Steam/logs/controller.txt` + `console_log.txt` show the Xbox Series X pad (the user plays through
+Steam Input) switched from the game's config to app 413080 (Steam's desktop/overlay config) at
+15:11:28, back to the game at 15:14:30, to 413080 again at 15:14:36, then the close. That is the
+Steam in-game overlay opening (Xbox/guide button, or Shift+Tab): under Wine it takes the pad and
+pauses the game while drawing nothing visible = a "freeze". Reproduced the mechanics in run 13:
+Shift+Tab in the game made the overlay initialise (a burst of `CheckFeatureSupport feature=4`
+B8G8R8A8 lines in the shim log, execlists/s up 20 %); the game's menu itself does NOT switch the
+controller config (checked while driving the menu with the keyboard).
+**Tried and REVERTED:** blocking the overlay DLL (`WINEDLLOVERRIDES gameoverlayrenderer64=d`,
+config `steam_overlay` off). It does stop the overlay (no "GameOverlay: started", Shift+Tab inert),
+but Steam Input needs that DLL in-process to know the game has focus: without it Steam loaded the
+413080 desktop config every few seconds and the game logged "XInput controller connected" every
+3 s (run 15, 15:39-15:41) = no usable pad. `steam_overlay` now defaults to ON; leave it.
+So the 15:11:28 switch to 413080 was a FOCUS LOSS of the game window as seen by Steam, most likely
+the pad's Xbox button (macOS handles it system-wide: Launchpad/Game Center; the pad is on USB,
+"XboxUSBDevice") or Shift+Tab. The user later said the second "freeze" was not one; the real one
+is still unexplained beyond "something took focus"; next time check `controller.txt` for the
+413080 line and ask what was pressed.
+
+**Retina / "higher definition":** `retina` was only applied at prefix creation. Now
+`apply_retina()` runs at every launch (reg add only when user.reg differs), `layover config
+retina on|off` applies immediately, Steam gets `-forcedesktopscaling 2` when on, and `layover play`
+restarts Steam if it was started with the other setting (running.json records it). Verified run 14:
+the game enumerates "Mode 42: 3456 x 2234 @ 120 Hz". The user still has to pick the resolution
+and an upscaler in the game's display settings (the prefs are a binary DAT1 blob under the prefix's
+Documents/Marvel's Spider-Man 2/<steamid>/prefs-autosave.save; not worth decoding). The user's
+current in-game settings are everything on Low (left over from the T-pose hunt), windowed
+1728x1080, FSR Quality: that is why it looks soft. Recommended: fullscreen 3456x2234, FSR/XeSS
+Performance or Balanced, preset Medium/High, VSync off + `layover config fps_cap 60` if it tears.
+
+**Tidy-ups:** the shim logged `GetTimestampFrequency -> 60` every frame (47k lines/run); now 3x.
+`layover` writes `system32/d3d12shim.env` at every launch with a fresh `logs/d3d12-<stamp>.log`
+plus `games.<appid>.env` entries (keys LAYOVER_*/D3DM_*/HB_*), so the old hand-edited env file
+(sm2-skin-run12.log, grew forever) is gone. Log pruning now keeps the 20 newest by mtime (it used
+to sort by name and would have deleted d3d12-* first). Shim deploys are atomic (temp + rename) so a
+running game keeps its mapped copy. `layover kill` (and the Quit Steam menu item) first sends
+WM_CLOSE to running game exes (`wine taskkill /IM`), which makes the game exit cleanly in ~5 s
+("Quit request confirmed by user") and avoids Steam's cloud-sync prompt on the next launch.
+`tools/dev/sendkey.c` gained `+KEY`/`-KEY` (hold/release) for chords. **Screenshots still do not
+work** from the agent (wallpaper only / "could not create image"); the memory note that said
+otherwise was wrong and is corrected.
+
+**Driving notes:** `tools/dev/drive.sh` starts the game via a running Steam; after `layover play`
+(Steam started with -applaunch) use the same loop minus the launch step (scratch drive2.sh). Keyboard
+in the game: TAB opens the hub menu (draw-indexed rate halves, fps ~110); after that my E/ESC/TAB
+presses did not change the rendering signature. It is NOT a hang: two `winedbg bt 0x<main tid>`
+snapshots 10 s apart show the main thread running different frames of its loop (exe+0x2afa6df);
+the hub UI just does not react to SendInput keys (keys or input path, not investigated; the user
+plays on the pad). Close a test run cleanly with `wine taskkill /IM Spider-Man2.exe`. The game's threads
+of interest (winedbg `info threads`): main 0x8b0, "Render Thread", "Coherent Thread" (Gameface HTML
+UI = menus), "File Video Stream" x4 (Bink), "Pipeline creation thread" x6.
+
 
 ## START HERE: where things stand on 2026-10-09
 

@@ -96,8 +96,26 @@ known desktop vendor (Layover's AGS replacement then stands in for AMD's driver 
 
 Other settings (`./layover config`): `msync` (faster sync, on), `metal_hud` (FPS overlay), `fps_cap`
 (cap frame rate, e.g. 60, for cooler and quieter play on battery),
-`advertise_avx` (some engines refuse to start without it, on), `retina` (high-res mode),
+`advertise_avx` (some engines refuse to start without it, on), `retina` (see below),
+`steam_overlay` (off: Steam's in-game overlay is kept out of games, see below),
 `steam_args` (extra flags for steam.exe).
+
+**Sharper picture (`./layover config retina on`, the default is off):** games then see the
+MacBook's full 3456x2234 panel instead of the 1728x1117 "looks like" size, and Steam is started
+with 2x UI scaling so its window stays readable. Applied at the next launch (Steam restarts by
+itself if it was started with the other setting). Once in the game, pick the native resolution in
+its display settings and use its upscaler (FSR/XeSS Balanced or Performance): the game then
+renders around 1728x1117 internally, as before, but the HUD, text and the final image are output
+at the panel's real resolution. Running a 2024 AAA game at 3456x2234 *without* an upscaler is too
+much for this GPU.
+
+**Steam overlay (`steam_overlay`, on):** leave it on. Steam Input needs the overlay DLL inside the
+game to know the game is in front; with it blocked, Steam hands the controller to its desktop
+profile every few seconds and the game gets no input at all. What *does* steal the controller is
+anything that takes macOS focus away from the game window: the Xbox button on the pad (macOS opens
+Launchpad or Game Center for it), Shift+Tab (Steam's overlay), or clicking outside the game. The
+game then sits paused with the picture still updating, which looks like a freeze; bring the game
+window back to the front to continue.
 
 ## Honest limitations
 
@@ -116,7 +134,7 @@ Other settings (`./layover config`): `msync` (faster sync, on), `metal_hud` (FPS
 ```bash
 ./layover doctor      # health check
 ./layover logs        # last launch log; Steam's own logs are in the prefix under Steam/logs
-./layover kill        # stop Steam and everything in the Windows prefix
+./layover kill        # close running games cleanly, then stop Steam and everything in the Windows prefix
 ./layover update-steam  # let the Steam client update itself, then re-install the wrapper
 ./layover winecfg     # Wine's settings window (drives, audio, Windows version)
 ./layover setup --reinstall
@@ -136,6 +154,6 @@ Layover.command    double-click launcher for the menu
   engines/sikarugir10.0_6/  engine/ (Wine), frameworks/ (runtime), renderers/ (dxmt, d3dmetal)
   prefixes/steam/  the Windows environment; games live in drive_c/Program Files (x86)/Steam/steamapps
   downloads/       cached archives (checksums pinned in `layover`)
-  logs/            launch logs (last 20 kept)
+  logs/            launch logs (steam-*) and per-run d3d12 shim logs (d3d12-*); the 20 newest are kept
   config.json      your settings
 ```

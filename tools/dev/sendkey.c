@@ -1,5 +1,6 @@
 // sendkey: inject keyboard input inside the Wine prefix via SendInput (no macOS permission needed).
-// usage: sendkey.exe [wait:MS] KEY[:HOLDMS] ... ; KEY = ENTER SPACE ESC UP DOWN LEFT RIGHT TAB A..Z 0..9 F1..F12 or hex VK (0x..)
+// usage: sendkey.exe [--focus CLASS] [wait:MS] KEY[:HOLDMS] +KEY -KEY ... ; KEY = ENTER SPACE ESC UP DOWN LEFT RIGHT TAB SHIFT CTRL ALT A..Z 0..9 F1..F12 or hex VK (0x..)
+// +KEY holds a key down and -KEY releases it, for chords such as `+SHIFT TAB -SHIFT` (Steam overlay).
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +38,11 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "wait")) { Sleep(n); continue; }
         if (!strcmp(a, "click")) { INPUT in[2]; memset(in, 0, sizeof in); in[0].type = in[1].type = INPUT_MOUSE; in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN; in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP; SendInput(1, in, sizeof(INPUT)); Sleep(60); SendInput(1, in + 1, sizeof(INPUT)); printf("click\n"); continue; }
         if (!strcmp(a, "move")) { INPUT in; memset(&in, 0, sizeof in); in.type = INPUT_MOUSE; in.mi.dwFlags = MOUSEEVENTF_MOVE; in.mi.dx = (LONG)n; in.mi.dy = 0; SendInput(1, &in, sizeof in); continue; }
+        if (a[0] == '+' || a[0] == '-') {   // +KEY = press and hold, -KEY = release (chords: +SHIFT TAB -SHIFT)
+            INPUT in; memset(&in, 0, sizeof in); WORD vk = vk_of(a + 1);
+            in.type = INPUT_KEYBOARD; in.ki.wVk = vk; in.ki.wScan = MapVirtualKey(vk, MAPVK_VK_TO_VSC); in.ki.dwFlags = a[0] == '-' ? KEYEVENTF_KEYUP : 0;
+            SendInput(1, &in, sizeof in); printf("%s %s\n", a[0] == '+' ? "down" : "up", a + 1); fflush(stdout); Sleep(120); continue;
+        }
         WORD vk = vk_of(a); int ext = vk == VK_UP || vk == VK_DOWN || vk == VK_LEFT || vk == VK_RIGHT;
         if (post && target) { LPARAM lp = 1 | ((LPARAM)MapVirtualKey(vk, MAPVK_VK_TO_VSC) << 16); PostMessageA(target, WM_KEYDOWN, vk, lp); Sleep(n ? n : 80); PostMessageA(target, WM_KEYUP, vk, lp | (1u << 30) | (1u << 31)); printf("posted %s\n", a); fflush(stdout); Sleep(150); continue; }
         key(vk, n ? n : 80, ext); printf("key %s (vk 0x%x)\n", a, vk); fflush(stdout);

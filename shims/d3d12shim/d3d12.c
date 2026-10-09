@@ -617,7 +617,7 @@ static void STDMETHODCALLTYPE hook_ExecuteIndirect(ID3D12GraphicsCommandList *l,
 static void STDMETHODCALLTYPE hook_ExecuteCommandLists(ID3D12CommandQueue *q, UINT n, ID3D12CommandList *const *lists) { InterlockedIncrement(&c_execlists); real_ExecuteCommandLists(q, n, lists); }
 static HRESULT STDMETHODCALLTYPE hook_GetTimestampFrequency(ID3D12CommandQueue *q, UINT64 *f)
 {
-    if (!tsshim) { HRESULT hr = real_GetTimestampFrequency(q, f); LOG("GetTimestampFrequency -> %llu hr=0x%lx", f ? (unsigned long long)*f : 0, (unsigned long)hr); return hr; }
+    if (!tsshim) { static volatile LONG n_tsf; HRESULT hr = real_GetTimestampFrequency(q, f); if (InterlockedIncrement(&n_tsf) <= 3) LOG("GetTimestampFrequency -> %llu hr=0x%lx (logged 3x; the game asks every frame)", f ? (unsigned long long)*f : 0, (unsigned long)hr); return hr; }
     if (!f) return E_INVALIDARG; *f = qpc_freq; return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE hook_GetClockCalibration(ID3D12CommandQueue *q, UINT64 *gpu, UINT64 *cpu)

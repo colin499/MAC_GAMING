@@ -88,7 +88,11 @@ DEFAULT_CONFIG = {
     "msync": True,             # Mach semaphore sync (faster), with esync as fallback
     "metal_hud": False,        # Apple's FPS overlay
     "advertise_avx": True,     # Rosetta: tell games AVX exists (needed by some engines)
-    "retina": False,           # High-res mode (crisper, but some games mis-scale)
+    "retina": False,           # games see the full 3456x2234 panel instead of 1728x1117 (`layover config retina on`)
+    # Steam's in-game overlay DLL. Keep it ON: Steam Input needs it inside the game to know the game
+    # has focus. Without it (tried 2026-10-09) Steam hands the pad to its desktop profile every few
+    # seconds and the game sees the controller connect/disconnect in a loop = no input at all.
+    "steam_overlay": True,
     # -cef-disable-gpu: Steam's web UI can't GPU-render under Wine (otherwise 15 crash/retry cycles).
     # -noverifyfiles etc: stop Steam's startup self-check from overwriting the web-helper wrapper
     # (see WRAPPER below). `layover update-steam` runs an update with these off.
@@ -420,6 +424,8 @@ def wine_env(cfg, game=None, extra=None):
         env["MTL_HUD_ENABLED"] = "1"
     if g.get("advertise_avx", cfg["advertise_avx"]):
         env["ROSETTA_ADVERTISE_AVX"] = "1"
+    if not g.get("steam_overlay", cfg.get("steam_overlay", True)):
+        env["WINEDLLOVERRIDES"] += ";gameoverlayrenderer64=d;gameoverlayrenderer=d"   # Steam can't inject its overlay
     overlays = []
     if renderer == "dxmt":
         overlays = [os.path.join(ENGINE_RENDERERS, "dxmt", "wine")]
@@ -472,7 +478,33 @@ def wineserver_wait(cfg):
     subprocess.run([WINESERVER, "-w"], env=wine_env(cfg), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def close_games(cfg, wait=20):
+    """Ask running games to close (WM_CLOSE, like clicking the window's close button) and wait a little.
+    A game that is killed instead leaves Steam's "cloud sync failed" prompt for the next launch."""
+    exes = running_game_exes()
+    if not exes:
+        return
+    for exe in exes:
+        wine(cfg, ["taskkill", "/IM", exe])
+    for _ in range(wait):
+        if not running_game_exes():
+            return
+        time.sleep(1)
+
+
+def running_game_exes():
+    """Basenames of game executables running in our prefix (from the Mac process list)."""
+    out = sh(["ps", "-axo", "command"])
+    found = set()
+    for line in out.splitlines():
+        if "steamapps/common" in line and ".exe" in line and "crs-" not in line:
+            exe = line.split(".exe")[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1] + ".exe"
+            found.add(exe)
+    return sorted(found)
+
+
 def wineserver_kill(cfg):
+    close_games(cfg)
     subprocess.run([WINESERVER, "-k"], env=wine_env(cfg), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -480,12 +512,60 @@ def reg_add(cfg, key, name, value, kind="REG_SZ"):
     return wine(cfg, ["reg", "add", key, "/v", name, "/t", kind, "/d", str(value), "/f"])
 
 
+def registry_value(key_path, name):
+    """Read a string value from the prefix's user.reg without starting Wine (None if absent)."""
+    try:
+        with open(os.path.join(PREFIX, "user.reg"), errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    # user.reg writes the key with doubled backslashes: [Software\\Wine\\Mac Driver] <timestamp>
+    m = re.search(r'^\[' + re.escape(key_path.replace("\\", "\\\\")) + r'\][^\n]*\n(.*?)(?=^\[|\Z)', text, re.M | re.S)
+    if not m:
+        return None
+    v = re.search(r'^"' + re.escape(name) + r'"="([^"]*)"', m.group(1), re.M)
+    return v.group(1) if v else None
+
+
+def apply_retina(cfg):
+    """Make Wine's Mac driver match config `retina` (3456x2234 vs 1728x1117 on this MacBook).
+    Each Wine process reads the key at start, so this also works while Steam is up (next game launch)."""
+    want = "y" if cfg.get("retina") else "n"
+    if registry_value(r"Software\Wine\Mac Driver", "RetinaMode") == want:
+        return False
+    reg_add(cfg, r"HKCU\Software\Wine\Mac Driver", "RetinaMode", want)
+    return True
+
+
+SHIM_ENV_PATH = os.path.join(PREFIX, "drive_c", "windows", "system32", "d3d12shim.env")
+
+
+def write_shim_env(cfg, game=None):
+    """Settings file the d3d12 shim reads in DllMain (KEY=VALUE; only sets variables that are unset).
+    Needed because a Steam-launched game inherits Steam's environment, not ours. Rewritten at every
+    launch: a fresh log per run (logs/d3d12-<stamp>.log) plus games.<appid>.env from config.json."""
+    if not os.path.isdir(os.path.dirname(SHIM_ENV_PATH)):
+        return None
+    log = new_log("d3d12")
+    lines = ["LAYOVER_D3D12_LOG=Z:" + log.replace("/", "\\"), "LAYOVER_SKIN_LOG=1"]
+    g = cfg["games"].get(str(game), {}) if game else {}
+    for k, v in (g.get("env") or {}).items():
+        if k.startswith(("LAYOVER_", "D3DM_", "HB_")):
+            lines.append(f"{k}={v}")
+    try:
+        with open(SHIM_ENV_PATH, "w") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError:
+        return None
+    return log
+
+
 def new_log(name):
     os.makedirs(LOGS, exist_ok=True)
     stamp = _dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     path = os.path.join(LOGS, f"{name}-{stamp}.log")
-    # keep the last 20 logs
-    old = sorted(p for p in os.listdir(LOGS) if p.endswith(".log"))
+    # keep the 20 most recent logs (any kind: steam-*, d3d12-*, setup-*)
+    old = sorted((p for p in os.listdir(LOGS) if p.endswith(".log")), key=lambda p: os.path.getmtime(os.path.join(LOGS, p)))
     for p in old[:-20]:
         try:
             os.remove(os.path.join(LOGS, p))
@@ -506,6 +586,23 @@ def renderer_installed(renderer):
         return os.path.isfile(os.path.join(ENGINE_RENDERERS, "d3dmetal", "wine", "x86_64-windows", "d3d12.dll")) and \
             os.path.isdir(os.path.join(ENGINE_RENDERERS, "d3dmetal", "external", "D3DMetal.framework"))
     return False
+
+
+def _same_content(a, b):
+    try:
+        if os.path.getsize(a) != os.path.getsize(b):
+            return False
+        return sha256(a) == sha256(b)
+    except OSError:
+        return False
+
+
+def replace_file(src, dst):
+    """Copy src over dst atomically (temp file + rename). A game that has the old dst mapped keeps
+    running on the old inode instead of seeing its code change under it."""
+    tmp = dst + ".new"
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
 
 
 def _same_file(a, b):
@@ -639,11 +736,11 @@ GAME_FIXES = {}
 def d3d12_shim_binary():
     os.makedirs(TOOLS, exist_ok=True)
     try:
-        if not os.path.exists(D3D12_SHIM_DLL) and os.path.exists(MINGW_GCC) and os.path.isdir(D3D12_SHIM_SRC_DIR):
+        if os.path.exists(MINGW_GCC) and os.path.isdir(D3D12_SHIM_SRC_DIR):
+            # make is a no-op when d3d12.dll is newer than its sources
             subprocess.run(["make", "-s", "-C", D3D12_SHIM_SRC_DIR], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if os.path.exists(D3D12_SHIM_DLL) and os.path.getsize(D3D12_SHIM_DLL) > 0:
-            if not os.path.exists(D3D12_SHIM_INSTALLED) or os.path.getsize(D3D12_SHIM_INSTALLED) != os.path.getsize(D3D12_SHIM_DLL):
-                shutil.copy2(D3D12_SHIM_DLL, D3D12_SHIM_INSTALLED)
+        if os.path.exists(D3D12_SHIM_DLL) and os.path.getsize(D3D12_SHIM_DLL) > 0 and not _same_content(D3D12_SHIM_DLL, D3D12_SHIM_INSTALLED):
+            replace_file(D3D12_SHIM_DLL, D3D12_SHIM_INSTALLED)
     except PermissionError:
         pass
     return D3D12_SHIM_INSTALLED if os.path.exists(D3D12_SHIM_INSTALLED) else None
@@ -669,8 +766,8 @@ def install_d3d12_shim(quiet=True):
     w = os.path.join(D3D12_SHIM_OVERLAY, "x86_64-windows"); u = os.path.join(D3D12_SHIM_OVERLAY, "x86_64-unix")
     os.makedirs(w, exist_ok=True); os.makedirs(u, exist_ok=True)
     for dst, from_ in ((os.path.join(w, "d3d12.dll"), src), (os.path.join(w, "d3d12_d3dmetal.dll"), real)):
-        if not os.path.isfile(dst) or os.path.getsize(dst) != os.path.getsize(from_):
-            shutil.copy2(from_, dst)
+        if not _same_content(from_, dst):
+            replace_file(from_, dst)
     so = os.path.join(u, "d3d12_d3dmetal.so")
     if not os.path.islink(so):
         if os.path.exists(so):
@@ -1163,12 +1260,16 @@ def require_setup():
 STATE_PATH = os.path.join(ROOT, "running.json")
 
 
-def running_renderer():
+def running_state():
     try:
         with open(STATE_PATH) as f:
-            return json.load(f).get("renderer")
+            return json.load(f)
     except (OSError, ValueError):
-        return None
+        return {}
+
+
+def running_renderer():
+    return running_state().get("renderer")
 
 
 def launch_steam(cfg, game=None, offline=None, extra_args=None):
@@ -1187,12 +1288,16 @@ def launch_steam(cfg, game=None, offline=None, extra_args=None):
         remove_webhelper_wrapper()
     install_ags_shim()
     install_d3d12_shim()
+    apply_retina(cfg)
+    if cfg.get("retina") and not any(a.startswith("-forcedesktopscaling") for a in args):
+        args += ["-forcedesktopscaling", "2"]   # keep Steam's UI readable on the 2x desktop
+    write_shim_env(cfg, game)
     log = new_log("steam")
     if game:
         args += ["-applaunch", str(game)]
     wine(cfg, args, game=game, wait=False, log=log, cwd=STEAM_DIR, extra_env={"LAYOVER_RENDERER": renderer})
     with open(STATE_PATH, "w") as f:
-        json.dump({"renderer": renderer, "started": _dt.datetime.now().isoformat(), "game": game}, f)
+        json.dump({"renderer": renderer, "retina": bool(cfg.get("retina")), "started": _dt.datetime.now().isoformat(), "game": game}, f)
     return log
 
 
@@ -1262,14 +1367,22 @@ def cmd_play(args):
         return
     require_setup()
     renderer = resolve_renderer(cfg, g["appid"])
+    restart = None
     if steam_running() and running_renderer() not in (None, renderer):
-        info(f"{g['name']} uses the {renderer} renderer; Steam is running with {running_renderer()}. Restarting Steam.")
+        restart = f"{g['name']} uses the {renderer} renderer; Steam is running with {running_renderer()}"
+    elif steam_running() and running_state().get("retina") not in (None, bool(cfg.get("retina"))):
+        restart = "the retina setting changed since Steam was started"
+    if restart:
+        info(restart + ". Restarting Steam.")
         wineserver_kill(cfg)
         for _ in range(30):
             if not steam_running():
                 break
             time.sleep(1)
     if steam_running():
+        install_d3d12_shim()
+        apply_retina(cfg)
+        write_shim_env(cfg, g["appid"])
         wine(cfg, ["start", f"steam://rungameid/{g['appid']}"], game=g["appid"], wait=False)
         ok(f"asked Steam to launch {g['name']} ({renderer})")
     else:
@@ -1459,6 +1572,14 @@ def cmd_config(args):
     cfg[args.key] = val
     save_config(cfg)
     ok(f"{args.key} = {val}")
+    if args.key == "retina" and engine_ready() and os.path.isdir(os.path.join(PREFIX, "drive_c")):
+        apply_retina(cfg)
+        if val:
+            info("games now see the full 3456x2234 panel. In the game's display settings pick that")
+            info("resolution (fullscreen or a maximized window) and an upscaler (FSR Balanced/Performance)")
+            info("so it renders around 1728x1117 internally and only the output is native-sharp.")
+        else:
+            info("games see 1728x1117 again; re-pick the resolution in the game's display settings.")
 
 
 def cmd_kill(args):
@@ -1685,7 +1806,7 @@ def main(argv=None):
     s.add_argument("renderer", nargs="?", choices=RENDERER_CHOICES)
     s.set_defaults(fn=lambda a: cmd_renderer(a) if (a.game is None or a.renderer) else die("usage: layover renderer <game|default> <dxmt|wined3d|d3dmetal>"))
 
-    s = sub.add_parser("config", help="show or change a setting (msync, metal_hud, advertise_avx, retina, fps_cap, steam_args, d3dmetal_identity)")
+    s = sub.add_parser("config", help="show or change a setting (msync, metal_hud, advertise_avx, retina, steam_overlay, fps_cap, steam_args, d3dmetal_identity)")
     s.add_argument("key", nargs="?")
     s.add_argument("value", nargs="?", help="for steam_args, quote the whole list, e.g. \"-cef-disable-gpu -noverifyfiles\"")
     s.set_defaults(fn=lambda a: cmd_config(a) if (a.key is None or a.value is not None) else die("usage: layover config <key> <value>"))
