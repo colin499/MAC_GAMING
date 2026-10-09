@@ -37,9 +37,8 @@ blobs), carve-low 251/252, impostor 69 (high-water 174) of 526, carve-high 413/4
 region being used; when the main allocator is exhausted the game's AllocSmall falls back to the
 subheaps, so the skin heap's spare space is not lost.
 
-**Not yet verified:** the user has not seen this build (they left; the earlier runs they saw had
-the flag-bit detection that matched nothing). Verify by eye: main menu characters, then the city.
-Also check distant buildings (impostor heap now above 1 GB; if they look wrong, try
+**Verified by the user (2026-10-08 evening): "so far it looks like it works super well".** Still worth
+checking over longer play: distant buildings (impostor heap now above 1 GB; if they look wrong, try
 `LAYOVER_PLUG=0` with `LAYOVER_IMPOSTOR_MB=320`, which keeps impostors low but caps them; the
 observed impostor request was 416 MB in run 4, so expect trouble there).
 
