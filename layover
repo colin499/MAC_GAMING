@@ -1141,6 +1141,7 @@ def cmd_setup(args):
 
     print()
     ok(paint("Setup complete.", C.B))
+    cmd_app(args)   # keep ~/Applications/Layover.app in sync
     info("Next:  layover steam        (first launch downloads Steam's update, then shows the login window)")
     info("Then:  install games in Steam as usual, and `layover games` / `layover play <name>`")
     info("Before a flight:  layover flight")
@@ -1152,7 +1153,7 @@ def cmd_setup(args):
             ans = "n"
         if ans in ("", "y", "yes"):
             cmd_steam(argparse.Namespace(offline=False, online=False, game=None, extra=[]))
-    cmd_app(args)   # keep ~/Applications/Layover.app in sync
+
 
 def require_setup():
     if not engine_ready() or not steam_installed():
