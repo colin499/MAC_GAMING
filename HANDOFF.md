@@ -1,6 +1,58 @@
-# Handoff notes (2026-10-08, end of fourth session)
+# Handoff notes (2026-10-09 morning, end of the fourth session)
 
 Read this first if you are a new agent (or future me) picking up Layover.
+
+## START HERE: where things stand on 2026-10-09
+
+**Status in one paragraph.** Layover (our own Wine/D3DMetal launcher) runs Marvel's Spider-Man 2
+on the user's M4 Pro. The characters-frozen-in-T-pose bug is FIXED by the d3d12 shim module
+`shims/d3d12shim/sm2_skin.c`, on by default for Spider-Man2.exe; the user confirmed animation in
+gameplay, confirmed distant buildings look right with the shared-heap layout, and the last known
+defect (T-pose during cinematics, caused by a leak that filled the shared heap) was fixed at
+09:16 today and verified by counters but NOT yet by the user's eyes. The user launches the game
+from `~/Applications/Layover.app` (a chooser dialog; no Terminal). Everything is committed and
+pushed (github.com/colin499/MAC_GAMING, main).
+
+**If the user reports anything wrong, read these first:**
+- The shim log: `~/Library/Application Support/Layover/logs/sm2-skin-run12.log` (name set in the
+  prefix's `drive_c/windows/system32/d3d12shim.env`; change it per run). Every 5 s it prints a
+  `pool:` line and a `live MB:` line. Healthy = `failed 0`, `heap-failed-bytes 0`, and
+  `alloc-internal: bytes/blocks` equal to the record table's `skin N (M)` figures.
+- The game's own log: prefix `drive_c/users/colinlysik/Documents/Marvel's Spider-Man 2/Marvel's
+  Spider-Man 2.log` (fps line once a minute, save/cloud lines).
+- Steam cloud: prefix `Program Files (x86)/Steam/logs/cloud_log.txt` ("login=false" after sleep
+  = Steam not reconnected yet; it syncs once "Logged On" appears in `connection_log.txt`).
+
+**Current design of the fix (details and addresses in the "Fourth session" section below):**
+pool = 2046 MB; Metal can only index the first 1 GB through 4-byte typed views. Layout now:
+[0,132) small allocations (game's own), [132,1008) OUR shared subheap (876 MB) holding every
+GPU-skinned model's blob (relocated at the model "data arrived" hook when the blob sits above
+1 GB; skinned = CPU segment has section tag 0xc5354b60) AND all impostor (distant building) data
+(the impostor system's global heap pointer exe+0xbf2dd80 is overwritten with our heap after the
+game creates its own, which we shrink to a 16 MB stub at [1008,1024)); static geometry above 1 GB
+where raw reads work. Knobs: LAYOVER_SKIN_MB (876), LAYOVER_IMPOSTOR_MB (16), LAYOVER_PLUG (0; the
+plug layout broke distant buildings, do not use), LAYOVER_SKIN_RESERVE_MB (48, dormant),
+LAYOVER_SKIN_LOG (1; 2 = survey every model). Measured need in the city: shared heap peaks around
+550-620 MB of 876. Do NOT cap the impostor heap below what the game asks (a refused impostor
+allocation is retried every frame: 7M requests, fps halves) and do NOT let the shared heap fill.
+
+**Things still worth doing (none blocking):**
+1. Get the user to confirm cinematics animate with run 12's build (expected yes).
+2. Longer play soak: watch the shared heap peak; if it approaches 876 MB, there is no room left in
+   the first GB (small region 132 is the game's). Options then: shrink the small region at init
+   (`[0x14c359760]*0x46/100` in exe+0x2c59ff9..) or accept rare T-poses.
+3. Layover.app could wait for Steam to be logged on before launching (cloud-sync dialog after
+   sleep); `drive.sh` (dev only) sometimes needs several Play presses on the launcher.
+4. Nice-to-haves from before: controller pairing/test, offline "flight" mode rehearsal, fps_cap.
+
+**Tools:** `tools/dev/drive.sh TAG [continue]` runs the game unattended (launch via Steam, press
+Play, wait for the menu, press Enter = Continue). `tools/dev/pe.py` (capstone disassembler, needs
+a venv with capstone pefile numpy), `xref.py`, `ctx.py`, `winlist.c`/`sendkey.c` (build with
+mingw), `wincap/main.swift` (window list; captures fail without Screen Recording permission, so
+visuals always need the user). The shim builds with `make` in `shims/d3d12shim`; deploy by copying
+`d3d12.dll` to `~/Library/Application Support/Layover/tools/d3d12shim.dll` AND to
+`.../engines/sikarugir10.0_6/renderers/d3d12shim/wine/x86_64-windows/d3d12.dll` (the game loads
+the overlay copy). Restart the game to load a new build.
 
 ## Fourth session (evening): the T-pose fix is implemented and running; needs the user's eyes
 
@@ -138,7 +190,7 @@ byte flags at +0x184 and +0x1a4 worth checking) and give their buffers a reserve
 VA [nbytes]`), xref.py (rel32/rip-relative reference finder), ctx.py (call-site context),
 analyze2.py (allocation-log parser). Make a venv with `pip install capstone pefile numpy`.
 
-## START HERE: the one open task is Spider-Man 2's T-pose, and here is the plan
+## (Historical, third session) The plan that was followed for the T-pose fix
 
 **What you inherit.** The game runs on Layover (Wine + D3DMetal). Characters are frozen in their bind
 pose. The cause is known and proven (section "ROOT CAUSE FOUND" below): the game puts all geometry
@@ -194,7 +246,7 @@ Traps: the vramcap dxgi wrapper crashes the game (don't use; the shim's LAYOVER_
 a `ps | grep` pattern that matches your own shell's command line kills your shell; a stray Enter at
 the main menu hits Quit; the game's crash dialog needs `crs-handler.exe` killed too.
 
-## State right now
+## State right now (written 2026-10-08 afternoon; see START HERE above for today)
 
 - `layover` works end to end on this Mac (M4 Pro, 48 GB, macOS 15.7.9): setup, Steam sign-in,
   game download, controller detection, offline "flight" mode.
@@ -214,7 +266,7 @@ the main menu hits Quit; the game's crash dialog needs `crs-handler.exe` killed 
 - Two older engine folders may still exist under `engines/` (`wine-staging-11.18`, `cx26.3`, ~2.3 GB);
   `layover setup` deletes them when Steam is not running.
 
-## Next steps
+## Next steps (as of 2026-10-08 afternoon; items 0-1 are done)
 
 0. Spider-Man 2 T-pose: root cause found, fix blocked; see the section below for the two strategies.
    The d3d12 shim is installed by `layover setup`/every launch and inert unless games.2651280.env sets
