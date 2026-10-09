@@ -48,7 +48,18 @@ shrunk to 16 MB (fallback), static geometry above 1 GB. Measured at the save loa
 live 521-526 MB (peak 603), 528 skinned moved + 862 impostor blocks redirected, 0 refusals, 0
 failures, 69 fps. Lessons: a refused impostor allocation makes the game retry it every frame (run 9:
 850k requests, fps 47), so the shared heap must never refuse; live bytes must come from the record
-table (failed requests are never freed, an estimate drifts). Still to check by eye: distant buildings (impostor heap now above 1 GB; if they look wrong, try
+table (failed requests are never freed, an estimate drifts). The user confirmed characters AND distant buildings look right with this layout (morning of
+2026-10-09), BUT: during cinematics characters T-pose again. Log (sm2-skin-run10.log, 08:46): the
+shared heap started refusing allocations (even 69 KB) while holding only 547 MB of 876 MB (640
+records); skin-hw (copy high-water inside the heap) was 836 MB, so ~290 MB of freed holes were not
+being reused. After that every impostor request redirected into the heap failed too (7M retries,
+heap-failed-bytes in the TB). So the game's subheap allocator does not behave like a first-fit heap
+under alloc/free churn (or the CreateSubHeap "entries" argument, 0x8000 for ours, caps something).
+NEXT: read the allocator (ctor 0x143132510 sets the vtable; alloc 0x1431325f0 calls vtbl+0x18 after
+checking [alloc+0x40] max size and [alloc+0x38]/[alloc+0x30] chained allocators; init
+0x1431334a0(obj, base, size, policy, entries-derived, name, 0x2200, 0x10, 2)). Cheap experiments:
+entries 0x20000; two separate heaps (models / impostors) so impostor churn cannot fragment the
+model heap; or a periodic "compaction" is impossible (GPU addresses are cached). Also check by eye (impostor heap now above 1 GB; if they look wrong, try
 `LAYOVER_PLUG=0` with `LAYOVER_IMPOSTOR_MB=320`, which keeps impostors low but caps them; the
 observed impostor request was 416 MB in run 4, so expect trouble there).
 
