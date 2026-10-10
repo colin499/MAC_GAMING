@@ -3,6 +3,14 @@
 //                           buffer views fit Metal's 2^28-element limit (see try_patch_budget).
 //   LAYOVER_SKIN_MB=<n>     Spider-Man 2 T-pose fix: keep skinned models' GPU data in the first 1 GB of
 //                           the pool (sm2_skin.c; default 256 MB, 0 = off; LAYOVER_SKIN_LOG=1 per model).
+//   LAYOVER_MAX_FPS=<n>     frame limiter: pace IDXGISwapChain::Present to n frames per second (D3DMetal 3.0
+//                           has no cap of its own; `layover config fps_cap 60` sets this). Less GPU work in
+//                           menus and light scenes = a cooler, quieter machine.
+//   LAYOVER_FENCE_SLEEP=0   turn OFF the fence-wait relief (default 3): the game's render thread polls
+//                           ID3D12Fence::GetCompletedValue in a tight loop ~12 times per frame while the GPU
+//                           catches up, pegging a CPU core; after LAYOVER_FENCE_SPIN_US (300) of identical
+//                           answers the shim blocks on the fence's own completion event instead (mode 3).
+//                           Modes 1 (nap LAYOVER_FENCE_NAP_US) and 2 (measure only) exist for experiments.
 //   LAYOVER_TSSHIM=1        serve timestamp queries from the CPU clock (Highball's tsshim fix).
 //   LAYOVER_D3D12_LOG=<win path>  log what the game asks of D3D12 (feature queries, pools, views,
 //                           pipelines, command signatures, counters); LAYOVER_D3D12_VERBOSE=1 for all.
@@ -50,6 +58,7 @@ void shim_note(const char *fmt, ...)
 static int readable(const void *p, SIZE_T n);
 int shim_readable(const void *p, SIZE_T n) { return readable(p, n); }
 void sm2_skin_install(void);
+int sm2_known_build(void);
 void sm2_skin_stats(char *out, size_t cap);
 void sm2_skin_note_copy(UINT64 doff, UINT64 n);
 
@@ -89,14 +98,17 @@ static UINT64 res_width(ID3D12Resource *r) { D3D12_RESOURCE_DESC d; if (!r) retu
 
 // ---- counters dumped periodically --------------------------------------------------------
 static ID3D12Resource *pool_res; static UINT64 pool_width; static volatile LONG64 pool_hw; static volatile LONG pool_oob, pool_copies;
+static volatile LONG c_present, c_present_paced, c_fence_polls, c_fence_sleeps;
+static volatile LONG fence_hist[8]; static volatile LONG64 fence_episodes; static int fence_sleep = 3;   // fence wait hook (see below); 3 = event wait
 static volatile LONG c_dispatch, c_draw, c_drawidx, c_execind, c_execind_sig, c_execlists, c_copybuf, c_setpso, c_dispatchmesh, c_srv_buf, c_uav_buf, c_srv_tex, c_uav_tex, c_pso_gfx, c_pso_cs, c_pso_gen, c_pso_fail, c_res_buf, c_res_tex, c_map, c_barrier;
 static DWORD WINAPI stats_thread(LPVOID arg)
 {
     for (;;) {
         Sleep(5000);
         if (pool_res) { char sk[300]; sm2_skin_stats(sk, sizeof sk); NOTE("pool: high-water %llu MB of %llu, copies %ld, past-end %ld | %s", (unsigned long long)(pool_hw >> 20), (unsigned long long)(pool_width >> 20), pool_copies, pool_oob, sk); }
-        LOG("stats: execlists=%ld dispatch=%ld dispatchmesh=%ld draw=%ld drawidx=%ld execind=%ld copybuf=%ld setpso=%ld map=%ld barrier=%ld | views srv_buf=%ld uav_buf=%ld srv_tex=%ld uav_tex=%ld | pso gfx=%ld cs=%ld gen=%ld FAIL=%ld | res buf=%ld tex=%ld",
-            c_execlists, c_dispatch, c_dispatchmesh, c_draw, c_drawidx, c_execind, c_copybuf, c_setpso, c_map, c_barrier, c_srv_buf, c_uav_buf, c_srv_tex, c_uav_tex, c_pso_gfx, c_pso_cs, c_pso_gen, c_pso_fail, c_res_buf, c_res_tex);
+        if (fence_sleep) LOG("fence waits: episodes=%lld hist(<50us %ld, <200us %ld, <1ms %ld, <4ms %ld, <16ms %ld, <64ms %ld, <256ms %ld, more %ld) polls=%ld slept=%ld", (long long)fence_episodes, fence_hist[0], fence_hist[1], fence_hist[2], fence_hist[3], fence_hist[4], fence_hist[5], fence_hist[6], fence_hist[7], c_fence_polls, c_fence_sleeps);
+        LOG("stats: presents=%ld (paced %ld) fence-polls=%ld (slept %ld) execlists=%ld dispatch=%ld dispatchmesh=%ld draw=%ld drawidx=%ld execind=%ld copybuf=%ld setpso=%ld map=%ld barrier=%ld | views srv_buf=%ld uav_buf=%ld srv_tex=%ld uav_tex=%ld | pso gfx=%ld cs=%ld gen=%ld FAIL=%ld | res buf=%ld tex=%ld",
+            c_present, c_present_paced, c_fence_polls, c_fence_sleeps, c_execlists, c_dispatch, c_dispatchmesh, c_draw, c_drawidx, c_execind, c_copybuf, c_setpso, c_map, c_barrier, c_srv_buf, c_uav_buf, c_srv_tex, c_uav_tex, c_pso_gfx, c_pso_cs, c_pso_gen, c_pso_fail, c_res_buf, c_res_tex);
     }
     return 0;
 }
@@ -165,6 +177,8 @@ DECL(HRESULT, CreateCommandQueue, ID3D12Device *, const D3D12_COMMAND_QUEUE_DESC
 DECL(HRESULT, CreateCommandList, ID3D12Device *, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *, REFIID, void **)
 DECL(HRESULT, CreateCommandList1, ID3D12Device4 *, UINT, D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_LIST_FLAGS, REFIID, void **)
 DECL(HRESULT, GetDeviceRemovedReason, ID3D12Device *)
+DECL(HRESULT, CreateFence, ID3D12Device *, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)
+DECL(UINT64, GetCompletedValue, ID3D12Fence *)
 DECL(void, EndQuery, ID3D12GraphicsCommandList *, ID3D12QueryHeap *, D3D12_QUERY_TYPE, UINT)
 DECL(void, BeginQuery, ID3D12GraphicsCommandList *, ID3D12QueryHeap *, D3D12_QUERY_TYPE, UINT)
 DECL(void, ResolveQueryData, ID3D12GraphicsCommandList *, ID3D12QueryHeap *, D3D12_QUERY_TYPE, UINT, UINT, ID3D12Resource *, UINT64)
@@ -194,7 +208,7 @@ static void try_patch_budget(const char *where)
     if (budget_done) return;
     if (!GetEnvironmentVariableA("LAYOVER_MANAGED_MB", v, sizeof v)) { budget_done = 1; return; }
     GetModuleFileNameA(NULL, exepath, sizeof exepath); base = strrchr(exepath, '\\'); base = base ? base + 1 : exepath;
-    if (_stricmp(base, "Spider-Man2.exe")) { budget_done = 1; return; }   // the table address below is this game's
+    if (_stricmp(base, "Spider-Man2.exe") || !sm2_known_build()) { budget_done = 1; return; }   // the table address below is this game build's
     exe = (UINT8 *)GetModuleHandleA(NULL); tbl = exe + 0xc3d9838;
     if (!readable(tbl, 16)) { LOG("budget table at %p not readable (%s)", tbl, where); return; }
     { INT64 raw = *(INT64 *)tbl; entries = raw < 0 ? tbl + (int)raw : (UINT8 *)raw; }   // the game's accessor: negative = offset from the table itself
@@ -238,7 +252,7 @@ static void try_patch_subheaps(const char *where)
     if (subheap_done) return;
     if (!GetEnvironmentVariableA("LAYOVER_SUBHEAP_MB", v, sizeof v)) { subheap_done = 1; return; }
     GetModuleFileNameA(NULL, exepath, sizeof exepath); base = strrchr(exepath, '\\'); base = base ? base + 1 : exepath;
-    if (_stricmp(base, "Spider-Man2.exe")) { subheap_done = 1; return; }
+    if (_stricmp(base, "Spider-Man2.exe") || !sm2_known_build()) { subheap_done = 1; return; }
     big = (UINT32)atoi(v) << 20; if (big < (16u << 20) || big > (416u << 20)) { NOTE("LAYOVER_SUBHEAP_MB=%s ignored (16..416)", v); subheap_done = 1; return; }
     small = big / 4; if (small < (16u << 20)) small = (16u << 20);
     exe = (UINT8 *)GetModuleHandleA(NULL);
@@ -330,6 +344,101 @@ static void install_vram_cap(void)
     }
 }
 
+// ---- frame limiter (LAYOVER_MAX_FPS) --------------------------------------------------------------
+// D3DMetal 3.0 has no frame-rate cap (no D3DM_MAX_FPS; checked the framework's strings) and this game's
+// VSync only ties it to the 120 Hz panel, so menus run at 100+ fps with the GPU flat out. We pace
+// IDXGISwapChain::Present/Present1 instead: after each real present, sleep until the next slot of a
+// 1/n s grid. The grid accumulates (next += period), so a late wake-up shortens the next wait and the
+// average rate stays exact; after a stall (loading, the window in the background) the grid resyncs.
+// The swapchain vtable is reached the way the VRAM cap reaches the adapter's: D3DMetal uses one
+// vtable per class, so patching the factory's CreateSwapChain* through a factory of our own catches
+// the game's swapchain, whose Present slots are then patched in place. The hooks fall back to the
+// originals if LAYOVER_MAX_FPS is 0 (the shim leaves everything untouched then).
+#include <dxgi1_6.h>
+static UINT64 fps_period;            // QPC ticks per frame; 0 = limiter off
+static UINT64 fps_next;              // QPC tick at which the next present may return
+static CRITICAL_SECTION fps_lock;
+static void fps_pace(void)
+{
+    LARGE_INTEGER c; UINT64 now, target;
+    if (!fps_period) return;
+    QueryPerformanceCounter(&c); now = (UINT64)c.QuadPart;
+    EnterCriticalSection(&fps_lock);
+    if (!fps_next || now > fps_next + fps_period) fps_next = now;   // first frame, or we are already slower than the cap: resync
+    target = fps_next; fps_next += fps_period;
+    LeaveCriticalSection(&fps_lock);
+    if (now >= target) return;
+    InterlockedIncrement(&c_present_paced);
+    for (;;) {
+        UINT64 rem = target - now; UINT64 ms = rem * 1000 / qpc_freq;
+        if (ms >= 2) Sleep((DWORD)(ms - 1));      // Sleep() wakes up to ~1 ms late: leave the last millisecond to a yield loop
+        else if (ms >= 1) Sleep(0);
+        else YieldProcessor();
+        QueryPerformanceCounter(&c); now = (UINT64)c.QuadPart;
+        if (now >= target) return;
+    }
+}
+typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDXGISwapChain *, UINT, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_Present1)(IDXGISwapChain1 *, UINT, UINT, const DXGI_PRESENT_PARAMETERS *);
+static PFN_Present real_Present; static PFN_Present1 real_Present1;
+static HRESULT STDMETHODCALLTYPE hook_Present(IDXGISwapChain *sc, UINT sync, UINT flags)
+{
+    HRESULT hr = real_Present(sc, sync, flags);
+    if (!(flags & DXGI_PRESENT_TEST)) { InterlockedIncrement(&c_present); fps_pace(); }
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE hook_Present1(IDXGISwapChain1 *sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *pp)
+{
+    HRESULT hr = real_Present1(sc, sync, flags, pp);
+    if (!(flags & DXGI_PRESENT_TEST)) { InterlockedIncrement(&c_present); fps_pace(); }
+    return hr;
+}
+static int swapchain_patched;
+static void patch_swapchain(IDXGISwapChain *sc)
+{
+    void *p;
+    if (!sc) return;
+    patch_slot((void **)&sc->lpVtbl->Present, (void *)hook_Present, (void **)&real_Present);
+    if (SUCCEEDED(sc->lpVtbl->QueryInterface(sc, &IID_IDXGISwapChain1, &p)) && p) { IDXGISwapChain1 *s1 = p; patch_slot((void **)&s1->lpVtbl->Present1, (void *)hook_Present1, (void **)&real_Present1); patch_slot((void **)&s1->lpVtbl->Present, (void *)hook_Present, (void **)&real_Present); s1->lpVtbl->Release(s1); }
+    if (!swapchain_patched) { swapchain_patched = 1; NOTE("frame limiter: swapchain %p vtable patched, pacing Present to %llu fps", (void *)sc, (unsigned long long)(qpc_freq / fps_period)); }
+}
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CSC)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CSCH)(IDXGIFactory2 *, IUnknown *, HWND, const DXGI_SWAP_CHAIN_DESC1 *, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *, IDXGIOutput *, IDXGISwapChain1 **);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CSCW)(IDXGIFactory2 *, IUnknown *, IUnknown *, const DXGI_SWAP_CHAIN_DESC1 *, IDXGIOutput *, IDXGISwapChain1 **);
+typedef HRESULT (STDMETHODCALLTYPE *PFN_CSCC)(IDXGIFactory2 *, IUnknown *, const DXGI_SWAP_CHAIN_DESC1 *, IDXGIOutput *, IDXGISwapChain1 **);
+static PFN_CSC real_CSC; static PFN_CSCH real_CSCH; static PFN_CSCW real_CSCW; static PFN_CSCC real_CSCC;
+static HRESULT STDMETHODCALLTYPE hook_CSC(IDXGIFactory *f, IUnknown *dev, DXGI_SWAP_CHAIN_DESC *d, IDXGISwapChain **out) { HRESULT hr = real_CSC(f, dev, d, out); if (SUCCEEDED(hr) && out && *out) patch_swapchain(*out); return hr; }
+static HRESULT STDMETHODCALLTYPE hook_CSCH(IDXGIFactory2 *f, IUnknown *dev, HWND w, const DXGI_SWAP_CHAIN_DESC1 *d, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fd, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCH(f, dev, w, d, fd, o, out); if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
+static HRESULT STDMETHODCALLTYPE hook_CSCW(IDXGIFactory2 *f, IUnknown *dev, IUnknown *w, const DXGI_SWAP_CHAIN_DESC1 *d, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCW(f, dev, w, d, o, out); if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
+static HRESULT STDMETHODCALLTYPE hook_CSCC(IDXGIFactory2 *f, IUnknown *dev, const DXGI_SWAP_CHAIN_DESC1 *d, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCC(f, dev, d, o, out); if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
+static int fps_factory_done;
+static void install_fps_limiter(void)
+{
+    char v[32]; int fps; HMODULE dxgi; IDXGIFactory *f = NULL; void *p;
+    typedef HRESULT (WINAPI *PFN_CDF1_)(REFIID, void **);
+    PFN_CDF1_ cdf1;
+    if (fps_factory_done) return;
+    fps_factory_done = 1;
+    if (!GetEnvironmentVariableA("LAYOVER_MAX_FPS", v, sizeof v)) return;
+    fps = atoi(v);
+    if (fps <= 0) return;
+    if (fps < 15 || fps > 240) { NOTE("LAYOVER_MAX_FPS=%s ignored (15..240)", v); return; }
+    InitializeCriticalSection(&fps_lock);
+    fps_period = qpc_freq / (UINT64)fps;
+    dxgi = LoadLibraryA("dxgi.dll"); cdf1 = dxgi ? (PFN_CDF1_)GetProcAddress(dxgi, "CreateDXGIFactory1") : NULL;
+    if (!cdf1 || FAILED(cdf1(&IID_IDXGIFactory1, (void **)&f)) || !f) { NOTE("frame limiter: no DXGI factory (dxgi %p); cap not applied", (void *)dxgi); fps_period = 0; return; }
+    patch_slot((void **)&f->lpVtbl->CreateSwapChain, (void *)hook_CSC, (void **)&real_CSC);
+    if (SUCCEEDED(f->lpVtbl->QueryInterface(f, &IID_IDXGIFactory2, &p)) && p) {
+        IDXGIFactory2 *f2 = p;
+        patch_slot((void **)&f2->lpVtbl->CreateSwapChainForHwnd, (void *)hook_CSCH, (void **)&real_CSCH);
+        patch_slot((void **)&f2->lpVtbl->CreateSwapChainForCoreWindow, (void *)hook_CSCW, (void **)&real_CSCW);
+        patch_slot((void **)&f2->lpVtbl->CreateSwapChainForComposition, (void *)hook_CSCC, (void **)&real_CSCC);
+        f2->lpVtbl->Release(f2);
+    } else NOTE("frame limiter: IDXGIFactory2 not available; only IDXGIFactory::CreateSwapChain is covered");
+    f->lpVtbl->Release(f);
+    NOTE("frame limiter armed: %d fps (LAYOVER_MAX_FPS); waiting for the game's swapchain", fps);
+}
+
 // ---- logpoints (LAYOVER_LOGPOINTS=rva,rva,...): INT3 at exe+rva, logged by a vectored handler -----
 // Each hit logs the registers and the return address, then the original byte is restored, the thread
 // single-steps over it and the INT3 goes back. Cheap way to see whether a code path (an OOM branch)
@@ -403,6 +512,7 @@ static HRESULT STDMETHODCALLTYPE hook_CreateQueryHeap(ID3D12Device *dev, const D
 static HRESULT STDMETHODCALLTYPE hook_CheckFeatureSupport(ID3D12Device *dev, D3D12_FEATURE feature, void *data, UINT size)
 {
     char in[200] = "", outb[200] = "";
+    if (!logging) return real_CheckFeatureSupport(dev, feature, data, size);
     if (data) hexdump(in, sizeof in, data, size);
     HRESULT hr = real_CheckFeatureSupport(dev, feature, data, size);
     if (data) hexdump(outb, sizeof outb, data, size);
@@ -555,6 +665,69 @@ static HRESULT STDMETHODCALLTYPE hook_GetDeviceRemovedReason(ID3D12Device *dev)
     return hr;
 }
 
+// ---- fence spin-wait relief ------------------------------------------------------------------------
+// Sampled at the main menu (2026-10-10): the game's "Render Thread" spends ~97 % of a core in a loop at
+// exe+0x2cca320..0x2ccc2fb calling D3D12Fence::GetCompletedValue until the fence reaches the value it
+// waits for. Measured (mode 2): ~12 wait episodes per frame, most 1-16 ms long, ~140k polls/s. Any
+// sleep-based relief multiplies its granularity by those 12 waits (Sleep(1) took the menu from 26-32 fps
+// to 4-32 fps, run-dependent), so mode 3 blocks on the fence's own completion event for value+1 after a
+// short spin: it wakes exactly when the fence advances. Measured: render thread 97 % -> 25 %, fps equal
+// to the unpatched game (26 vs 26 at the same menu scene).
+// LAYOVER_FENCE_SLEEP: 0 off, 1 sleep after LAYOVER_FENCE_SPIN_US microseconds of identical polls (a "wait
+// episode"), 2 measure only. The first version slept from the third identical poll on and cut the menu
+// fps from 26-32 to 4-5: a frame has 100+ short waits, and every one of them grew to a 1-2 ms sleep.
+// So: spin through short waits exactly as the game does, and only sleep inside long ones.
+static DWORD fence_tls = TLS_OUT_OF_INDEXES; static UINT64 fence_spin_ticks; static UINT fence_nap_us = 250;
+typedef struct FencePoll { ID3D12Fence *fence; UINT64 value; UINT64 t0; int same; int slept; HANDLE event; } FencePoll;
+// fence_hist[]: wait-episode lengths <50us <200us <1ms <4ms <16ms <64ms <256ms more (declared with the counters above)
+typedef NTSTATUS (WINAPI *PFN_NtDelayExecution)(BOOLEAN, const LARGE_INTEGER *);
+static PFN_NtDelayExecution p_NtDelayExecution;
+static void fence_nap(void) { LARGE_INTEGER t; t.QuadPart = -(LONGLONG)fence_nap_us * 10; if (p_NtDelayExecution) p_NtDelayExecution(FALSE, &t); else Sleep(1); }   // Wine passes the exact interval to the unix side (Sleep() rounds up to ~1-2 ms)
+static UINT64 STDMETHODCALLTYPE hook_GetCompletedValue(ID3D12Fence *f)
+{
+    UINT64 v = real_GetCompletedValue(f); FencePoll *s; LARGE_INTEGER c;
+    if (!fence_sleep || fence_tls == TLS_OUT_OF_INDEXES) return v;
+    s = TlsGetValue(fence_tls);
+    if (!s) { s = calloc(1, sizeof *s); if (!s) return v; TlsSetValue(fence_tls, s); }
+    InterlockedIncrement(&c_fence_polls);
+    if (s->fence == f && s->value == v) {
+        QueryPerformanceCounter(&c);
+        if (++s->same == 1) s->t0 = (UINT64)c.QuadPart;
+        else if (fence_sleep == 1 && (UINT64)c.QuadPart - s->t0 >= fence_spin_ticks) { InterlockedIncrement(&c_fence_sleeps); s->slept = 1; fence_nap(); v = real_GetCompletedValue(f); if (v != s->value) goto done; }
+        else if (fence_sleep == 3 && (UINT64)c.QuadPart - s->t0 >= fence_spin_ticks) {
+            // block on the fence's own completion event for the next value: wakes when the GPU (or a CPU Signal)
+            // gets there, no polling granularity; 4 ms timeout as a safety net, then the loop re-reads anyway
+            if (!s->event) s->event = CreateEventW(NULL, FALSE, FALSE, NULL);
+            InterlockedIncrement(&c_fence_sleeps); s->slept = 1;
+            if (s->event && SUCCEEDED(f->lpVtbl->SetEventOnCompletion(f, v + 1, s->event))) WaitForSingleObject(s->event, 4); else fence_nap();
+            v = real_GetCompletedValue(f); if (v != s->value) goto done;
+        }
+        return v;
+    }
+done:
+    if (s->same) {   // an episode of identical answers ended: histogram its length
+        UINT64 us; QueryPerformanceCounter(&c); us = ((UINT64)c.QuadPart - s->t0) * 1000000 / qpc_freq;
+        InterlockedIncrement(&fence_hist[us < 50 ? 0 : us < 200 ? 1 : us < 1000 ? 2 : us < 4000 ? 3 : us < 16000 ? 4 : us < 64000 ? 5 : us < 256000 ? 6 : 7]);
+        InterlockedIncrement64(&fence_episodes);
+    }
+    s->fence = f; s->value = v; s->same = 0; s->slept = 0;
+    return v;
+}
+static int fence_patched;
+static HRESULT STDMETHODCALLTYPE hook_CreateFence(ID3D12Device *dev, UINT64 init, D3D12_FENCE_FLAGS flags, REFIID riid, void **out)
+{
+    HRESULT hr = real_CreateFence(dev, init, flags, riid, out);
+    if (SUCCEEDED(hr) && out && *out && fence_sleep && !fence_patched) {
+        ID3D12Fence *f = NULL;
+        if (SUCCEEDED(((IUnknown *)*out)->lpVtbl->QueryInterface((IUnknown *)*out, &IID_ID3D12Fence, (void **)&f)) && f) {
+            patch_slot((void **)&f->lpVtbl->GetCompletedValue, (void *)hook_GetCompletedValue, (void **)&real_GetCompletedValue);
+            f->lpVtbl->Release(f); fence_patched = 1;
+            NOTE("fence wait hook on: mode %d (LAYOVER_FENCE_SLEEP: 0 off, 1 nap %u us after %llu us of polling, 2 measure only, 3 wait on the fence event after that spin)", fence_sleep, fence_nap_us, (unsigned long long)(fence_spin_ticks * 1000000 / qpc_freq));
+        }
+    }
+    return hr;
+}
+
 // ---- command list hooks -----------------------------------------------------------------------
 static void STDMETHODCALLTYPE hook_EndQuery(ID3D12GraphicsCommandList *list, ID3D12QueryHeap *heap, D3D12_QUERY_TYPE type, UINT index)
 {
@@ -681,7 +854,7 @@ static void patch_device_vtbl(void *iface, int gen)
     PATCH(vt, CreateCommittedResource); PATCH(vt, CreatePlacedResource); PATCH(vt, CreateReservedResource); PATCH(vt, CreateHeap);
     PATCH(vt, CreateShaderResourceView); PATCH(vt, CreateUnorderedAccessView);
     PATCH(vt, CreateGraphicsPipelineState); PATCH(vt, CreateComputePipelineState); PATCH(vt, CreateCommandSignature); PATCH(vt, CreateRootSignature);
-    PATCH(vt, CreateCommandQueue); PATCH(vt, CreateCommandList); PATCH(vt, GetDeviceRemovedReason);
+    PATCH(vt, CreateCommandQueue); PATCH(vt, CreateCommandList); PATCH(vt, GetDeviceRemovedReason); PATCH(vt, CreateFence);
     if (gen >= 2) { ID3D12Device2Vtbl *v2 = (ID3D12Device2Vtbl *)vt; PATCH(v2, CreatePipelineState); }
     if (gen >= 4) { ID3D12Device4Vtbl *v4 = (ID3D12Device4Vtbl *)vt; PATCH(v4, CreateCommandList1); }
 }
@@ -730,6 +903,7 @@ HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL level, REF
     if (!fn) return E_FAIL;
     hr = fn(adapter, level, riid, out);
     try_patch_budget("D3D12CreateDevice"); try_patch_subheaps("D3D12CreateDevice");
+    if (SUCCEEDED(hr)) install_fps_limiter();
     LOG("D3D12CreateDevice adapter=%p level=0x%x out=%p hr=0x%lx -> %p", adapter, (unsigned)level, out, (unsigned long)hr, out ? *out : NULL);
     if (SUCCEEDED(hr) && out && *out) {
         ID3D12Device *dev = NULL; IUnknown *u = (IUnknown *)*out;
@@ -766,6 +940,10 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         tsshim = GetEnvironmentVariableA("LAYOVER_TSSHIM", v, sizeof v) == 1 && v[0] == '1';
         logging = GetEnvironmentVariableA("LAYOVER_D3D12_LOG", NULL, 0) > 0;
         verbose = GetEnvironmentVariableA("LAYOVER_D3D12_VERBOSE", v, sizeof v) == 1 && v[0] == '1';
+        if (GetEnvironmentVariableA("LAYOVER_FENCE_SLEEP", v, sizeof v) >= 1) fence_sleep = atoi(v);
+        { char u[16]; UINT spin_us = 300; if (GetEnvironmentVariableA("LAYOVER_FENCE_SPIN_US", u, sizeof u) >= 1) spin_us = (UINT)atoi(u); fence_spin_ticks = qpc_freq * spin_us / 1000000;
+          if (GetEnvironmentVariableA("LAYOVER_FENCE_NAP_US", u, sizeof u) >= 1) fence_nap_us = (UINT)atoi(u); if (fence_nap_us < 50) fence_nap_us = 50; }
+        if (fence_sleep) { fence_tls = TlsAlloc(); p_NtDelayExecution = (PFN_NtDelayExecution)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtDelayExecution"); }
         if (!load_real()) return FALSE;
         RESOLVE(D3D12CoreCreateLayeredDevice); RESOLVE(D3D12CoreGetLayeredDeviceSize); RESOLVE(D3D12CoreRegisterLayers);
         RESOLVE(D3D12CreateRootSignatureDeserializer); RESOLVE(D3D12CreateVersionedRootSignatureDeserializer);

@@ -97,7 +97,8 @@ DEFAULT_CONFIG = {
     # -noverifyfiles etc: stop Steam's startup self-check from overwriting the web-helper wrapper
     # (see WRAPPER below). `layover update-steam` runs an update with these off.
     "steam_args": ["-cef-disable-gpu"],
-    "fps_cap": 0,              # cap frame rate (0 = off); smoother + cooler on battery
+    "fps_cap": 0,              # cap frame rate (0 = off): cooler and quieter. D3DMetal games: our d3d12 shim paces
+                               # Present (LAYOVER_MAX_FPS, applied at the next game launch); DXMT games: DXMT's own cap.
     "audiobuf": True,          # insert Highball's CoreAudio buffer fix (off if it causes trouble)
     "webhelper_wrapper": False,  # single-process CEF wrapper: needed on the old Wine Staging engine, not on this one
     # What D3DMetal calls the GPU. "apple": the adapter Wine registered in the prefix's registry
@@ -450,11 +451,10 @@ def wine_env(cfg, game=None, extra=None):
                 env["D3DM_DEVICE_DESCRIPTION"] = gpu[2]
     if overlays:
         env["WINEDLLPATH_PREPEND"] = ":".join(overlays)
-    fps = g.get("fps_cap", cfg.get("fps_cap", 0)) or 0
+    fps = game_fps_cap(cfg, game)
     if fps and renderer in ("dxmt", "d3dmetal"):
-        env["DXMT_CONFIG"] = f"d3d11.preferredMaxFrameRate={fps};"
-        if renderer == "d3dmetal":
-            env["D3DM_MAX_FPS"] = str(fps)
+        env["DXMT_CONFIG"] = f"d3d11.preferredMaxFrameRate={fps};"   # DXMT's limiter (D3D11 games); D3DMetal has none
+        # D3D12 games under D3DMetal get the cap from our d3d12 shim (LAYOVER_MAX_FPS in d3d12shim.env, see write_shim_env)
     env["LAYOVER_RENDERER"] = renderer
     for k, v in (g.get("env") or {}).items():
         env[k] = str(v)
@@ -540,6 +540,14 @@ def apply_retina(cfg):
 SHIM_ENV_PATH = os.path.join(PREFIX, "drive_c", "windows", "system32", "d3d12shim.env")
 
 
+def game_fps_cap(cfg, game=None):
+    g = cfg["games"].get(str(game), {}) if game else {}
+    try:
+        return int(g.get("fps_cap", cfg.get("fps_cap", 0)) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def write_shim_env(cfg, game=None):
     """Settings file the d3d12 shim reads in DllMain (KEY=VALUE; only sets variables that are unset).
     Needed because a Steam-launched game inherits Steam's environment, not ours. Rewritten at every
@@ -547,7 +555,7 @@ def write_shim_env(cfg, game=None):
     if not os.path.isdir(os.path.dirname(SHIM_ENV_PATH)):
         return None
     log = new_log("d3d12")
-    lines = ["LAYOVER_D3D12_LOG=Z:" + log.replace("/", "\\"), "LAYOVER_SKIN_LOG=1"]
+    lines = ["LAYOVER_D3D12_LOG=Z:" + log.replace("/", "\\"), "LAYOVER_SKIN_LOG=1", f"LAYOVER_MAX_FPS={game_fps_cap(cfg, game)}"]
     g = cfg["games"].get(str(game), {}) if game else {}
     for k, v in (g.get("env") or {}).items():
         if k.startswith(("LAYOVER_", "D3DM_", "HB_")):
@@ -995,6 +1003,56 @@ def steam_accounts(where):
         return parse_vdf(f.read()).get("users", {})
 
 
+def steam_connection_state():
+    """Last state in Steam's connection_log.txt ("Logged On", "Disconnected", "Connecting", ...); None if unknown."""
+    try:
+        with open(os.path.join(STEAM_DIR, "logs", "connection_log.txt"), "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 65536))
+            tail = f.read().decode(errors="replace")
+    except OSError:
+        return None
+    states = re.findall(r"^\[[^\]]+\] \[([A-Za-z ]+?),", tail, re.M)
+    return states[-1] if states else None
+
+
+def wants_offline(where="windows"):
+    p = loginusers_path(where)
+    try:
+        with open(p, errors="replace") as f:
+            return re.search(r'"WantsOfflineMode"\s+"1"', f.read()) is not None
+    except OSError:
+        return False
+
+
+def wait_for_steam_logon(timeout=45):
+    """After the Mac sleeps, Steam takes a while to reconnect. Launching a game before it is logged on makes
+    Steam's controller-config / cloud sync fail and it then waits on a dialog ("Launching...") that nobody
+    sees behind the game. Wait a little for "Logged On" (skipped in offline mode)."""
+    if wants_offline() or steam_connection_state() in (None, "Logged On"):
+        return True
+    info("Steam is not connected yet (" + str(steam_connection_state()) + "); waiting for it to log on")
+    for _ in range(timeout // 2):
+        time.sleep(2)
+        if steam_connection_state() == "Logged On":
+            return True
+    warn("Steam still is not logged on; launching anyway (if Steam shows a 'Launching...' dialog, answer it)")
+    return False
+
+
+def steam_launch_prompt(appid):
+    """True if Steam's console log shows a launch of this app stuck waiting for the user (a dialog)."""
+    try:
+        with open(os.path.join(STEAM_DIR, "logs", "console_log.txt"), "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 65536))
+            tail = f.read().decode(errors="replace")
+    except OSError:
+        return False
+    last = [l for l in tail.splitlines() if f"GameAction [AppID {appid}," in l]
+    return bool(last) and "waiting for user response" in last[-1]
+
+
 def set_offline_mode(where, offline):
     """Flip Steam's remembered 'WantsOfflineMode' so it boots straight into offline mode."""
     p = loginusers_path(where)
@@ -1272,8 +1330,19 @@ def running_renderer():
     return running_state().get("renderer")
 
 
+def remove_legacy_engines():
+    """Delete engine folders from earlier experiments (2+ GB). Only while nothing runs in the prefix."""
+    if steam_running() or prefix_running():
+        return
+    for old in LEGACY_ENGINES + [RENDERERS]:
+        if os.path.isdir(old):
+            shutil.rmtree(old, ignore_errors=True)
+            info(f"removed old engine files {os.path.basename(old)}")
+
+
 def launch_steam(cfg, game=None, offline=None, extra_args=None):
     """Start Windows Steam in our prefix (detached). Returns log path."""
+    remove_legacy_engines()
     if offline is not None:
         set_offline_mode("windows", offline)
     renderer = resolve_renderer(cfg, game)
@@ -1309,7 +1378,8 @@ def cmd_steam(args):
         if offline is not None:
             warn("Steam is already running; offline/online can only be set on launch. Use Steam's menu → Go Offline.")
         else:
-            ok("Steam is already running")
+            wine(cfg, ["start", "steam://open/main"], wait=False)
+            ok("Steam is already running; bringing its window up")
         return
     if native_steam_running():
         warn("native Mac Steam is running. Two Steam clients on one account kick each other offline")
@@ -1383,8 +1453,17 @@ def cmd_play(args):
         install_d3d12_shim()
         apply_retina(cfg)
         write_shim_env(cfg, g["appid"])
+        wait_for_steam_logon()
+        if steam_launch_prompt(g["appid"]):
+            warn("Steam is still showing a dialog from the last launch of this game; answer it in Steam's window")
+            wine(cfg, ["start", "steam://open/main"], wait=False)
+            time.sleep(2)
         wine(cfg, ["start", f"steam://rungameid/{g['appid']}"], game=g["appid"], wait=False)
         ok(f"asked Steam to launch {g['name']} ({renderer})")
+        time.sleep(8)
+        if steam_launch_prompt(g["appid"]):
+            warn("Steam wants an answer before it starts the game: look at its window (a sync or notice dialog)")
+            notify("Layover", "Steam is asking something before it starts the game: look at its window")
     else:
         offline = True if args.offline else None
         log = launch_steam(cfg, game=g["appid"], offline=offline)
@@ -1567,11 +1646,18 @@ def cmd_config(args):
         val = val.lower() in ("1", "true", "on", "yes", "y")
     elif isinstance(DEFAULT_CONFIG[args.key], list):
         val = val.split()
+    elif isinstance(DEFAULT_CONFIG[args.key], int):
+        try:
+            val = int(val)
+        except ValueError:
+            die(f"{args.key} needs a whole number (0 = off)")
     elif args.key == "d3dmetal_identity" and val not in D3DMETAL_IDENTITIES:
         die("d3dmetal_identity must be one of: " + ", ".join(D3DMETAL_IDENTITIES))
     cfg[args.key] = val
     save_config(cfg)
     ok(f"{args.key} = {val}")
+    if args.key == "fps_cap":
+        info("applies when a game is next launched (D3D12 games: the d3d12 shim paces frames; D3D11 games: DXMT, needs a Steam restart)" if val else "frame rate uncapped from the next game launch")
     if args.key == "retina" and engine_ready() and os.path.isdir(os.path.join(PREFIX, "drive_c")):
         apply_retina(cfg)
         if val:
@@ -1593,7 +1679,7 @@ def cmd_logs(args):
     if not os.path.isdir(LOGS):
         info("no logs yet")
         return
-    files = sorted(os.listdir(LOGS))
+    files = sorted((f for f in os.listdir(LOGS) if f.endswith(".log")), key=lambda f: os.path.getmtime(os.path.join(LOGS, f)))
     if not files:
         info("no logs yet")
         return
@@ -1649,7 +1735,6 @@ def notify(title, text):
 
 def cmd_app(args):
     """Build ~/Applications/Layover.app: a double-clickable app (no Terminal) that launches a game."""
-    py = sys.executable if sys.executable and os.path.exists(sys.executable) else "/usr/bin/python3"
     macos = os.path.join(APP_DIR, "Contents", "MacOS"); res = os.path.join(APP_DIR, "Contents", "Resources")
     os.makedirs(macos, exist_ok=True); os.makedirs(res, exist_ok=True)
     with open(os.path.join(APP_DIR, "Contents", "Info.plist"), "w") as f:
@@ -1672,8 +1757,12 @@ def cmd_app(args):
     with open(launcher, "w") as f:
         f.write(f"""#!/bin/zsh
 # Layover.app: launches `layover app-launch` from the repo without a Terminal window.
+# Any python3 will do (the program only uses the standard library): Homebrew's if present, else Apple's.
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
-exec "{py}" "{os.path.join(HERE, 'layover')}" app-launch >> "{os.path.join(LOGS, 'app.log')}" 2>&1
+for py in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+  [ -x "$py" ] && exec "$py" "{os.path.join(HERE, 'layover')}" app-launch >> "{os.path.join(LOGS, 'app.log')}" 2>&1
+done
+osascript -e 'display dialog "Layover needs python3 (install the Xcode Command Line Tools or Homebrew python)." buttons {{"OK"}} with icon stop'
 """)
     os.chmod(launcher, 0o755)
     if os.path.exists(APP_SRC_ICON):
@@ -1685,6 +1774,12 @@ exec "{py}" "{os.path.join(HERE, 'layover')}" app-launch >> "{os.path.join(LOGS,
 
 def cmd_app_launch(args):
     """What Layover.app runs: pick a game in a dialog, then play it. Errors go to a dialog, not a terminal."""
+    try:
+        app_log = os.path.join(LOGS, "app.log")
+        if os.path.exists(app_log) and os.path.getsize(app_log) > (1 << 20):
+            open(app_log, "w").close()   # the launcher appends forever; start over past 1 MB
+    except OSError:
+        pass
     try:
         cfg = load_config()
         if not (engine_ready() and steam_installed()):

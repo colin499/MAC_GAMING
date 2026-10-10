@@ -1,6 +1,79 @@
-# Handoff notes (2026-10-09 afternoon, end of the fifth session)
+# Handoff notes (2026-10-10, end of the sixth session)
 
 Read this first if you are a new agent (or future me) picking up Layover.
+
+## Sixth session (2026-10-10): efficiency and "button it up" pass
+
+**Why:** the user asked for a full run-through for efficiency, long-term robustness and less heat,
+without losing the quality reached before. Everything below was measured, not guessed.
+
+**State of the T-pose fix:** an 18-hour session (2026-10-09 15:42 to 2026-10-10 09:33, including a
+laptop sleep) ended with `failed 0`, `heap-failed-bytes 0`, allocator bytes/blocks == record table
+(526 MB / 685), no minidump, clean "Quit requested from pause menu". Nothing to change there.
+
+**Frame cap was a no-op:** `fps_cap` used to export `D3DM_MAX_FPS`, which D3DMetal 3.0 does not have
+(`strings` on the framework: no such knob). Replaced by a frame limiter in our shim: `LAYOVER_MAX_FPS`
+(written into `system32/d3d12shim.env` at every launch from config `fps_cap`, game override honoured;
+no Steam restart needed). Mechanism: `install_fps_limiter()` runs at the first successful
+D3D12CreateDevice, makes a DXGI factory of its own, patches the shared factory vtable's CreateSwapChain*
+slots, and when the game's swapchain appears patches its Present/Present1 slots; after each real present
+`fps_pace()` sleeps to the next slot of a 1/n grid (accumulating target, resync after stalls, Sleep for
+all but the last ms, then yield-spin). Verified: the intro/loading phase, which runs uncapped at 100+ fps,
+holds exactly 300 presents per 5 s (60.0 fps) with the stats line's `presents=N (paced M)`. The user's
+config now has `fps_cap 60`. Note the main menu and gameplay at the user's current settings (3456x2160
+windowed, FSR Quality = 2304x1400 internal) are GPU-bound at 12-35 fps, so the cap only acts in menus,
+loading and light scenes; the real heat lever is the in-game render resolution (FSR Balanced/Performance).
+
+**Fence-wait relief (the CPU finding, and a lesson in measuring):** `sample` on the game at the main
+menu showed the "Render Thread" at ~97 % of a core in a loop at exe+0x2cca320..0x2ccc2fb calling
+`D3D12Fence::GetCompletedValue`. First attempt: from the third identical poll on, `Sleep(1)` and re-read.
+One run looked great (CPU 220 % -> 55 %, fps 20-22), the alternating A/B (off, on, off, on, 60 s settle,
+3 fps readings each, display held awake) did not: off 32/26 fps, on 4.5/32 fps. Then a measure-only mode
+(LAYOVER_FENCE_SLEEP=2, histogram of "wait episodes" = runs of identical answers per thread) showed WHY:
+~12 wait episodes per frame, per 5 s at 28 fps: 213 <50 us, 114 <200 us, 144 <1 ms, 971 1-4 ms, 315
+4-16 ms; ~140k polls/s. Twelve waits per frame times a 1-2 ms sleep granularity eats the frame, and when
+the other side of the handshake waits too it cascades (the 4 fps runs). Final design (mode 3, default):
+spin like the game for LAYOVER_FENCE_SPIN_US (300) us, then `SetEventOnCompletion(value+1, per-thread
+event)` + `WaitForSingleObject(event, 4 ms)`, re-read, repeat: wakes exactly when the fence advances.
+All main-menu runs of the day (fps / process CPU / hottest thread), 60 s settle, 3 one-minute fps
+readings, display awake: off1 32.5 / 283-420 / 97 %; off2 26.3 / 370-390 / 97 %; off3 32.0 / 306-388 /
+97 %; measure-only 28.5 / 273-320 / 97 %; event3 26.0 / 303-320 / 25 %; event3b 28.7 / 203-215 / 18 %.
+The menu scene itself drifts between 26 and 32 fps from run to run (same build, relief off), so the
+event mode shows no fps cost, and about one core less CPU. Mode 1 (nap LAYOVER_FENCE_NAP_US=250 us via NtDelayExecution after
+the spin) is kept for experiments only. Stats line additions: `fence waits: episodes=.. hist(..)` and
+`fence-polls=N (slept M)` where "slept" counts event waits in mode 3. The remaining ~3 cores at the menu
+are the game's other threads (Submit Thread lock contention inside D3DMetal's ExecuteCommandLists, Coherent
+UI, streaming/prefetch) and were not touched.
+
+**Robustness:**
+- `sm2_known_build()` (sm2_skin.c): compares the exe's PE link timestamp (0x6a79a155) and SizeOfImage
+  (0xd069000) with the build the addresses come from; on mismatch every game-specific patch is skipped
+  with a clear log line (T-pose would return after a game update instead of a crash through wrong code).
+- `layover play` with Steam running now waits (up to 45 s) for Steam's connection_log.txt to say
+  "Logged On" before `steam://rungameid/...` (skipped in offline mode), and warns + notifies when
+  console_log.txt shows the launch "waiting for user response" (a dialog). Cause seen today: a launch
+  requested 90 s before Steam had reconnected after sleep -> "SynchronizingControllerConfig syncfailed"
+  -> a "Launching..." CEF dialog nobody sees, and the next rungameid is ignored until it is answered
+  (Steam had to be restarted: `layover kill` then `layover play`).
+- Layover.app's launcher script no longer bakes in one python binary (brew's python@3.14 path would
+  break at the next brew upgrade); it tries /opt/homebrew/bin/python3, /usr/local/bin/python3,
+  /usr/bin/python3 (the program is plain stdlib; compiles on 3.9 and 3.14). app.log is truncated past 1 MB.
+- Old engines (wine-staging-11.18, cx26.3, ROOT/renderers; 2.1 GB) are removed at the next Steam launch
+  while nothing runs in the prefix (setup could never do it because Steam was always up).
+- `layover steam` while Steam runs brings its window up (`steam://open/main`) instead of doing nothing.
+- `layover config` coerces integer settings (fps_cap was being saved as the string "60").
+- `layover logs` shows the newest log by mtime. CheckFeatureSupport hexdumps only when logging.
+- tools/dev/sendkey.c: `--title TITLE` (Steam's CEF dialogs all have class SDL_app) and note that the
+  game's launcher (GameNxApp) only takes Enter via `--post` (PostMessage), not SendInput, on some runs.
+  Scratch drivers used today: drive2.sh (press Play, wait for the menu), abtest.sh/ab4.sh (A/B harness).
+
+**Measured background cost of Steam idle:** CEF renderer ~13 %, webhelper ~7 %, wineserver ~6 %,
+steam.exe ~2 % of a core, continuously. Not fixed in code (the user needs the Steam UI); README recommends
+Steam's Low Performance Mode. `-silent` was considered and not tried.
+
+**Display sleep trap for unattended runs:** displaysleep is 5 min; once the screen sleeps the game drops
+to ~5 fps (no drawables), which looks like a performance regression in the logs. Hold it with
+`caffeinate -d -u` during measurements.
 
 ## Fifth session (2026-10-09 afternoon): the "froze in the skills menu" report, retina, tidy-up
 

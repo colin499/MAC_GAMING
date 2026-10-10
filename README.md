@@ -95,10 +95,32 @@ the DXGI adapter against the registry's display-adapter driver entry and otherwi
 known desktop vendor (Layover's AGS replacement then stands in for AMD's driver library).
 
 Other settings (`./layover config`): `msync` (faster sync, on), `metal_hud` (FPS overlay), `fps_cap`
-(cap frame rate, e.g. 60, for cooler and quieter play on battery),
-`advertise_avx` (some engines refuse to start without it, on), `retina` (see below),
+(see "Heat" below), `advertise_avx` (some engines refuse to start without it, on), `retina` (see below),
 `steam_overlay` (off: Steam's in-game overlay is kept out of games, see below),
 `steam_args` (extra flags for steam.exe).
+
+## Heat, noise and battery
+
+A 2024 AAA game on a laptop is going to be warm; what Layover can do is stop the *wasted* work:
+
+* **`./layover config fps_cap 60`** (set by default on this Mac). DirectX 12 games under D3DMetal get
+  the cap from Layover's own d3d12 shim, which paces the swapchain's Present to a fixed grid (D3DMetal 3.0
+  has no cap of its own, and the game's VSync only ties it to the 120 Hz panel). Verified in Spider-Man 2:
+  loading and menus that ran at 100+ fps now sit at exactly 60. It takes effect at the next game launch,
+  no Steam restart. `0` turns it off. DirectX 11 games get the same number through DXMT's limiter.
+* **Fence-wait relief** (on by default, shim knob `LAYOVER_FENCE_SLEEP=0` turns it off): Spider-Man 2's
+  render thread polls a GPU fence in a tight loop about a dozen times per frame while it waits for the
+  GPU, which pegged a whole CPU core at all times. After 0.3 ms of polling the shim blocks on the fence's
+  own completion event instead, so the thread wakes exactly when the GPU gets there. Measured at the main
+  menu over six runs: that thread 97 % -> about 20 % of a core, the whole game about one core less,
+  frame rate unchanged (26-32 fps with and without; the scene itself drifts that much).
+* **In the game's settings** is where the real heat lives: Spider-Man 2 at 3456x2160 with FSR *Quality*
+  renders 2304x1400 internally and is GPU-bound at 25-35 fps, i.e. the GPU is flat out. FSR *Balanced* or
+  *Performance* (render ~1700x1080 or ~1150x720) is the biggest lever; Medium preset next. Dynamic
+  resolution with a target of 60 also works. Lower render work = less heat *and* smoother play.
+* **Steam itself** costs about a quarter of a core in the background (its Chromium UI keeps
+  animating). In Steam: Settings → Library → *Low Performance Mode*, and Interface → turn off smooth
+  scrolling and GPU rendering (GPU rendering is already off via `-cef-disable-gpu`).
 
 **Sharper picture (`./layover config retina on`, the default is off):** games then see the
 MacBook's full 3456x2234 panel instead of the 1728x1117 "looks like" size, and Steam is started
@@ -120,6 +142,13 @@ window back to the front to continue.
 ## Honest limitations
 
 * **Anti-cheat multiplayer games** (EAC, BattlEye, Vanguard) will not run. Nothing on macOS fixes this.
+* **After the Mac sleeps**, Steam takes a minute to reconnect. `layover play` (and Layover.app) now
+  waits for it to be logged on before asking for a game, because a launch requested earlier makes
+  Steam's controller-config sync fail and it then sits on a "Launching..." dialog behind everything.
+  If that still happens, click the dialog in Steam's window (or pick "Open Steam" in Layover.app).
+* **A game update** (Spider-Man 2 patches) changes the executable; the shim checks the exe's build
+  stamp and turns its game-specific patches off instead of patching the wrong code. Characters would
+  T-pose again until the shim is updated for the new build (see HANDOFF.md).
 * **Performance** is below a Windows PC. DX11 games through DXMT are generally good on an M4 Pro;
   DX12 games vary a lot.
 * **Steam's UI** runs with GPU rendering off (`-cef-disable-gpu`), so store pages are a bit
@@ -133,7 +162,7 @@ window back to the front to continue.
 
 ```bash
 ./layover doctor      # health check
-./layover logs        # last launch log; Steam's own logs are in the prefix under Steam/logs
+./layover logs        # newest log (launch or per-run d3d12 shim); Steam's own logs are in the prefix under Steam/logs
 ./layover kill        # close running games cleanly, then stop Steam and everything in the Windows prefix
 ./layover update-steam  # let the Steam client update itself, then re-install the wrapper
 ./layover winecfg     # Wine's settings window (drives, audio, Windows version)
@@ -149,11 +178,14 @@ and dxmt.report for DXMT-specific game notes.
 layover            the program (Python 3, no dependencies beyond macOS)
 wrapper/           steamwebhelper wrapper: prebuilt .exe plus C source (rebuilds with brew's mingw-w64)
 shims/amd_ags/     AMD AGS replacement DLL: prebuilt .dll plus C++ source and AMD's header (make rebuilds it)
+shims/d3d12shim/   our d3d12.dll in front of D3DMetal: Spider-Man 2 T-pose fix (sm2_skin.c), frame limiter,
+                   fence spin-wait relief, optional D3D12 trace. `make` rebuilds it; every launch deploys it
+tools/dev/         agent tooling: drive the game unattended, disassembly helpers, minidump reader
 Layover.command    double-click launcher for the menu
 ~/Library/Application Support/Layover/
   engines/sikarugir10.0_6/  engine/ (Wine), frameworks/ (runtime), renderers/ (dxmt, d3dmetal)
   prefixes/steam/  the Windows environment; games live in drive_c/Program Files (x86)/Steam/steamapps
   downloads/       cached archives (checksums pinned in `layover`)
-  logs/            launch logs (steam-*) and per-run d3d12 shim logs (d3d12-*); the 20 newest are kept
+  logs/            launch logs (steam-*), per-run d3d12 shim logs (d3d12-*), app.log (Layover.app); the 20 newest are kept
   config.json      your settings
 ```

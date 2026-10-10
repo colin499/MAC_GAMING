@@ -1,5 +1,5 @@
 // sendkey: inject keyboard input inside the Wine prefix via SendInput (no macOS permission needed).
-// usage: sendkey.exe [--focus CLASS] [wait:MS] KEY[:HOLDMS] +KEY -KEY ... ; KEY = ENTER SPACE ESC UP DOWN LEFT RIGHT TAB SHIFT CTRL ALT A..Z 0..9 F1..F12 or hex VK (0x..)
+// usage: sendkey.exe [--focus CLASS] [--title TITLE] [wait:MS] KEY[:HOLDMS] +KEY -KEY ... ; KEY = ENTER SPACE ESC UP DOWN LEFT RIGHT TAB SHIFT CTRL ALT A..Z 0..9 F1..F12 or hex VK (0x..)
 // +KEY holds a key down and -KEY releases it, for chords such as `+SHIFT TAB -SHIFT` (Steam overlay).
 #include <windows.h>
 #include <stdio.h>
@@ -31,6 +31,11 @@ int main(int argc, char **argv) {
             target = FindWindowA(argv[++i], NULL);
             if (target) { ShowWindow(target, SW_SHOW); SetForegroundWindow(target); SetActiveWindow(target); SetFocus(target); Sleep(400); }
             fg = GetForegroundWindow(); printf("focus %s -> hwnd %p, foreground now %p\n", argv[i], (void *)target, (void *)fg); fflush(stdout); continue;
+        }
+        if (!strcmp(argv[i], "--title") && i + 1 < argc) {   // same, by exact window title (Steam's CEF dialogs all share class SDL_app)
+            target = FindWindowA(NULL, argv[++i]);
+            if (target) { ShowWindow(target, SW_SHOW); SetForegroundWindow(target); SetActiveWindow(target); SetFocus(target); Sleep(400); }
+            fg = GetForegroundWindow(); printf("title '%s' -> hwnd %p, foreground now %p\n", argv[i], (void *)target, (void *)fg); fflush(stdout); continue;
         }
         if (!strcmp(argv[i], "--post")) { post = 1; continue; }   // PostMessage WM_KEYDOWN/UP to the target instead of SendInput
         char *a = strdup(argv[i]); char *colon = strchr(a, ':'); DWORD n = 0;

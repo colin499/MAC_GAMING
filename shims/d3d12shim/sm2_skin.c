@@ -29,7 +29,10 @@
 //     game does) and patch the slot: record pointer at slot+0x90, mirror address at [slot+0x28]+0x18.
 //     Everything downstream reads those two fields.
 //   * Frees resolve the owning allocator by address range, so relocated blobs free back into our heap.
-// Build v2.810.0.0 addresses; every hook checks the expected bytes before patching.
+// Build v2.810.0.0 addresses. Two guards: sm2_known_build() compares the exe's PE header (link
+// timestamp + image size) with the build these addresses come from, and every hook checks the
+// expected code bytes before patching. A Steam update of the game therefore turns the fix off
+// (characters T-pose again, the log says why) instead of patching the wrong code.
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -282,12 +285,30 @@ void sm2_skin_stats(char *out, size_t cap)
     snprintf(out, cap, "skin: models %ld skinned %ld moved %ld (live %lld MB, peak %lld, heap %u MB) freed %ld low-already %ld failed %ld skin-hw %lld heap-failed-bytes %llu alloc-internal: bytes %lld MB blocks %d freedesc %d | impostor: redirected %ld overflow %ld, own heap hw %lld MB of %llu failed-bytes %llu", st_models, st_skinned, st_moved, (long long)(st_live >> 20), (long long)(skin_peak >> 20), skin_mb, st_freed, st_already_low, st_fail, (long long)(skin_hw >> 20), (unsigned long long)(skin_heap ? *(UINT64 *)((UINT8 *)skin_heap + 0x4e0) : 0), (long long)(skin_heap ? *(INT64 *)((UINT8 *)skin_heap + 0xd0) >> 20 : 0), skin_heap ? *(int *)((UINT8 *)skin_heap + 0x114) : 0, skin_heap ? *(int *)((UINT8 *)skin_heap + 0x110) : 0, imp_redirected, imp_overflow, (long long)(imp_hw >> 20), (unsigned long long)(imp_req >> 20), (unsigned long long)(imp_heap ? *(UINT64 *)((UINT8 *)imp_heap + 0x4e0) : 0));
 }
 
+// Spider-Man2.exe v2.810.0.0 as shipped on Steam in October 2026: PE link timestamp and SizeOfImage.
+#define KNOWN_TIMESTAMP 0x6a79a155u
+#define KNOWN_IMAGE_SIZE 0x0d069000u
+int sm2_known_build(void)
+{
+    static int known = -1;
+    if (known < 0) {
+        const UINT8 *base = (const UINT8 *)GetModuleHandleA(NULL);
+        const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)base;
+        const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+        known = nt->FileHeader.TimeDateStamp == KNOWN_TIMESTAMP && nt->OptionalHeader.SizeOfImage == KNOWN_IMAGE_SIZE;
+        if (!known) SNOTE("Spider-Man2.exe build (link stamp %08lx, image %#lx) is not the one the fixes were made for (%08x, %#x): game patches OFF until the shim is updated for this build",
+                          (unsigned long)nt->FileHeader.TimeDateStamp, (unsigned long)nt->OptionalHeader.SizeOfImage, KNOWN_TIMESTAMP, KNOWN_IMAGE_SIZE);
+    }
+    return known;
+}
+
 void sm2_skin_install(void)
 {
     static const UINT8 e_movrbx[] = { 0x48, 0x89, 0x5C, 0x24, 0x10 };   // mov [rsp+0x10], rbx
     char v[32], exepath[MAX_PATH]; const char *base;
     GetModuleFileNameA(NULL, exepath, sizeof exepath); base = strrchr(exepath, '\\'); base = base ? base + 1 : exepath;
     if (_stricmp(base, "Spider-Man2.exe")) return;
+    if (!sm2_known_build()) return;
     if (GetEnvironmentVariableA("LAYOVER_SKIN_MB", v, sizeof v)) skin_mb = (UINT)atoi(v);
     if (!skin_mb) { SNOTE("LAYOVER_SKIN_MB=0: skinned-model steering off"); return; }
     if (skin_mb < 32 || skin_mb > 892) { SNOTE("LAYOVER_SKIN_MB=%u out of range (32..892); using 876", skin_mb); skin_mb = 876; }
