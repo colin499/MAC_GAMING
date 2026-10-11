@@ -1,6 +1,27 @@
-# Handoff notes (2026-10-10, end of the sixth session)
+# Handoff notes (2026-10-11; sixth session plus the Fallout 4 start)
 
 Read this first if you are a new agent (or future me) picking up Layover.
+
+## Fallout 4 (AppID 377160, installed 2026-10-10, 27 GB; status 2026-10-11 afternoon, OPEN)
+
+DirectX 11 -> Layover picks DXMT. First launch (2026-10-10 19:57) was from Steam's own window while
+Steam was in D3DMetal mode, so it ran D3D11 through D3DMetal: fullscreen 3456x2234 looked right (the
+window started minimized at -32000,-32000 and came back when focused), ~70 % CPU, but no frame cap on
+that path (the shim is a d3d12.dll and never loads in a D3D11 game; the DXMT cap is DXMT_CONFIG). The
+Creation Engine ties physics to fps, so >60 fps on the 120 Hz panel is a quality problem.
+Second launch via Layover.app (2026-10-11 15:14, Steam restarted in dxmt mode): the user saw the game in
+a QUARTER of the screen. DXMT's log (steam-2026-10-11_15-14-25.log): "Setting display mode:
+3456x2234@59/60", i.e. exclusive fullscreen did a display-mode switch under Wine RetinaMode=y, which is
+where the quarter picture comes from. Prefs are in the prefix's Documents/My Games/Fallout4/
+Fallout4Prefs.ini (bFull Screen=1, bBorderless=1, iSize 3456x2234, sD3DDevice="NVIDIA GeForce 6800" =
+the launcher detects the GPU through wined3d's d3d9, harmless). Change made, NOT yet tested by the user:
+bFull Screen=0 (borderless windowed at 3456x2234; backup Fallout4Prefs.ini.bak-fullscreen). If that does
+not fill the screen: either run it through D3DMetal (launch from Steam's window) and add a D3D11 frame
+cap to the shim (a dxgi/d3d11 front DLL, same limiter code), or turn retina off for this game.
+DXMT config keys available (strings of winemetal.so): d3d11.preferredMaxFrameRate (used for fps_cap),
+d3d11.metalSpatialUpscaleFactor, d3d11.maxFeatureLevel, dxgi.customVendorId/DeviceId/DeviceDesc,
+dxgi.forceSDR, dxgi.handleAltTab; nothing retina-specific. Fallout 76 was discussed (no kernel
+anti-cheat, Proton Gold, D3D11, online-only) but is not installed.
 
 ## Sixth session (2026-10-10): efficiency and "button it up" pass
 
