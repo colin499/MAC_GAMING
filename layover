@@ -18,6 +18,7 @@ Usage:  layover <command> [options]      (run `layover help` for the list)
 
 import argparse
 import datetime as _dt
+import glob
 import hashlib
 import json
 import os
@@ -108,8 +109,13 @@ DEFAULT_CONFIG = {
     # insist on an AMD/NVIDIA/Intel vendor; our AGS replacement covers AMD's driver library then.
     "d3dmetal_identity": "apple",
     "d3d12_shim": True,        # our d3d12.dll in front of D3DMetal (per-game fixes, see GAME_FIXES)
-    "games": {},               # per-appid overrides: {"renderer": ..., "msync": ..., "fps_cap": ..., "env": {...}}
+    # per-appid overrides (`layover game <game> <key> <value>`): renderer, msync, fps_cap, metal_hud,
+    # steam_overlay, retina, metalfx (DXMT games: render at the window size / factor and let MetalFX
+    # spatial upscaling fill the panel; 2 with retina off = full-panel output from a 1728x1117 render),
+    # env {...}. A game whose settings differ from the running Steam's gets Steam restarted first.
+    "games": {},
 }
+GAME_KEYS = ("renderer", "msync", "fps_cap", "metal_hud", "steam_overlay", "retina", "metalfx")
 
 MICROSOFT_VID = 0x045E
 
@@ -451,10 +457,8 @@ def wine_env(cfg, game=None, extra=None):
                 env["D3DM_DEVICE_DESCRIPTION"] = gpu[2]
     if overlays:
         env["WINEDLLPATH_PREPEND"] = ":".join(overlays)
-    fps = game_fps_cap(cfg, game)
-    if fps and renderer in ("dxmt", "d3dmetal"):
-        env["DXMT_CONFIG"] = f"d3d11.preferredMaxFrameRate={fps};"   # DXMT's limiter (D3D11 games); D3DMetal has none
-        # D3D12 games under D3DMetal get the cap from our d3d12 shim (LAYOVER_MAX_FPS in d3d12shim.env, see write_shim_env)
+    if renderer in ("dxmt", "d3dmetal"):
+        env.update(dxmt_env(cfg, game))
     env["LAYOVER_RENDERER"] = renderer
     for k, v in (g.get("env") or {}).items():
         env[k] = str(v)
@@ -527,10 +531,10 @@ def registry_value(key_path, name):
     return v.group(1) if v else None
 
 
-def apply_retina(cfg):
-    """Make Wine's Mac driver match config `retina` (3456x2234 vs 1728x1117 on this MacBook).
-    Each Wine process reads the key at start, so this also works while Steam is up (next game launch)."""
-    want = "y" if cfg.get("retina") else "n"
+def apply_retina(cfg, game=None):
+    """Make Wine's Mac driver match config `retina` (3456x2234 vs 1728x1117 on this MacBook), or the
+    game's own override. Each Wine process reads the key at start."""
+    want = "y" if effective_retina(cfg, game) else "n"
     if registry_value(r"Software\Wine\Mac Driver", "RetinaMode") == want:
         return False
     reg_add(cfg, r"HKCU\Software\Wine\Mac Driver", "RetinaMode", want)
@@ -546,6 +550,51 @@ def game_fps_cap(cfg, game=None):
         return int(g.get("fps_cap", cfg.get("fps_cap", 0)) or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def game_metalfx(cfg, game=None):
+    """MetalFX spatial upscale factor for a DXMT game (0 = off). DXMT keeps the game's backbuffer at the
+    size the game asked for and makes the Metal layer `factor` times larger, so with retina off a game
+    at 1728x1117 fills the 3456x2234 panel with a MetalFX-upscaled picture at a quarter of the GPU work."""
+    g = cfg["games"].get(str(game), {}) if game else {}
+    try:
+        f = float(g.get("metalfx", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return f if f > 1.0 else 0
+
+
+def dxmt_env(cfg, game=None):
+    """DXMT settings for a launch (the game inherits them from Steam, so Steam is restarted when they
+    change; see launch_fingerprint). D3D12 games under D3DMetal get their cap from our d3d12 shim
+    (LAYOVER_MAX_FPS in d3d12shim.env, see write_shim_env)."""
+    env = {}
+    conf = []
+    fps = game_fps_cap(cfg, game)
+    if fps:
+        conf.append(f"d3d11.preferredMaxFrameRate={fps}")   # DXMT's limiter (D3D11 games); D3DMetal has none
+    f = game_metalfx(cfg, game)
+    if f:
+        env["DXMT_METALFX_SPATIAL_SWAPCHAIN"] = "1"
+        conf.append(f"d3d11.metalSpatialUpscaleFactor={f:g}")
+    if conf:
+        env["DXMT_CONFIG"] = ";".join(conf) + ";"
+    return env
+
+
+def effective_retina(cfg, game=None):
+    g = cfg["games"].get(str(game), {}) if game else {}
+    return bool(g.get("retina", cfg.get("retina")))
+
+
+def launch_fingerprint(cfg, game=None):
+    """What a game's launch needs from the Steam process it is started by: the renderer, Wine's retina
+    mode and the environment the game inherits. Steam is restarted when a game's fingerprint differs
+    from the one Steam was started with (running.json)."""
+    g = cfg["games"].get(str(game), {}) if game else {}
+    env = dxmt_env(cfg, game)
+    env.update({k: str(v) for k, v in (g.get("env") or {}).items()})
+    return {"renderer": resolve_renderer(cfg, game), "retina": effective_retina(cfg, game), "env": env}
 
 
 def write_shim_env(cfg, game=None):
@@ -1357,8 +1406,9 @@ def launch_steam(cfg, game=None, offline=None, extra_args=None):
         remove_webhelper_wrapper()
     install_ags_shim()
     install_d3d12_shim()
-    apply_retina(cfg)
-    if cfg.get("retina") and not any(a.startswith("-forcedesktopscaling") for a in args):
+    apply_retina(cfg, game)
+    fp = launch_fingerprint(cfg, game)
+    if fp["retina"] and not any(a.startswith("-forcedesktopscaling") for a in args):
         args += ["-forcedesktopscaling", "2"]   # keep Steam's UI readable on the 2x desktop
     write_shim_env(cfg, game)
     log = new_log("steam")
@@ -1366,7 +1416,7 @@ def launch_steam(cfg, game=None, offline=None, extra_args=None):
         args += ["-applaunch", str(game)]
     wine(cfg, args, game=game, wait=False, log=log, cwd=STEAM_DIR, extra_env={"LAYOVER_RENDERER": renderer})
     with open(STATE_PATH, "w") as f:
-        json.dump({"renderer": renderer, "retina": bool(cfg.get("retina")), "started": _dt.datetime.now().isoformat(), "game": game}, f)
+        json.dump(dict(fp, started=_dt.datetime.now().isoformat(), game=game), f)
     return log
 
 
@@ -1438,10 +1488,14 @@ def cmd_play(args):
     require_setup()
     renderer = resolve_renderer(cfg, g["appid"])
     restart = None
+    fp = launch_fingerprint(cfg, g["appid"])
+    state = running_state()
     if steam_running() and running_renderer() not in (None, renderer):
         restart = f"{g['name']} uses the {renderer} renderer; Steam is running with {running_renderer()}"
-    elif steam_running() and running_state().get("retina") not in (None, bool(cfg.get("retina"))):
-        restart = "the retina setting changed since Steam was started"
+    elif steam_running() and state.get("retina") not in (None, fp["retina"]):
+        restart = f"{g['name']} needs retina {'on' if fp['retina'] else 'off'}; Steam was started with it {'on' if state.get('retina') else 'off'}"
+    elif steam_running() and state and state.get("env", {}) != fp["env"]:
+        restart = f"{g['name']}'s renderer settings differ from the ones Steam was started with"
     if restart:
         info(restart + ". Restarting Steam.")
         wineserver_kill(cfg)
@@ -1451,7 +1505,7 @@ def cmd_play(args):
             time.sleep(1)
     if steam_running():
         install_d3d12_shim()
-        apply_retina(cfg)
+        apply_retina(cfg, g["appid"])
         write_shim_env(cfg, g["appid"])
         wait_for_steam_logon()
         if steam_launch_prompt(g["appid"]):
@@ -1634,6 +1688,62 @@ def cmd_renderer(args):
     ok(f"{g['name']} → {args.renderer}  (applies next time Steam is launched)")
 
 
+def cmd_game(args):
+    """Show or set a per-game override (keys in GAME_KEYS, plus `env` as KEY=VALUE pairs)."""
+    cfg = load_config()
+    g = find_game(args.game, all_games())
+    if not g:
+        die(f"no installed game matches '{args.game}' (layover games)")
+    cur = cfg["games"].get(g["appid"], {})
+    if args.key is None:
+        head(g["name"])
+        shown = {k: v for k, v in cur.items() if k != "dx12"}
+        info(json.dumps(shown, indent=2) if shown else "no overrides (uses the global settings)")
+        info("keys: " + ", ".join(GAME_KEYS) + ", env; `layover game <game> <key> default` removes one")
+        return
+    key, val = args.key, args.value
+    if key not in GAME_KEYS and key != "env":
+        die(f"unknown per-game setting '{key}'. Keys: " + ", ".join(GAME_KEYS) + ", env")
+    if val == "default":
+        cur.pop(key, None)
+    elif key == "env":
+        env = cur.setdefault("env", {})
+        for pair in val.split():
+            k, _, v = pair.partition("=")
+            if v == "":
+                env.pop(k, None)
+            else:
+                env[k] = v
+        if not env:
+            cur.pop("env", None)
+    elif key == "renderer":
+        if val not in RENDERER_CHOICES:
+            die("renderer must be one of: " + ", ".join(RENDERER_CHOICES))
+        cur[key] = val
+    elif key in ("fps_cap",):
+        try:
+            cur[key] = int(val)
+        except ValueError:
+            die(f"{key} needs a whole number (0 = off)")
+    elif key == "metalfx":
+        try:
+            cur[key] = float(val)
+        except ValueError:
+            die("metalfx needs a factor such as 2 or 1.5 (0 = off)")
+        if cur[key] <= 1.0:
+            cur.pop(key, None)
+    else:
+        cur[key] = val.lower() in ("1", "true", "on", "yes", "y")
+    cfg["games"][g["appid"]] = cur
+    save_config(cfg)
+    ok(f"{g['name']}: {key} = {cur.get(key, 'default')}")
+    info("applies at the next `layover play` of this game (Steam is restarted if it was started with other settings)")
+    if key == "metalfx" and key in cur:
+        res = "1728x1117" if not effective_retina(cfg, g["appid"]) else "3456x2234"
+        info(f"DXMT games only. Set the game's resolution to {res} (borderless/windowed): it renders at that size")
+        info(f"and MetalFX scales the output {cur[key]:g}x. Retina off + factor 2 fills the panel at 1/4 of the GPU work.")
+
+
 def cmd_config(args):
     cfg = load_config()
     if args.key is None:
@@ -1721,6 +1831,56 @@ def cmd_uninstall(args):
 # --------------------------------------------------------------------------- the Finder app
 APP_DIR = os.path.expanduser("~/Applications/Layover.app")
 APP_SRC_ICON = os.path.join(HERE, "app", "Layover.icns")
+MENU_SRC = os.path.join(HERE, "app", "menu.swift")                     # the pinball-backglass picker (AppKit)
+MENU_BIN = os.path.join(APP_DIR, "Contents", "MacOS", "LayoverMenu")
+MENU_ACTIONS = ["Open Steam", "Quit Steam", "Flight mode", "Back online"]
+
+
+def menu_binary(quiet=True):
+    """Compile app/menu.swift into the app bundle when missing or stale. Returns the path or None.
+    The Command Line Tools' newest SDK can be ahead of their swiftc (seen 2026-10-11: SDK 26.2 vs Swift
+    6.1.2 -> "this SDK is not supported by the compiler"), so older SDKs in the same folder are tried too."""
+    if not os.path.exists(MENU_SRC):
+        return None
+    try:
+        if os.path.exists(MENU_BIN) and os.path.getmtime(MENU_BIN) >= os.path.getmtime(MENU_SRC):
+            return MENU_BIN
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(MENU_BIN), exist_ok=True)
+    sdks = [None] + sorted(glob.glob("/Library/Developer/CommandLineTools/SDKs/MacOSX1[5-9]*.sdk"), reverse=True)
+    for sdk in sdks:
+        cmd = ["xcrun", "swiftc", "-O", "-swift-version", "5"] + (["-sdk", sdk] if sdk else []) + ["-framework", "AppKit", "-o", MENU_BIN, MENU_SRC]
+        r = run(cmd)
+        if r.returncode == 0 and os.path.exists(MENU_BIN):
+            if not quiet:
+                ok("menu built" + (f" (SDK {os.path.basename(sdk)})" if sdk else ""))
+            return MENU_BIN
+    if not quiet:
+        warn("could not build the menu (swiftc); Layover.app falls back to a plain list dialog")
+    return None
+
+
+def pick_in_menu(names, status):
+    """Show the backglass menu; returns the chosen name, None for cancel, or False if the menu is unavailable."""
+    binary = menu_binary()
+    if not binary:
+        return False
+    args = [binary]
+    for n in names:
+        args += ["--game", n]
+    for a in MENU_ACTIONS:
+        args += ["--action", a]
+    args += ["--status", status]
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=3600)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip().splitlines()[-1]
+    if r.returncode == 1:
+        return None
+    return False
 
 
 def osa(script):
@@ -1767,6 +1927,7 @@ osascript -e 'display dialog "Layover needs python3 (install the Xcode Command L
     os.chmod(launcher, 0o755)
     if os.path.exists(APP_SRC_ICON):
         shutil.copy2(APP_SRC_ICON, os.path.join(res, "Layover.icns"))
+    menu_binary(quiet=False)
     run(["touch", APP_DIR])   # make Finder notice the icon
     ok(f"{APP_DIR} built (double-click it, or Spotlight → Layover)")
     info("it lists your installed Windows games and launches the one you pick; Steam starts on its own if needed")
@@ -1788,12 +1949,17 @@ def cmd_app_launch(args):
         games = [g for g in all_games() if g["where"] == "windows"]
         games.sort(key=lambda g: g["name"].lower())
         names = [g["name"] for g in games if g["ready"]]
-        items = names + ["Open Steam", "Quit Steam"]
-        lst = ", ".join('"' + n.replace('"', "'") + '"' for n in items)
-        default = '"' + (names[0].replace('"', "'") if names else "Open Steam") + '"'
-        pick = osa(f'choose from list {{{lst}}} with title "Layover" with prompt "What do you want to play?" default items {{{default}}} OK button name "Launch"')
-        if not pick or pick == "false":
+        status = f"STEAM {'ON' if steam_running() else 'OFF'} · {'FLIGHT MODE' if wants_offline() else 'ONLINE MODE'} · {len(names)} GAME{'S' if len(names) != 1 else ''} READY"
+        pick = pick_in_menu(names, status)
+        if pick is None:
             return
+        if pick is False:   # no menu binary: the plain dialog
+            items = names + MENU_ACTIONS
+            lst = ", ".join('"' + n.replace('"', "'") + '"' for n in items)
+            default = '"' + (names[0].replace('"', "'") if names else "Open Steam") + '"'
+            pick = osa(f'choose from list {{{lst}}} with title "Layover" with prompt "What do you want to play?" default items {{{default}}} OK button name "Launch"')
+            if not pick or pick == "false":
+                return
         if pick == "Open Steam":
             cmd_steam(argparse.Namespace(offline=False, online=False, extra=[]))
             notify("Layover", "Steam is starting")
@@ -1801,6 +1967,28 @@ def cmd_app_launch(args):
         if pick == "Quit Steam":
             cmd_kill(argparse.Namespace())
             notify("Layover", "Steam closed")
+            return
+        if pick in ("Flight mode", "Back online"):
+            offline = pick.startswith("Flight")
+            if steam_running() or native_steam_running():
+                if steam_running():
+                    wineserver_kill(cfg)
+                if native_steam_running():
+                    subprocess.run(["osascript", "-e", 'tell application "Steam" to quit'], capture_output=True)
+                for _ in range(30):
+                    if not steam_running() and not native_steam_running():
+                        break
+                    time.sleep(1)
+            for where in ("windows", "mac"):
+                set_offline_mode(where, offline)
+            if offline:
+                missing = [g["name"] for g in games if not g["ready"]]
+                msg = "Steam will start in OFFLINE mode (no internet needed). Open Layover again and pick a game to play."
+                if missing:
+                    msg += " Not ready for offline play (launch once while online): " + ", ".join(missing)
+                osa(f'display dialog "{msg}" buttons {{"OK"}} default button 1 with title "Layover"')
+            else:
+                osa('display dialog "Steam will start in online mode again (cloud saves sync at the next launch)." buttons {"OK"} default button 1 with title "Layover"')
             return
         g = next((g for g in games if g["name"].replace('"', "'") == pick), None)
         if not g:
@@ -1900,6 +2088,12 @@ def main(argv=None):
     s.add_argument("game", nargs="?", help="game name/AppID, or 'default'")
     s.add_argument("renderer", nargs="?", choices=RENDERER_CHOICES)
     s.set_defaults(fn=lambda a: cmd_renderer(a) if (a.game is None or a.renderer) else die("usage: layover renderer <game|default> <dxmt|wined3d|d3dmetal>"))
+
+    s = sub.add_parser("game", help="show or change one game's overrides (renderer, fps_cap, retina, metalfx, metal_hud, msync, steam_overlay, env)")
+    s.add_argument("game", help="game name/AppID")
+    s.add_argument("key", nargs="?")
+    s.add_argument("value", nargs="?", help="'default' removes the override; env takes KEY=VALUE pairs (KEY= removes)")
+    s.set_defaults(fn=lambda a: cmd_game(a) if (a.key is None or a.value is not None) else die("usage: layover game <game> [<key> <value>]"))
 
     s = sub.add_parser("config", help="show or change a setting (msync, metal_hud, advertise_avx, retina, steam_overlay, fps_cap, steam_args, d3dmetal_identity)")
     s.add_argument("key", nargs="?")

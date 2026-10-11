@@ -1,27 +1,74 @@
-# Handoff notes (2026-10-11; sixth session plus the Fallout 4 start)
+# Handoff notes (2026-10-11; sixth session plus Fallout 4 set-up and smoothing)
 
 Read this first if you are a new agent (or future me) picking up Layover.
 
-## Fallout 4 (AppID 377160, installed 2026-10-10, 27 GB; status 2026-10-11 afternoon, OPEN)
+## Fallout 4 (AppID 377160, installed 2026-10-10, 27 GB; status 2026-10-11 evening: smoothed, awaiting the user's verdict)
 
-DirectX 11 -> Layover picks DXMT. First launch (2026-10-10 19:57) was from Steam's own window while
-Steam was in D3DMetal mode, so it ran D3D11 through D3DMetal: fullscreen 3456x2234 looked right (the
-window started minimized at -32000,-32000 and came back when focused), ~70 % CPU, but no frame cap on
-that path (the shim is a d3d12.dll and never loads in a D3D11 game; the DXMT cap is DXMT_CONFIG). The
-Creation Engine ties physics to fps, so >60 fps on the 120 Hz panel is a quality problem.
-Second launch via Layover.app (2026-10-11 15:14, Steam restarted in dxmt mode): the user saw the game in
-a QUARTER of the screen. DXMT's log (steam-2026-10-11_15-14-25.log): "Setting display mode:
-3456x2234@59/60", i.e. exclusive fullscreen did a display-mode switch under Wine RetinaMode=y, which is
-where the quarter picture comes from. Prefs are in the prefix's Documents/My Games/Fallout4/
-Fallout4Prefs.ini (bFull Screen=1, bBorderless=1, iSize 3456x2234, sD3DDevice="NVIDIA GeForce 6800" =
-the launcher detects the GPU through wined3d's d3d9, harmless). Change made, NOT yet tested by the user:
-bFull Screen=0 (borderless windowed at 3456x2234; backup Fallout4Prefs.ini.bak-fullscreen). If that does
-not fill the screen: either run it through D3DMetal (launch from Steam's window) and add a D3D11 frame
-cap to the shim (a dxgi/d3d11 front DLL, same limiter code), or turn retina off for this game.
-DXMT config keys available (strings of winemetal.so): d3d11.preferredMaxFrameRate (used for fps_cap),
-d3d11.metalSpatialUpscaleFactor, d3d11.maxFeatureLevel, dxgi.customVendorId/DeviceId/DeviceDesc,
-dxgi.forceSDR, dxgi.handleAltTab; nothing retina-specific. Fallout 76 was discussed (no kernel
-anti-cheat, Proton Gold, D3D11, online-only) but is not installed.
+DirectX 11 -> Layover picks DXMT. History: first launch (2026-10-10 19:57) from Steam's own window in
+D3DMetal mode looked right but had no frame cap (the d3d12 shim never loads in a D3D11 game). Launched
+through Layover (DXMT, 2026-10-11 15:14) exclusive fullscreen at 3456x2234 under RetinaMode=y did a
+display-mode switch ("Setting display mode: 3456x2234@60") = picture in a quarter of the screen;
+bFull Screen=0 (borderless) fixed that, and the user then played 15:18-15:42 (Vault 111 -> Commonwealth)
+and reported "laggy and glitchy". Cause: the game's launcher had picked the Ultra preset at the full
+3456x2234 panel (god rays Ultra, 4096 shadow maps, 20000 shadow distance) - too much GPU work through
+translation; Fallout Silicon (Nexus 107246) also names god rays as the source of volumetric flicker on
+Apple Silicon. DXMT's shader cache is fine (DARWIN_USER_CACHE_DIR/dxmt/Fallout4.exe, shaders_320.db
+8.8 MB after one session; the "Failed to set Metal cache path" line is harmless).
+
+**Fix (2026-10-11 ~16:00), three parts:**
+1. `layover game 377160 retina off` + `layover game 377160 metalfx 2` (new per-game overrides, config
+   games.377160). DXMT's MetalFX spatial swapchain (DXMT_METALFX_SPATIAL_SWAPCHAIN=1 +
+   d3d11.metalSpatialUpscaleFactor=2 in DXMT_CONFIG) keeps the game's backbuffer at the requested size
+   and makes the Metal layer 2x bigger (d3d11_swapchain.cpp: layer = desc.Width*scale_factor), so with
+   RetinaMode=n a 1728x1117 window = the whole 1728x1117 Wine desktop = 3456x2234 panel pixels, filled
+   by a MetalFX image from a 1728x1117 render (1/4 of the pixel work). Keeping retina on would make the
+   layer 6912x4468 or leave the window in a quarter of the screen, so retina off is required here.
+2. Fallout4Prefs.ini (backup Fallout4Prefs.ini.bak-ultra-3456 = the Ultra/3456 state; .bak-fullscreen =
+   the original fullscreen state): iSize 1728x1117, bFull Screen=0, bBorderless=1, bVolumetricLightingEnable=0
+   (iVolumetricLightingQuality=1 if re-enabled), fShadowDistance/fDirShadowDistance 14000 (High),
+   iShadowMapResolution 2048 (High). Everything else still Ultra (TAA, SSR, LOD, decals). iPresentInterval=1
+   + DXMT cap 60 (Creation Engine physics need <= 60).
+3. Launcher: `launch_fingerprint()` (renderer, effective retina, DXMT env) is stored in running.json and
+   `layover play` restarts Steam when a game's fingerprint differs (before, a per-game fps_cap or env was
+   silently not applied when Steam was already up for another game). Switching SM2 <-> FO4 therefore
+   restarts Steam (retina on/off) - about 20 s.
+
+**Verified unattended (15:53-15:58):** window class 'Fallout4' at 0,0-1728,1117 (full desktop, no
+display-mode switch), `sample` of the game shows winemetal.so -> MetalFX
+`-[_MFXSpatialScalingEffect encodeToCommandBuffer:]` on the present path, no DXMT warning ("MetalFX spatial
+scaler is not supported" would be logged otherwise), game CPU 17-19 % at the intro/menu, 2.8 GB RSS.
+NOT verified (no screenshots possible): sharpness of the MetalFX output and the actual fps in the
+Commonwealth. If the user finds it soft: with retina off the panel is 2x the Wine desktop, so factor 2
+at 1728x1117 is the only setting that maps 1:1; a sharper picture means more render work (god rays back to
+Low via the launcher's Options is the cheaper visual win). If still laggy: the launcher's Options -> High
+preset (keep the resolution), then Medium shadows.
+
+**Fallout 4's launcher (Fallout4Launcher.exe, dialog class #32770, 835x400, image buttons = Static
+controls):** needs a mouse click on PLAY; Enter via sendkey only took effect after ~90 s (unclear why).
+With a controller only (plane) that is a problem; options: Steam launch option to start Fallout4.exe
+directly, or a Layover per-game "post-launch click" using tools/dev clickwin (scratch, not in repo yet).
+Steam's DLC assertion "BGetDLCDataByIndex: unexpected appID 377160" in the log is harmless noise.
+
+Layover.app's menu (2026-10-11 16:15) gained "Flight mode (Steam offline)" and "Back online" (same as
+`layover flight --go` without launching Steam, and `--online`), so a trip needs no Terminal.
+
+**Layover.app menu (2026-10-11 17:30):** `app/menu.swift`, an AppKit window styled as a pinball backglass
+(128x32 dot-matrix "LAYOVER" + scrolling status line, pop-bumper numbers, insert-light game buttons with a
+pulsing glow, rollover-style action buttons, flippers). `menu_binary()` compiles it into
+~/Applications/Layover.app/Contents/MacOS/LayoverMenu when missing or older than the source (the CLT's
+default SDK 26.2 is newer than swiftc 6.1.2 here, so it falls back to the MacOSX15*.sdk folders);
+`pick_in_menu()` runs it (--game/--action/--status args, chosen name on stdout, rc 1 = cancel) and
+cmd_app_launch falls back to the old `choose from list` dialog if the binary is unavailable.
+`LayoverMenu --snapshot out.png` renders the window to a PNG without showing it: the only way to see it
+from an agent session (no Screen Recording permission). Not yet confirmed by the user on screen.
+
+DXMT config keys available (strings of d3d11.dll): d3d11.preferredMaxFrameRate, d3d11.metalSpatialUpscaleFactor,
+d3d11.maxFeatureLevel, d3d11.maxTessFactor, d3d11.ignoreMapFlagNoWait, d3d11.sampleNaNToZero, d3d11.defuseFma,
+dxgi.customVendorId/DeviceId/DeviceDesc, dxgi.forceSDR, dxgi.handleAltTab, dxmt.shaderMetalVersion; env
+DXMT_CONFIG (highest priority), DXMT_CONFIG_FILE / dxmt.conf (cwd-relative, [Exe.exe] sections),
+DXMT_LOG_LEVEL, DXMT_LOG_PATH, DXMT_SHADER_CACHE=0 (off), DXMT_SHADER_CACHE_PATH, DXMT_METALFX_SPATIAL_SWAPCHAIN,
+DXMT_USE_DEFAULT_METAL_CACHE. Fallout 76 was discussed (no kernel anti-cheat, Proton Gold, D3D11,
+online-only) but is not installed.
 
 ## Sixth session (2026-10-10): efficiency and "button it up" pass
 

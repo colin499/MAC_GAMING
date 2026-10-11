@@ -28,9 +28,13 @@ cd ~/Documents/BRAIN_FOOD/MAC_GAMING
 ```
 
 **No Terminal needed after setup:** `./layover app` (setup does this too) puts **Layover.app** in
-`~/Applications`. Double-click it, or Cmd-Space → "Layover": a dialog lists your installed Windows
-games; pick one and it launches, starting Steam first if needed. Drag it to the Dock to keep it there.
-`Layover.command` still opens the text menu in Terminal.
+`~/Applications`. Double-click it, or Cmd-Space → "Layover": a pinball-backglass menu (app/menu.swift,
+compiled into the app by `layover app`) lists your installed Windows games on lit inserts, with Open
+Steam / Quit Steam / Flight mode / Back online as rollover buttons and a dot-matrix display showing
+Steam's state. Click, or use arrows + Enter, or the number keys. Pick a game and it launches, starting
+Steam first if needed. Drag the app to the Dock to keep it there. If the menu cannot be built (no
+Swift compiler) the app falls back to a plain list dialog. `Layover.command` still opens the text menu
+in Terminal.
 
 Sign in to Steam, install games as usual (they download into the Wine prefix),
 then:
@@ -56,6 +60,11 @@ online (that caches the license, config and shaders). So, while you still have W
 `flight --go` closes Steam if it is open, flips the saved *WantsOfflineMode* flag for
 both Windows Steam and native Mac Steam, and starts Windows Steam offline.
 After landing: `./layover flight --online` (or Steam menu → Go Online).
+
+Without a Terminal: Layover.app's menu has **Flight mode** and **Back online**. Pick
+Flight mode while you still have Wi-Fi (it closes Steam and flips the offline flag), then pick the game
+as usual at the gate or in the air. If you forget, Windows Steam shows "Couldn't connect" with a *Start
+in Offline Mode* button when it starts; that works too as long as the login is remembered.
 
 ## Xbox controller
 
@@ -130,6 +139,17 @@ its display settings and use its upscaler (FSR/XeSS Balanced or Performance): th
 renders around 1728x1117 internally, as before, but the HUD, text and the final image are output
 at the panel's real resolution. Running a 2024 AAA game at 3456x2234 *without* an upscaler is too
 much for this GPU.
+
+**Per-game settings (`./layover game <game> <key> <value>`):** `renderer`, `fps_cap`, `retina`,
+`metalfx`, `metal_hud`, `msync`, `steam_overlay` and `env KEY=VALUE` override the global settings for
+one game; `./layover game <game>` shows them, `default` as the value removes one. `layover play`
+restarts Steam when the game needs settings Steam was not started with (renderer, retina, DXMT
+environment). **`metalfx` is the upscaler for DirectX 11 games that have none of their own:** DXMT
+renders at the resolution the game asks for and MetalFX spatial upscaling enlarges only the output by
+that factor. With `retina off` and `metalfx 2`, a game set to 1728x1117 borderless fills the panel
+with a 3456x2234 MetalFX image at a quarter of the GPU work. Fallout 4 is set up this way (its own
+prefs: 1728x1117 borderless, god rays off, High shadows; the launcher's Ultra preset at 3456x2234
+played laggy and glitchy, 2026-10-11).
 
 **Steam overlay (`steam_overlay`, on):** leave it on. Steam Input needs the overlay DLL inside the
 game to know the game is in front; with it blocked, Steam hands the controller to its desktop
