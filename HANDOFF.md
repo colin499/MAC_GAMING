@@ -2,6 +2,25 @@
 
 Read this first if you are a new agent (or future me) picking up Layover.
 
+## Spider-Man 2 gray city blocks (2026-10-17, fix built, NOT yet verified by the user)
+
+Symptom (user screenshot): from a rooftop, some mid-distance city blocks are flat light-gray ground with only
+small props on them; they fill in up close, and a higher in-game Level of Detail shrinks them a bit.
+Survey run (LAYOVER_SKIN_LOG=2 via `layover game 2651280 env`, log d3d12-2026-10-17_12-21-54.log, 13,201
+model arrivals): static models whose Model Built flags carry bit 33 (0x200000000; typically flags
+0000000200941800, ~1 MB each) are the only group that sits above 1 GB almost entirely (94 of 96, 79 MB
+of arrivals). Theory: they are the mid-distance block models and, like skinned models and impostors, are
+read through the 4-byte typed views that Metal caps at 1 GB. Fix: sm2_skin.c moves static models with
+LAYOVER_LOW_FLAGS bits (default 0x200000000; 0 = off) into the shared low heap at data arrival, the same
+relocation as skinned models, but only while the heap keeps LAYOVER_LOW_RESERVE_MB (160) free. The stats
+line now starts with `static-low: moved N (MB) left-high N`.
+Next steps by outcome: blocks gone -> done. Fewer but some remain -> add the next candidate bits
+(0x40000: 146 MB of arrivals above 1 GB, 0x20000: 100 MB, 0x800: 94 MB; watch the reserve). No change ->
+revert to LAYOVER_LOW_FLAGS=0 and look at the shaders that draw those blocks instead.
+Also: write_shim_env now lets per-game env values replace the defaults (before, the first line won, so a
+per-game LAYOVER_SKIN_LOG was ignored), and the survey is no longer capped at 6000 arrivals
+(LAYOVER_SURVEY_MAX, default 40000) and logs each record's DXGI format.
+
 ## Fallout 4 (AppID 377160, installed 2026-10-10, 27 GB; status 2026-10-11 evening: smoothed, awaiting the user's verdict)
 
 DirectX 11 -> Layover picks DXMT. History: first launch (2026-10-10 19:57) from Steam's own window in

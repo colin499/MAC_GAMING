@@ -117,7 +117,9 @@ typedef const UINT8 *(*PFN_FindSection)(const void *dat1, UINT tag);
 static PFN_Allocate g_alloc; static PFN_CreateSubHeap g_create_subheap; static PFN_FreeDeferred g_free_deferred; static PFN_FindSection g_find_section;
 static UINT8 *g_mgr;
 static void *skin_heap; static UINT64 skin_heap_lo, skin_heap_hi;   // our subheap and its pool-offset range
-static UINT skin_mb = 876; static UINT impostor_mb = 16; static UINT reserve_mb = 48; static int plug_on = 0; static int skin_log;
+static UINT skin_mb = 876; static UINT impostor_mb = 16; static UINT reserve_mb = 48; static int plug_on = 0; static int skin_log; static LONG survey_max = 40000;
+static UINT64 low_flags = 0x200000000ull; static UINT low_reserve_mb = 160;   // static models steered low as well (see on_model_arrived)
+static volatile LONG st_static_moved, st_static_full; static volatile LONG64 st_static_bytes;
 static volatile LONG imp_redirected, imp_overflow;
 static void *plug;   // temporary block filling [skin heap end, 1 GB) while the game creates its impostor subheap, so that heap lands above 1 GB
 static void *imp_heap; static UINT64 imp_lo, imp_hi, imp_req; static volatile LONG64 imp_live, imp_peak, skin_peak; static volatile LONG imp_allocs;
@@ -179,17 +181,36 @@ static void on_model_arrived(Regs *r)
     if (!sec || !shim_readable(sec, 12)) return;
     { UINT32 so = *(const UINT32 *)(sec + 4); if (!shim_readable(cpu + so, 8)) return; flags = *(const UINT64 *)(cpu + so);
       if (dbg) SNOTE("arrival %ld: Model Built at +%u size %u flags %016llx", nth, so, *(const UINT32 *)(sec + 8), (unsigned long long)flags); }
-    if (skin_log >= 2 && nth <= 6000) {   // survey mode: name, flags, size, section tags
+    if (skin_log >= 2 && nth <= survey_max) {   // survey mode: name, flags, size, section tags
         char tags[400] = "", path[200] = ""; int k, n = *(UINT16 *)(cpu + 0xc); size_t o = 0; const UINT8 *m = (const UINT8 *)r->rdx;
         for (k = 0; k < n && o < sizeof tags - 12; k++) o += snprintf(tags + o, sizeof tags - o, "%08x,", *(const UINT32 *)(cpu + 0x10 + 12 * k));
         if (m && shim_readable(m, 0x18)) { const char *q = *(const char **)(m + 0x10); if (q && shim_readable(q, 200)) { for (k = 0; k < 199 && q[k] >= 0x20 && q[k] < 0x7f; k++) path[k] = q[k]; path[k] = 0; } }
-        SNOTE("survey flags=%016llx hdr=%08x%08x%08x%08x%08x%08x size=%u off=%u tags=%s name=%s", (unsigned long long)flags,
+        SNOTE("survey flags=%016llx hdr=%08x%08x%08x%08x%08x%08x size=%u off=%u fmt=%u tags=%s name=%s", (unsigned long long)flags,
               *(const UINT32 *)(cpu + *(const UINT32 *)(sec + 4) + 8), *(const UINT32 *)(cpu + *(const UINT32 *)(sec + 4) + 12), *(const UINT32 *)(cpu + *(const UINT32 *)(sec + 4) + 16), *(const UINT32 *)(cpu + *(const UINT32 *)(sec + 4) + 20), *(const UINT32 *)(cpu + *(const UINT32 *)(sec + 4) + 24), *(const UINT32 *)(cpu + *(const UINT32 *)(sec + 4) + 28),
-              *(UINT32 *)(rec + REC_SIZE), *(UINT32 *)(rec + REC_OFF), tags, path);
+              *(UINT32 *)(rec + REC_SIZE), *(UINT32 *)(rec + REC_OFF), *(UINT32 *)(rec + REC_FMT), tags, path);
     }
-    if (!g_find_section(cpu, TAG_MODEL_SKIN)) return;   // not skinned (the Model Built flags do not say it at this point)
+    // Besides skinned models, static models whose Model Built flags carry LAYOVER_LOW_FLAGS bits are moved low
+    // too: bit 33 marks ~1 MB models that load for mid-distance city blocks; above 1 GB they draw nothing and the
+    // block shows as flat gray ground (2026-10-17 survey: 94 of 96 sat above 1 GB). They only get space while the
+    // shared heap keeps LAYOVER_LOW_RESERVE_MB free for skinned models and impostors, which must never be refused.
+    { int skinned = g_find_section(cpu, TAG_MODEL_SKIN) != NULL;
+      if (!skinned && !(flags & low_flags)) return;
+      off = *(UINT32 *)(rec + REC_OFF); size = *(UINT32 *)(rec + REC_SIZE); mirror = *(UINT64 *)(g_mgr + MGR_MIRROR_BASE);
+      if (!skinned) {
+          if (off + size <= LIMIT_1G || !skin_heap) return;
+          if (skin_live_exact() + size + ((UINT64)low_reserve_mb << 20) > ((UINT64)skin_mb << 20)) { LONG k = InterlockedIncrement(&st_static_full); if (k <= 10) SNOTE("static model (flags %016llx, %llu KB) left above 1 GB: shared heap near full", (unsigned long long)flags, (unsigned long long)(size >> 10)); return; }
+          nrec = g_alloc(g_mgr, skin_heap, *(UINT32 *)(rec + REC_FMT), (UINT)size, NULL, "LayoverLowModel", 2, 0);
+          if (!nrec) { InterlockedIncrement(&st_static_full); return; }
+          noff = *(UINT32 *)(nrec + REC_OFF);
+          memcpy((UINT8 *)mirror + noff, (UINT8 *)mirror + off, (size_t)size);
+          *(UINT8 **)(slot + SLOT_REC) = nrec;
+          *(UINT64 *)(res + 0x18) = mirror + noff;
+          old = rec; g_free_deferred(g_mgr, NULL, &old);
+          { LONG k = InterlockedIncrement(&st_static_moved); InterlockedExchangeAdd64(&st_static_bytes, (LONG64)size); InterlockedExchangeAdd64(&st_live, (LONG64)size);
+            if (skin_log && k <= 20) SNOTE("static model (flags %016llx): %llu KB moved %llu MB -> %llu MB", (unsigned long long)flags, (unsigned long long)(size >> 10), (unsigned long long)(off >> 20), (unsigned long long)(noff >> 20)); }
+          return;
+      } }
     InterlockedIncrement(&st_skinned);
-    off = *(UINT32 *)(rec + REC_OFF); size = *(UINT32 *)(rec + REC_SIZE); mirror = *(UINT64 *)(g_mgr + MGR_MIRROR_BASE);
     { const UINT8 *m = (const UINT8 *)r->rdx; if (skin_log && m && shim_readable(m, 0x18)) { const char *p = *(const char **)(m + 0x10); if (p && shim_readable(p, 64)) { int k; for (k = 0; k < 63 && p[k] >= 0x20 && p[k] < 0x7f; k++) nm[k] = p[k]; nm[k] = 0; } } }
     if (off + size <= LIMIT_1G) { InterlockedIncrement(&st_already_low); if (skin_log) SNOTE("skinned model %s: %llu KB at %llu MB already below 1 GB", nm, (unsigned long long)(size >> 10), (unsigned long long)(off >> 20)); return; }
     if (!skin_heap) { EnterCriticalSection(&skin_lock); create_skin_heap("first skinned model"); LeaveCriticalSection(&skin_lock); }
@@ -282,7 +303,7 @@ void sm2_skin_stats(char *out, size_t cap)
 {
     if (!g_mgr) { out[0] = 0; return; }
     { char rg[300]; region_usage(rg, sizeof rg); shim_note("%s", rg); }
-    snprintf(out, cap, "skin: models %ld skinned %ld moved %ld (live %lld MB, peak %lld, heap %u MB) freed %ld low-already %ld failed %ld skin-hw %lld heap-failed-bytes %llu alloc-internal: bytes %lld MB blocks %d freedesc %d | impostor: redirected %ld overflow %ld, own heap hw %lld MB of %llu failed-bytes %llu", st_models, st_skinned, st_moved, (long long)(st_live >> 20), (long long)(skin_peak >> 20), skin_mb, st_freed, st_already_low, st_fail, (long long)(skin_hw >> 20), (unsigned long long)(skin_heap ? *(UINT64 *)((UINT8 *)skin_heap + 0x4e0) : 0), (long long)(skin_heap ? *(INT64 *)((UINT8 *)skin_heap + 0xd0) >> 20 : 0), skin_heap ? *(int *)((UINT8 *)skin_heap + 0x114) : 0, skin_heap ? *(int *)((UINT8 *)skin_heap + 0x110) : 0, imp_redirected, imp_overflow, (long long)(imp_hw >> 20), (unsigned long long)(imp_req >> 20), (unsigned long long)(imp_heap ? *(UINT64 *)((UINT8 *)imp_heap + 0x4e0) : 0));
+    snprintf(out, cap, "static-low: moved %ld (%lld MB) left-high %ld | skin: models %ld skinned %ld moved %ld (live %lld MB, peak %lld, heap %u MB) freed %ld low-already %ld failed %ld skin-hw %lld heap-failed-bytes %llu alloc-internal: bytes %lld MB blocks %d freedesc %d | impostor: redirected %ld overflow %ld, own heap hw %lld MB of %llu failed-bytes %llu", st_static_moved, (long long)(st_static_bytes >> 20), st_static_full, st_models, st_skinned, st_moved, (long long)(st_live >> 20), (long long)(skin_peak >> 20), skin_mb, st_freed, st_already_low, st_fail, (long long)(skin_hw >> 20), (unsigned long long)(skin_heap ? *(UINT64 *)((UINT8 *)skin_heap + 0x4e0) : 0), (long long)(skin_heap ? *(INT64 *)((UINT8 *)skin_heap + 0xd0) >> 20 : 0), skin_heap ? *(int *)((UINT8 *)skin_heap + 0x114) : 0, skin_heap ? *(int *)((UINT8 *)skin_heap + 0x110) : 0, imp_redirected, imp_overflow, (long long)(imp_hw >> 20), (unsigned long long)(imp_req >> 20), (unsigned long long)(imp_heap ? *(UINT64 *)((UINT8 *)imp_heap + 0x4e0) : 0));
 }
 
 // Spider-Man2.exe v2.810.0.0 as shipped on Steam in October 2026: PE link timestamp and SizeOfImage.
@@ -316,6 +337,9 @@ void sm2_skin_install(void)
     if (GetEnvironmentVariableA("LAYOVER_PLUG", v, sizeof v)) plug_on = atoi(v) != 0;
     if (GetEnvironmentVariableA("LAYOVER_SKIN_RESERVE_MB", v, sizeof v)) reserve_mb = (UINT)atoi(v);
     skin_log = GetEnvironmentVariableA("LAYOVER_SKIN_LOG", v, sizeof v) >= 1 ? atoi(v) : 0;
+    if (GetEnvironmentVariableA("LAYOVER_SURVEY_MAX", v, sizeof v)) survey_max = atol(v);
+    if (GetEnvironmentVariableA("LAYOVER_LOW_FLAGS", v, sizeof v)) low_flags = _strtoui64(v, NULL, 0);   // 0 = only skinned models
+    if (GetEnvironmentVariableA("LAYOVER_LOW_RESERVE_MB", v, sizeof v)) low_reserve_mb = (UINT)atoi(v);   // LAYOVER_SKIN_LOG=2: how many model arrivals to log
     InitializeCriticalSection(&skin_lock);
     exe_base = (UINT8 *)GetModuleHandleA(NULL);
     g_mgr = exe_base + RVA_MGR;
@@ -325,5 +349,5 @@ void sm2_skin_install(void)
     install_hook(RVA_CREATE_SUBHEAP, e_movrbx, 5, on_create_subheap, "CreateSubHeap");
     install_hook(RVA_FREE, e_movrbx, 5, on_free, "FreeBuffer");
     { static const UINT8 e_alloc[] = { 0x44, 0x89, 0x4C, 0x24, 0x20 }; install_hook(RVA_ALLOCATE, e_alloc, 5, on_alloc, "AllocateBuffer"); }
-    SNOTE("skinned-model steering on: skin heap %u MB (LAYOVER_SKIN_MB), impostor heap cap %u MB (LAYOVER_IMPOSTOR_MB, 0 = none), plug %d (LAYOVER_PLUG), per-model log %d (LAYOVER_SKIN_LOG)", skin_mb, impostor_mb, plug_on, skin_log);
+    SNOTE("skinned-model steering on: skin heap %u MB (LAYOVER_SKIN_MB), impostor heap cap %u MB (LAYOVER_IMPOSTOR_MB, 0 = none), plug %d (LAYOVER_PLUG), per-model log %d (LAYOVER_SKIN_LOG), static models low: flags %#llx reserve %u MB (LAYOVER_LOW_FLAGS, LAYOVER_LOW_RESERVE_MB)", skin_mb, impostor_mb, plug_on, skin_log, (unsigned long long)low_flags, low_reserve_mb);
 }

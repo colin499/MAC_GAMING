@@ -604,11 +604,12 @@ def write_shim_env(cfg, game=None):
     if not os.path.isdir(os.path.dirname(SHIM_ENV_PATH)):
         return None
     log = new_log("d3d12")
-    lines = ["LAYOVER_D3D12_LOG=Z:" + log.replace("/", "\\"), "LAYOVER_SKIN_LOG=1", f"LAYOVER_MAX_FPS={game_fps_cap(cfg, game)}"]
+    env = {"LAYOVER_D3D12_LOG": "Z:" + log.replace("/", "\\"), "LAYOVER_SKIN_LOG": "1", "LAYOVER_MAX_FPS": str(game_fps_cap(cfg, game))}
     g = cfg["games"].get(str(game), {}) if game else {}
-    for k, v in (g.get("env") or {}).items():
+    for k, v in (g.get("env") or {}).items():   # per-game values replace the defaults (the shim keeps the first value it reads)
         if k.startswith(("LAYOVER_", "D3DM_", "HB_")):
-            lines.append(f"{k}={v}")
+            env[k] = str(v)
+    lines = [f"{k}={v}" for k, v in env.items()]
     try:
         with open(SHIM_ENV_PATH, "w") as f:
             f.write("\n".join(lines) + "\n")
