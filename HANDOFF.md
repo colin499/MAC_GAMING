@@ -2,7 +2,18 @@
 
 Read this first if you are a new agent (or future me) picking up Layover.
 
-## Spider-Man 2 gray city blocks (2026-10-17, fix built, NOT yet verified by the user)
+## Spider-Man 2 gray city blocks (2026-10-17, OPEN: first theory ruled out)
+
+RESULT: with LAYOVER_LOW_FLAGS=0x200000000 all 94 such models were moved below 1 GB (log
+d3d12-2026-10-17_12-33-38.log: `static-low: moved 94 (79 MB) left-high 0`) and the user saw no change, so the
+default is back to 0 (knob kept). Next lead: macprotips/SpiderMan2Fix (public domain) shows D3DMetal also
+LOSES WRITES past element 2^28 and fixes it by rewriting the shaders' typed buffer access to raw
+(dxc -dumpbin -> sf_typed_to_raw -> dxa -> dxv, swapped in by hash in their d3d12.dll). Their four shaders
+cover skinning, vertex morph and the symbiote; the gray blocks may be another shader with typed access to
+the pool (likely GPU-written or GPU-culled block geometry). 2061 DXBC containers extract from
+Spider-Man2.exe; scanning them needs dxc (not installed here; running their bundled copy was not allowed).
+
+Original notes:
 
 Symptom (user screenshot): from a rooftop, some mid-distance city blocks are flat light-gray ground with only
 small props on them; they fill in up close, and a higher in-game Level of Detail shrinks them a bit.
