@@ -118,7 +118,7 @@ static PFN_Allocate g_alloc; static PFN_CreateSubHeap g_create_subheap; static P
 static UINT8 *g_mgr;
 static void *skin_heap; static UINT64 skin_heap_lo, skin_heap_hi;   // our subheap and its pool-offset range
 static UINT skin_mb = 876; static UINT impostor_mb = 16; static UINT reserve_mb = 48; static int plug_on = 0; static int skin_log; static LONG survey_max = 40000;
-static UINT64 low_flags = 0;   // 0x200000000 was tried for the gray city blocks (2026-10-17): moved, no visible change static UINT low_reserve_mb = 160;   // static models steered low as well (see on_model_arrived)
+static UINT64 low_flags = 0; static UINT low_reserve_mb = 160;   // static models steered low as well (see on_model_arrived); 0x200000000 was tried for the gray city blocks (2026-10-17): moved, no visible change
 static volatile LONG st_static_moved, st_static_full; static volatile LONG64 st_static_bytes;
 static volatile LONG imp_redirected, imp_overflow;
 static void *plug;   // temporary block filling [skin heap end, 1 GB) while the game creates its impostor subheap, so that heap lands above 1 GB
