@@ -11,6 +11,9 @@
 //                           catches up, pegging a CPU core; after LAYOVER_FENCE_SPIN_US (300) of identical
 //                           answers the shim blocks on the fence's own completion event instead (mode 3).
 //                           Modes 1 (nap LAYOVER_FENCE_NAP_US) and 2 (measure only) exist for experiments.
+//   LAYOVER_STALL_FPS=<n>   stall detector (default 8): once the game has run 30 s above 20 fps, a 5 s window
+//                           below n fps logs one STALL line (fps, time per frame inside Present / ExecuteCommandLists /
+//                           fence waits, host memory and the game's working set) and RECOVERED when it is back.
 //   LAYOVER_TSSHIM=1        serve timestamp queries from the CPU clock (Highball's tsshim fix).
 //   LAYOVER_D3D12_LOG=<win path>  log what the game asks of D3D12 (feature queries, pools, views,
 //                           pipelines, command signatures, counters); LAYOVER_D3D12_VERBOSE=1 for all.
@@ -22,6 +25,7 @@
 #include <windows.h>
 #include <initguid.h>
 #include <d3d12.h>
+#include <psapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +34,7 @@
 static HMODULE real_dll;
 static HINSTANCE self;
 static int tsshim, verbose, logging;
+static long stall_fps10 = 80;   // LAYOVER_STALL_FPS (default 8): below this, after 30 s above 20 fps, log a STALL line
 static UINT64 qpc_freq;
 static FILE *log_file;
 static CRITICAL_SECTION log_lock;
@@ -100,11 +105,39 @@ static UINT64 res_width(ID3D12Resource *r) { D3D12_RESOURCE_DESC d; if (!r) retu
 static ID3D12Resource *pool_res; static UINT64 pool_width; static volatile LONG64 pool_hw; static volatile LONG pool_oob, pool_copies;
 static volatile LONG c_present, c_present_paced, c_fence_polls, c_fence_sleeps;
 static volatile LONG fence_hist[8]; static volatile LONG64 fence_episodes; static int fence_sleep = 3;   // fence wait hook (see below); 3 = event wait
+// frame timing per stats window (reset by stats_thread): ticks inside the real Present, inside
+// ExecuteCommandLists, the longest gap between two presents and the longest fence-wait episode
+static volatile LONG64 t_present_sum, t_present_max, t_execl_sum, t_execl_max, t_gap_max, t_fence_max, t_last_present;
 static volatile LONG c_dispatch, c_draw, c_drawidx, c_execind, c_execind_sig, c_execlists, c_copybuf, c_setpso, c_dispatchmesh, c_srv_buf, c_uav_buf, c_srv_tex, c_uav_tex, c_pso_gfx, c_pso_cs, c_pso_gen, c_pso_fail, c_res_buf, c_res_tex, c_map, c_barrier;
+static void stall_note(const char *what, long fps10)
+{
+    // memory picture at the moment of a stall: Wine maps these to the host's numbers (unified memory,
+    // so the GPU's resources count too). A stall with little free memory = paging; with plenty = look elsewhere.
+    MEMORYSTATUSEX ms; PROCESS_MEMORY_COUNTERS_EX pm; char mem[256] = "";
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) snprintf(mem, sizeof mem, " | host: load %lu%% avail %llu MB of %llu, commit avail %llu MB", (unsigned long)ms.dwMemoryLoad, (unsigned long long)(ms.ullAvailPhys >> 20), (unsigned long long)(ms.ullTotalPhys >> 20), (unsigned long long)(ms.ullAvailPageFile >> 20));
+    pm.cb = sizeof pm;
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof pm)) snprintf(mem + strlen(mem), sizeof mem - strlen(mem), " | game: working set %llu MB (peak %llu) private %llu MB", (unsigned long long)(pm.WorkingSetSize >> 20), (unsigned long long)(pm.PeakWorkingSetSize >> 20), (unsigned long long)(pm.PrivateUsage >> 20));
+    NOTE("%s: %ld.%ld fps%s", what, fps10 / 10, fps10 % 10, mem);
+}
 static DWORD WINAPI stats_thread(LPVOID arg)
 {
+    LONG last_present = 0, last_execl = 0; int good_windows = 0, stalled = 0;
     for (;;) {
+        LONG dp, de; LONG64 ps, pm, es, em, gm, fm; long fps10;
         Sleep(5000);
+        dp = c_present - last_present; last_present = c_present;
+        de = c_execlists - last_execl; last_execl = c_execlists;
+        ps = InterlockedExchange64(&t_present_sum, 0); pm = InterlockedExchange64(&t_present_max, 0);
+        es = InterlockedExchange64(&t_execl_sum, 0); em = InterlockedExchange64(&t_execl_max, 0);
+        gm = InterlockedExchange64(&t_gap_max, 0); fm = InterlockedExchange64(&t_fence_max, 0);
+        fps10 = dp * 2;   // frames per 5 s = tenths of fps
+        if (qpc_freq && (dp || de)) LOG("frame: %ld.%ld fps | present avg %.2f max %.1f ms | gap max %.1f ms | execlists %ld avg %.2f max %.1f ms | fence wait max %.1f ms",
+            fps10 / 10, fps10 % 10, dp ? ps * 1000.0 / qpc_freq / dp : 0.0, pm * 1000.0 / qpc_freq, gm * 1000.0 / qpc_freq, de, de ? es * 1000.0 / qpc_freq / de : 0.0, em * 1000.0 / qpc_freq, fm * 1000.0 / qpc_freq);
+        // stall detector: the game ran at 20+ fps for 30 s and now does under 8 fps (LAYOVER_STALL_FPS) ->
+        // one STALL line with the memory picture; a RECOVERED line when it is back above 20 fps.
+        if (fps10 >= 200) { if (good_windows < 6) good_windows++; if (stalled) { stall_note("RECOVERED", fps10); stalled = 0; } }
+        else if (fps10 < stall_fps10 && good_windows >= 6 && !stalled) { stalled = 1; stall_note("STALL", fps10); }
         if (pool_res) { char sk[300]; sm2_skin_stats(sk, sizeof sk); NOTE("pool: high-water %llu MB of %llu, copies %ld, past-end %ld | %s", (unsigned long long)(pool_hw >> 20), (unsigned long long)(pool_width >> 20), pool_copies, pool_oob, sk); }
         if (fence_sleep) LOG("fence waits: episodes=%lld hist(<50us %ld, <200us %ld, <1ms %ld, <4ms %ld, <16ms %ld, <64ms %ld, <256ms %ld, more %ld) polls=%ld slept=%ld", (long long)fence_episodes, fence_hist[0], fence_hist[1], fence_hist[2], fence_hist[3], fence_hist[4], fence_hist[5], fence_hist[6], fence_hist[7], c_fence_polls, c_fence_sleeps);
         LOG("stats: presents=%ld (paced %ld) fence-polls=%ld (slept %ld) execlists=%ld dispatch=%ld dispatchmesh=%ld draw=%ld drawidx=%ld execind=%ld copybuf=%ld setpso=%ld map=%ld barrier=%ld | views srv_buf=%ld uav_buf=%ld srv_tex=%ld uav_tex=%ld | pso gfx=%ld cs=%ld gen=%ld FAIL=%ld | res buf=%ld tex=%ld",
@@ -381,16 +414,25 @@ static void fps_pace(void)
 typedef HRESULT (STDMETHODCALLTYPE *PFN_Present)(IDXGISwapChain *, UINT, UINT);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_Present1)(IDXGISwapChain1 *, UINT, UINT, const DXGI_PRESENT_PARAMETERS *);
 static PFN_Present real_Present; static PFN_Present1 real_Present1;
+static void max64(volatile LONG64 *slot, LONG64 v) { LONG64 cur = *slot; while (v > cur) { LONG64 seen = InterlockedCompareExchange64(slot, v, cur); if (seen == cur) break; cur = seen; } }
+static void present_timing(UINT64 t0, UINT64 t1)
+{
+    LONG64 prev = InterlockedExchange64(&t_last_present, (LONG64)t1);
+    InterlockedAdd64(&t_present_sum, (LONG64)(t1 - t0)); max64(&t_present_max, (LONG64)(t1 - t0));
+    if (prev) max64(&t_gap_max, (LONG64)t1 - prev);
+}
 static HRESULT STDMETHODCALLTYPE hook_Present(IDXGISwapChain *sc, UINT sync, UINT flags)
 {
+    UINT64 t0 = now_ticks();
     HRESULT hr = real_Present(sc, sync, flags);
-    if (!(flags & DXGI_PRESENT_TEST)) { InterlockedIncrement(&c_present); fps_pace(); }
+    if (!(flags & DXGI_PRESENT_TEST)) { present_timing(t0, now_ticks()); InterlockedIncrement(&c_present); fps_pace(); }
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE hook_Present1(IDXGISwapChain1 *sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *pp)
 {
+    UINT64 t0 = now_ticks();
     HRESULT hr = real_Present1(sc, sync, flags, pp);
-    if (!(flags & DXGI_PRESENT_TEST)) { InterlockedIncrement(&c_present); fps_pace(); }
+    if (!(flags & DXGI_PRESENT_TEST)) { present_timing(t0, now_ticks()); InterlockedIncrement(&c_present); fps_pace(); }
     return hr;
 }
 static int swapchain_patched;
@@ -708,6 +750,7 @@ done:
     if (s->same) {   // an episode of identical answers ended: histogram its length
         UINT64 us; QueryPerformanceCounter(&c); us = ((UINT64)c.QuadPart - s->t0) * 1000000 / qpc_freq;
         InterlockedIncrement(&fence_hist[us < 50 ? 0 : us < 200 ? 1 : us < 1000 ? 2 : us < 4000 ? 3 : us < 16000 ? 4 : us < 64000 ? 5 : us < 256000 ? 6 : 7]);
+        max64(&t_fence_max, (LONG64)((UINT64)c.QuadPart - s->t0));
         InterlockedIncrement64(&fence_episodes);
     }
     s->fence = f; s->value = v; s->same = 0; s->slept = 0;
@@ -787,7 +830,12 @@ static void STDMETHODCALLTYPE hook_ExecuteIndirect(ID3D12GraphicsCommandList *l,
     if (n <= 20) LOG("ExecuteIndirect sig=%p max=%u args=%p+%llu count=%p+%llu", sig, max, args, (unsigned long long)aoff, count, (unsigned long long)coff);
     real_ExecuteIndirect(l, sig, max, args, aoff, count, coff);
 }
-static void STDMETHODCALLTYPE hook_ExecuteCommandLists(ID3D12CommandQueue *q, UINT n, ID3D12CommandList *const *lists) { InterlockedIncrement(&c_execlists); real_ExecuteCommandLists(q, n, lists); }
+static void STDMETHODCALLTYPE hook_ExecuteCommandLists(ID3D12CommandQueue *q, UINT n, ID3D12CommandList *const *lists)
+{
+    UINT64 t0 = now_ticks(), dt;
+    InterlockedIncrement(&c_execlists); real_ExecuteCommandLists(q, n, lists);
+    dt = now_ticks() - t0; InterlockedAdd64(&t_execl_sum, (LONG64)dt); max64(&t_execl_max, (LONG64)dt);
+}
 static HRESULT STDMETHODCALLTYPE hook_GetTimestampFrequency(ID3D12CommandQueue *q, UINT64 *f)
 {
     if (!tsshim) { static volatile LONG n_tsf; HRESULT hr = real_GetTimestampFrequency(q, f); if (InterlockedIncrement(&n_tsf) <= 3) LOG("GetTimestampFrequency -> %llu hr=0x%lx (logged 3x; the game asks every frame)", f ? (unsigned long long)*f : 0, (unsigned long)hr); return hr; }
@@ -941,6 +989,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         logging = GetEnvironmentVariableA("LAYOVER_D3D12_LOG", NULL, 0) > 0;
         verbose = GetEnvironmentVariableA("LAYOVER_D3D12_VERBOSE", v, sizeof v) == 1 && v[0] == '1';
         if (GetEnvironmentVariableA("LAYOVER_FENCE_SLEEP", v, sizeof v) >= 1) fence_sleep = atoi(v);
+        if (GetEnvironmentVariableA("LAYOVER_STALL_FPS", v, sizeof v) >= 1) stall_fps10 = atol(v) * 10;
         { char u[16]; UINT spin_us = 300; if (GetEnvironmentVariableA("LAYOVER_FENCE_SPIN_US", u, sizeof u) >= 1) spin_us = (UINT)atoi(u); fence_spin_ticks = qpc_freq * spin_us / 1000000;
           if (GetEnvironmentVariableA("LAYOVER_FENCE_NAP_US", u, sizeof u) >= 1) fence_nap_us = (UINT)atoi(u); if (fence_nap_us < 50) fence_nap_us = 50; }
         if (fence_sleep) { fence_tls = TlsAlloc(); p_NtDelayExecution = (PFN_NtDelayExecution)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtDelayExecution"); }

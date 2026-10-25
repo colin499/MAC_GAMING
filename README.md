@@ -53,9 +53,16 @@ Steam's offline mode only works for games that have already been launched once
 online (that caches the license, config and shaders). So, while you still have Wi-Fi:
 
 ```bash
-./layover flight               # checklist: login remembered, games ready, controller, battery, disk
+./layover flight               # checklist: login remembered, games ready, controller, battery, disk,
+                               # days since the last restart, memory headroom + big background apps, Low Power Mode
 ./layover flight --go          # switches Steam to offline mode and launches it
 ```
+
+The machine checks come from the 2026-10-24 session (Spider-Man 2 fell from 60 to 2 fps in one second during a
+cinematic): the Mac had been up 48 days and background apps (Zoom, Chrome, WhatsApp, Spotify, Claude...) had
+28 of the 48 GB before the game started. Restart the Mac the day of the flight and quit what the checklist
+lists. Battery, measured that night: 46 % in 56 minutes at a 60 fps cap, so about 2 hours per charge;
+`./layover game 2651280 fps_cap 30` roughly halves the GPU work if you need more.
 
 `flight --go` closes Steam if it is open, flips the saved *WantsOfflineMode* flag for
 both Windows Steam and native Mac Steam, and starts Windows Steam offline.
@@ -189,6 +196,15 @@ window back to the front to continue.
 ./layover setup --reinstall
 ```
 
+**A game stutters or stalls:** every `layover play` starts a watchdog next to the game. It keeps the display
+awake (Wine games never tell macOS they are busy; a long cinematic with no input used to let the screen
+sleep), writes a health line every minute to `logs/watch.log` (fps, the game's memory, free memory, battery,
+CPU throttling) and, when the shim's frame rate collapses below 8 fps after the game ran at 20+, saves a
+3-second `sample` of the game plus memory/thermal state to `logs/stall-<time>.txt` and posts a
+notification. The shim itself logs a `frame:` line every 5 s (time per frame inside Present,
+ExecuteCommandLists and fence waits) and a `STALL`/`RECOVERED` line with host memory and the game's working
+set. Send those two files along when it happens.
+
 Compatibility lookups: codeweavers.com/compatibility (same Wine code), applegamingwiki.com,
 and dxmt.report for DXMT-specific game notes.
 
@@ -199,7 +215,8 @@ layover            the program (Python 3, no dependencies beyond macOS)
 wrapper/           steamwebhelper wrapper: prebuilt .exe plus C source (rebuilds with brew's mingw-w64)
 shims/amd_ags/     AMD AGS replacement DLL: prebuilt .dll plus C++ source and AMD's header (make rebuilds it)
 shims/d3d12shim/   our d3d12.dll in front of D3DMetal: Spider-Man 2 T-pose fix (sm2_skin.c), frame limiter,
-                   fence spin-wait relief, optional D3D12 trace. `make` rebuilds it; every launch deploys it
+                   fence spin-wait relief, frame timing + stall detector, optional D3D12 trace. `make` rebuilds it;
+                   every launch deploys it
 tools/dev/         agent tooling: drive the game unattended, disassembly helpers, minidump reader
 Layover.command    double-click launcher for the menu
 ~/Library/Application Support/Layover/
@@ -207,5 +224,6 @@ Layover.command    double-click launcher for the menu
   prefixes/steam/  the Windows environment; games live in drive_c/Program Files (x86)/Steam/steamapps
   downloads/       cached archives (checksums pinned in `layover`)
   logs/            launch logs (steam-*), per-run d3d12 shim logs (d3d12-*), app.log (Layover.app); the 20 newest are kept
+                   watch.log (game watchdog health lines), stall-*.txt (process sample + memory/thermal state at a stall)
   config.json      your settings
 ```

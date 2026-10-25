@@ -2,6 +2,45 @@
 
 Read this first if you are a new agent (or future me) picking up Layover.
 
+## Spider-Man 2 stall during a cinematic (2026-10-24 22:00:58, cause NOT found; diagnostics added)
+
+What happened: a clean 91-minute session (logs d3d12-2026-10-24_20-30-07.log, the game's own
+Documents/Marvel's Spider-Man 2/Marvel's Spider-Man 2.log): 60 fps paced for 55 min, 48-58 fps in the city,
+sm2_skin `failed 0`, no minidump. At 22:00:58 presents went from 300 per 5 s to 9 per 5 s (about 2 fps) within
+one second and stayed there until the user killed the game at 22:02 (no "Quit requested" line = killed).
+The user saw "slow and glitchy, lost the view". Checked and ruled out: shim log (no new heaps/PSOs/failures at
+that moment; draws per frame normal, so the game was rendering full frames very slowly), the game's log
+(working set 7.0 GB, Video Usage 2.6 GB, fps 59.1 at 22:00:42 then 16.8 average at 22:01:42), Steam's logs
+(controller stayed on the game config until 22:01:51 = the user alt-tabbing afterwards; the overlay's audio
+client re-init at 22:02:03 is the same thing), the unified log (no kernel/GPU/thermal/memorystatus lines;
+Spotlight's burst is 22:02 = the user launching something), display sleep (last event 21:14), free disk
+(356 GB), swap (0 now), thermals (no throttle recorded), Low Power Mode (off). Only coincidences at 22:00:57:
+coreaudiod's periodic RMS report (6/min all night, not a signal) and an mds.index power assertion (2 s long).
+Context that is real: Mac uptime 48 days (boot Sep 6), "Avail RAM = 20.0 GB" of 48 at game start (Zoom,
+WhatsApp, Chrome, Spotify, Monk, ShipStation, several Claude desktop helpers), the user played on battery
+80 % -> 34 % from 20:30 to 21:26 (then plugged in; Steam logged the power-profile change 21:26:04 and fps
+dropped from 60 paced to 48-58 right then: GPU-bound city or charging heat, not separable). In-game settings:
+Fullscreen 1496x967 (a Wine scaled mode, 120 Hz reported), FSR Quality (997x644 render), Custom preset.
+The fence histogram during the stall adds ~1.5 waits per second in the ">256 ms" bucket: the GPU side (or
+whatever Present waits on) took ~500 ms per frame.
+
+Added so the next one is diagnosable (all committed, shim rebuilt + installed, nothing changes rendering):
+- Shim: `frame:` line every 5 s (fps, avg/max ms inside real Present, max gap between presents, avg/max ms
+  inside ExecuteCommandLists, max fence-wait episode) and a stall detector: after 30 s above 20 fps, a 5 s
+  window below LAYOVER_STALL_FPS (8) logs `STALL: x fps | host: load/avail/commit | game: working set/private`
+  (GlobalMemoryStatusEx + K32GetProcessMemoryInfo, which Wine maps to host numbers) and `RECOVERED`.
+- Launcher: `layover watch <appid>` (hidden; `cmd_play` spawns it detached, pid in ROOT/watch.pid). Waits for
+  the game's host pid, runs `caffeinate -d -i -w <pid>` (display awake while the game runs), reads the shim
+  log's `stats:` presents every 5 s, writes a health line per minute to logs/watch.log, and on a stall (same
+  rule as the shim) saves logs/stall-<stamp>.txt = pmset therm, memory_pressure, top, `sample <pid> 3` and
+  notifies (max 3 per session, 10 files kept). Replayed against tonight's log it fires at 22:01:02.
+- `layover flight`: uptime (warn >= 7 days), available memory (warn < 20 GB) + big background apps, Low Power
+  Mode, battery estimate (2 h at 60 fps), and a note that the watchdog exists.
+Next time: read logs/stall-*.txt (the sample shows which thread is stuck where: D3DMetal nextDrawable / GPU
+wait / page faults / shader compile), the shim's `STALL` line (memory), and watch.log's trend before it.
+Also worth considering with the user (visual, needs their eyes): the fullscreen 1496x967 mode is a display
+mode switch under winemac; borderless at the desktop size avoids mode switches on focus changes.
+
 ## Spider-Man 2 gray city blocks (2026-10-17, OPEN: first theory ruled out)
 
 RESULT: with LAYOVER_LOW_FLAGS=0x200000000 all 94 such models were moved below 1 GB (log

@@ -215,6 +215,16 @@ def battery():
     return (int(m.group(1)), m.group(2)) if m else (None, None)
 
 
+def uptime_days():
+    m = re.search(r"sec = (\d+)", sh(["sysctl", "-n", "kern.boottime"]))
+    return (time.time() - int(m.group(1))) / 86400 if m else None
+
+
+def low_power_mode():
+    m = re.search(r"lowpowermode\s+(\d)", sh(["pmset", "-g"]))
+    return bool(m and m.group(1) == "1")
+
+
 def engine_ready():
     return os.path.isfile(WINE) and os.access(WINE, os.X_OK)
 
@@ -1514,6 +1524,7 @@ def cmd_play(args):
             wine(cfg, ["start", "steam://open/main"], wait=False)
             time.sleep(2)
         wine(cfg, ["start", f"steam://rungameid/{g['appid']}"], game=g["appid"], wait=False)
+        spawn_watch(g["appid"], g["name"])
         ok(f"asked Steam to launch {g['name']} ({renderer})")
         time.sleep(8)
         if steam_launch_prompt(g["appid"]):
@@ -1522,6 +1533,7 @@ def cmd_play(args):
     else:
         offline = True if args.offline else None
         log = launch_steam(cfg, game=g["appid"], offline=offline)
+        spawn_watch(g["appid"], g["name"])
         ok(f"starting Steam → {g['name']} ({renderer}); log: {log}")
 
 
@@ -1622,8 +1634,25 @@ def cmd_flight(args):
     pct, state = battery()
     if pct is not None:
         (ok if pct >= 80 else warn)(f"MacBook battery {pct}% ({state})")
+        info("measured 2026-10-24: Spider-Man 2 at a 60 fps cap used 46% of the battery in 56 min, about 2 h per charge;"
+             " a 30 fps cap (layover game <game> fps_cap 30) and lower screen brightness stretch that")
     fd = free_disk()
     (ok if fd > 10 << 30 else warn)(f"free disk {human(fd)}")
+
+    # the machine itself (2026-10-24: 48 days of uptime, 28 GB taken by background apps before the game started)
+    up = uptime_days()
+    if up is not None:
+        (ok if up < 7 else warn)(f"Mac last restarted {up:.0f} day{'s' if up != 1 else ''} ago" + ("" if up < 7 else " — restart it before the flight (fresh memory and GPU driver state)"))
+    free_mb, used_mb = host_memory()
+    (ok if free_mb >= 20000 else warn)(f"memory available {free_mb / 1024:.1f} GB" + ("" if free_mb >= 20000 else " — the game wants about 12 GB with Steam and Wine; quit the apps below first"))
+    apps = big_apps()
+    if apps:
+        info("big background apps: " + ", ".join(f"{n} {mb / 1024:.1f} GB" if mb >= 1024 else f"{n} {mb} MB" for mb, n in apps))
+    if low_power_mode():
+        warn("Low Power Mode is on (System Settings → Battery) — it caps the GPU; turn it off for playing")
+    else:
+        ok("Low Power Mode off")
+    info("while a game runs Layover keeps the display awake and logs its health (logs/watch.log; a stall saves logs/stall-*.txt)")
 
     # Offline mode
     if args.online:
@@ -1777,6 +1806,225 @@ def cmd_config(args):
             info("so it renders around 1728x1117 internally and only the output is native-sharp.")
         else:
             info("games see 1728x1117 again; re-pick the resolution in the game's display settings.")
+
+
+# --------------------------------------------------------------------------- game watchdog
+# `layover play` starts a detached `layover watch <appid>` next to every game. It (1) keeps the display
+# awake while the game runs (Wine games never tell macOS they are busy, so a long cinematic with no
+# input lets the screen sleep after 5 min on battery), (2) writes a health line every minute (fps from
+# the shim log, the game's memory, the host's free memory, battery, CPU throttle) to logs/watch-*.log,
+# and (3) when the shim's fps collapses (< 8 fps after the game ran at 20+) it saves a `sample` of the
+# game plus memory/thermal state to logs/stall-*.txt and posts a notification. 2026-10-24: Spider-Man 2
+# went from 60 fps to 2 fps in one second during a cinematic with nothing in any log; next time there
+# will be a stack sample of the moment. It exits with the game.
+WATCH_PID = os.path.join(ROOT, "watch.pid")
+
+
+def game_host_pid():
+    """Host pid of the game exe running in our prefix (the Wine process for steamapps/common/...exe)."""
+    out = sh(["ps", "-axo", "pid=,command="])
+    for line in out.splitlines():
+        if "steamapps/common" in line and ".exe" in line and "crs-" not in line and "gameoverlayui" not in line:
+            try:
+                return int(line.split(None, 1)[0])
+            except ValueError:
+                pass
+    return None
+
+
+def shim_log_path():
+    try:
+        with open(SHIM_ENV_PATH) as f:
+            for line in f:
+                if line.startswith("LAYOVER_D3D12_LOG="):
+                    return line.split("=", 1)[1].strip()[2:].replace("\\", "/")
+    except OSError:
+        pass
+    return None
+
+
+def shim_presents(path):
+    """(presents, timestamp) from the last `stats:` line of a shim log, or None."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 65536))
+            tail = f.read().decode(errors="replace")
+    except OSError:
+        return None
+    m = None
+    for m in re.finditer(r"^(\d\d:\d\d:\d\d)\.\d+ \[\d+\] stats: presents=(\d+)", tail, re.M):
+        pass
+    return (int(m.group(2)), m.group(1)) if m else None
+
+
+def host_memory():
+    """(free MB, used-by-apps MB) from vm_stat; free counts inactive and speculative pages too."""
+    out = sh(["vm_stat"])
+    pages = {k.strip(): int(v.strip(" .")) for k, v in (l.split(":", 1) for l in out.splitlines() if ":" in l and l.split(":", 1)[1].strip(" .").isdigit())}
+    pg = 16384
+    free = (pages.get("Pages free", 0) + pages.get("Pages inactive", 0) + pages.get("Pages speculative", 0) + pages.get("Pages purgeable", 0)) * pg
+    used = (pages.get("Pages active", 0) + pages.get("Pages wired down", 0) + pages.get("Pages occupied by compressor", 0)) * pg
+    return free >> 20, used >> 20
+
+
+def cpu_throttle():
+    """CPU speed limit in % from pmset (100 = no throttling), or None when macOS has nothing recorded."""
+    out = sh(["pmset", "-g", "therm"])
+    m = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", out)
+    return int(m.group(1)) if m else None
+
+
+def process_rss_mb(pid):
+    out = sh(["ps", "-o", "rss=", "-p", str(pid)])
+    return int(out) // 1024 if out.strip().isdigit() else 0
+
+
+def big_apps(min_mb=400, limit=8):
+    """[(MB, name)] of the biggest user processes, one entry per app, over min_mb."""
+    out = sh(["ps", "-axo", "rss=,comm="])
+    apps = {}
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        mb = int(parts[0]) // 1024
+        cmd = parts[1]
+        if "/Applications/" in cmd or "/Library/" in cmd:
+            m = re.search(r"/([^/]+)\.app/", cmd)
+            name = m.group(1) if m else os.path.basename(cmd)
+        else:
+            name = os.path.basename(cmd)
+        if name.lower() in ("kernel_task", "windowserver", "python3", "wine", "wine64-preloader", "wineserver", "caffeinate") or name.startswith("Layover"):
+            continue
+        apps[name] = apps.get(name, 0) + mb
+    return sorted(((mb, n) for n, mb in apps.items() if mb >= min_mb), reverse=True)[:limit]
+
+
+def stall_capture(pid, name, fps, reason):
+    os.makedirs(LOGS, exist_ok=True)
+    stamp = _dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    path = os.path.join(LOGS, f"stall-{stamp}.txt")
+    free, used = host_memory()
+    pct, state = battery()
+    parts = [f"Layover stall capture {stamp}: {name} (pid {pid}) at {fps:.1f} fps; {reason}",
+             f"host memory: {free} MB free, {used} MB in use; game RSS {process_rss_mb(pid)} MB; battery {pct}% ({state}); CPU speed limit {cpu_throttle()}",
+             "", "== pmset -g therm", sh(["pmset", "-g", "therm"]), "", "== memory_pressure", sh(["memory_pressure"])[-800:],
+             "", "== top (cpu)", sh(["top", "-l", "1", "-o", "cpu", "-n", "15", "-stats", "pid,cpu,mem,command"])[-2500:],
+             "", "== sample of the game (3 s)"]
+    r = run(["sample", str(pid), "3", "-mayDie"], timeout=60)
+    parts.append(r.stdout if r.returncode == 0 else f"sample failed ({r.returncode}): {r.stderr.strip()[:300]}")
+    with open(path, "w") as f:
+        f.write("\n".join(parts) + "\n")
+    old = sorted(glob.glob(os.path.join(LOGS, "stall-*.txt")), key=os.path.getmtime)
+    for p in old[:-10]:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    return path
+
+
+def spawn_watch(appid, name):
+    """Start the detached watchdog for a game launch (one per game; an older one is told to quit)."""
+    try:
+        with open(WATCH_PID) as f:
+            old = int(f.read().strip() or 0)
+        if old and old != os.getpid():
+            os.kill(old, 15)
+    except (OSError, ValueError):
+        pass
+    try:
+        os.makedirs(LOGS, exist_ok=True)
+        log = open(os.path.join(LOGS, "watch.log"), "ab")
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "watch", str(appid), "--name", name],
+                         stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        warn(f"could not start the game watchdog: {e}")
+
+
+def cmd_watch(args):
+    name = args.name or str(args.game)
+    try:
+        with open(WATCH_PID, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+    log_path = os.path.join(LOGS, "watch.log")
+    try:
+        if os.path.getsize(log_path) > (1 << 20):
+            open(log_path, "w").close()
+    except OSError:
+        pass
+
+    def w(msg):
+        print(_dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+
+    w(f"watch: waiting for {name} to start")
+    pid = None
+    for _ in range(args.wait):
+        pid = game_host_pid()
+        if pid:
+            break
+        time.sleep(1)
+    if not pid:
+        w("watch: the game did not start within the wait; giving up")
+        try:
+            os.remove(WATCH_PID)
+        except OSError:
+            pass
+        return
+    shim = shim_log_path()
+    w(f"watch: {name} is pid {pid}; shim log {shim or 'none'}")
+    try:
+        caf = subprocess.Popen(["caffeinate", "-d", "-i", "-w", str(pid)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        w("watch: display kept awake while the game runs (caffeinate)")
+    except OSError:
+        caf = None
+    last = None
+    good = 0            # consecutive 5 s windows at 20+ fps
+    stalled = False
+    captures = 0
+    minute = 0
+    fps = 0.0
+    while True:
+        time.sleep(5)
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            break
+        cur = shim_presents(shim) if shim else None
+        if cur and last and cur[1] != last[1]:
+            fps = (cur[0] - last[0]) / 5.0
+            if fps >= 20:
+                good = min(good + 1, 6)
+                if stalled:
+                    w(f"recovered: {fps:.1f} fps")
+                    stalled = False
+            elif fps < args.stall_fps and good >= 6 and not stalled:
+                stalled = True
+                reason = f"after {good * 5}+ s above 20 fps"
+                w(f"STALL: {fps:.1f} fps {reason}")
+                if captures < 3:
+                    captures += 1
+                    path = stall_capture(pid, name, fps, reason)
+                    w(f"saved {path}")
+                    notify("Layover", f"{name} dropped to {fps:.0f} fps; diagnostics saved to logs/{os.path.basename(path)}")
+        if cur:
+            last = cur
+        minute += 1
+        if minute % 12 == 0:
+            free, used = host_memory()
+            pct, state = battery()
+            thr = cpu_throttle()
+            w(f"health: {fps:.1f} fps | game {process_rss_mb(pid)} MB | host free {free} MB | battery {pct}% {state or ''}" + (f" | cpu limit {thr}%" if thr not in (None, 100) else ""))
+    w(f"watch: {name} exited")
+    if caf and caf.poll() is None:
+        caf.terminate()
+    try:
+        os.remove(WATCH_PID)
+    except OSError:
+        pass
 
 
 def cmd_kill(args):
@@ -2101,6 +2349,12 @@ def main(argv=None):
     s.add_argument("value", nargs="?", help="for steam_args, quote the whole list, e.g. \"-cef-disable-gpu -noverifyfiles\"")
     s.set_defaults(fn=lambda a: cmd_config(a) if (a.key is None or a.value is not None) else die("usage: layover config <key> <value>"))
 
+    s = sub.add_parser("watch", help=argparse.SUPPRESS)   # started by `play`: display awake, health log, stall capture
+    s.add_argument("game")
+    s.add_argument("--name")
+    s.add_argument("--wait", type=int, default=240, help="seconds to wait for the game process")
+    s.add_argument("--stall-fps", type=float, default=8.0)
+    s.set_defaults(fn=cmd_watch)
     sub.add_parser("doctor", help="health check").set_defaults(fn=cmd_doctor)
     sub.add_parser("kill", help="stop Steam and the Windows prefix").set_defaults(fn=cmd_kill)
     sub.add_parser("quit", help="same as kill: fully quit Steam (closing its window only hides it)").set_defaults(fn=cmd_kill)
