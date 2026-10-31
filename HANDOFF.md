@@ -12,6 +12,21 @@ both windows where the three baseline runs of the same save collapsed to 4-6 fps
 look of the tendrils. The watchdog now ignores a 0 fps window when the game is exiting (shutdown false positive).
 Before the fix, the details:
 
+**Hard freeze 2026-10-31 17:54:29 (OPEN, first ever; different from the stall).** 35 min into the user's first real
+session with the pool fix on (log d3d12-2026-10-31_17-19-08.log; symbiote scenes fine at 60 fps all session): "glitched
+while play was about to start", then frozen. Shim: presents AND ExecuteCommandLists AND fence polls all stopped at
+once (counters identical in every 5 s window afterwards), i.e. the game made no D3D12 calls at all; one thread at
+~100 % CPU (ps 107 %); the game's own per-minute Render line stopped (17:54:22 was the last); macOS log has no GPU
+fault/restart/AGX line at all (checked with /usr/bin/log; NOTE: `log` in zsh is a builtin that prints nothing);
+MTLCompilerService idle; memory fine (14.7 GB free). Right before it (17:54:25) a burst of ~30 model arrivals (new
+area/cutscene loading). LAYOVER_SKIN_LOG=2 (survey, one log line per arrival) was still on in that session; removed.
+`sample` (stall capture 17-54-41) is symbol-less under Rosetta, so the shim now has a FREEZE reporter: after two 5 s
+windows with no presents and no submissions it logs every thread's RIP and stack return addresses as module+offset
+(exe+0x..., ntdll, d3d12_d3dmetal...) three times, 5 s apart. Next freeze: read those lines; a thread stuck at one
+exe+offset is the hang, a small cycling set is the spinner. Fix candidates depend on where it is (game job system,
+Wine msync, D3DMetal). The stall-era multi-second "fence wait max" values at 60 fps are a background thread and
+appear equally with the fix off (Oct 26: 89 of 606 windows) and on (81 of 421): not related.
+
 Symptom (three times: 2026-10-24 22:00, 10-26 14:58/15:00/15:01, 10-31 16:25): during a cinematic where Harry
 uses the symbiote, Spider-Man "glitches out" and the game drops from 60 to 2 fps and lower (shim `frame:` lines:
 GPU fence waits grow 0.5 s -> 0.8 s -> 1.8 s per frame; draws per frame only ~2x normal; no new PSOs, heaps or

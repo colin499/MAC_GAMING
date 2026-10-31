@@ -120,7 +120,7 @@ static UINT64 res_width(ID3D12Resource *r) { D3D12_RESOURCE_DESC d; if (!r) retu
 
 // ---- counters dumped periodically --------------------------------------------------------
 static ID3D12Resource *pool_res; static UINT64 pool_width; static volatile LONG64 pool_hw; static volatile LONG pool_oob, pool_copies;
-static volatile LONG c_present, c_present_paced, c_fence_polls, c_fence_sleeps;
+static volatile LONG c_present, c_present_paced, c_fence_sleeps; static volatile LONG64 c_fence_polls;   // polls overflow a LONG in an hour
 static volatile LONG fence_hist[8]; static volatile LONG64 fence_episodes; static int fence_sleep = 3;   // fence wait hook (see below); 3 = event wait
 // frame timing per stats window (reset by stats_thread): ticks inside the real Present, inside
 // ExecuteCommandLists, the longest gap between two presents and the longest fence-wait episode
@@ -138,14 +138,59 @@ static void stall_note(const char *what, long fps10)
     if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof pm)) snprintf(mem + strlen(mem), sizeof mem - strlen(mem), " | game: working set %llu MB (peak %llu) commit %llu MB", (unsigned long long)(pm.WorkingSetSize >> 20), (unsigned long long)(pm.PeakWorkingSetSize >> 20), (unsigned long long)(pm.PagefileUsage >> 20));
     NOTE("%s: %ld.%ld fps%s", what, fps10 / 10, fps10 % 10, mem);
 }
+// Freeze report: when the game stops presenting AND stops submitting work for 10 s while it is still
+// alive (2026-10-31 17:54: 0 fps, one thread at 100 % CPU, no D3D12 calls at all, the game's own log
+// silent; `sample` on the host cannot symbolize Rosetta/Wine code), log where every thread is: module
+// + offset of its instruction pointer and the first return addresses on its stack. A hung thread shows
+// up as the same exe+offset in consecutive reports; a spinning one as a small set of offsets.
+#include <tlhelp32.h>
+static void module_offset(char *out, size_t cap, UINT64 addr)
+{
+    HMODULE m = NULL; char path[MAX_PATH]; const char *b;
+    if (addr && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(UINT_PTR)addr, &m) && m) {
+        GetModuleFileNameA(m, path, sizeof path); b = strrchr(path, '\\'); snprintf(out, cap, "%s+0x%llx", b ? b + 1 : path, (unsigned long long)(addr - (UINT64)(UINT_PTR)m));
+    } else snprintf(out, cap, "%#llx", (unsigned long long)addr);
+}
+static void freeze_report(int nth)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0); THREADENTRY32 te; DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId(); int n = 0;
+    if (snap == INVALID_HANDLE_VALUE) { NOTE("FREEZE report %d: thread snapshot failed (%lu)", nth, GetLastError()); return; }
+    te.dwSize = sizeof te;
+    if (Thread32First(snap, &te)) do {
+        HANDLE h; CONTEXT c; char where[160], stack[400] = ""; size_t o = 0; int k;
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == me || n >= 96) continue;
+        h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        if (SuspendThread(h) != (DWORD)-1) {
+            memset(&c, 0, sizeof c); c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            if (GetThreadContext(h, &c)) {
+                UINT64 *sp = (UINT64 *)(UINT_PTR)c.Rsp;
+                module_offset(where, sizeof where, c.Rip);
+                for (k = 0; k < 48 && o < sizeof stack - 60; k++) {   // return addresses among the first 48 stack slots
+                    UINT64 v; if (!readable(sp + k, 8)) break; v = sp[k];
+                    if (v > 0x10000 && readable((void *)(UINT_PTR)v, 1)) { MEMORY_BASIC_INFORMATION mbi; if (VirtualQuery((void *)(UINT_PTR)v, &mbi, sizeof mbi) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) { char w[160]; module_offset(w, sizeof w, v); o += snprintf(stack + o, sizeof stack - o, " %s", w); } }
+                }
+                NOTE("FREEZE report %d: thread %lu at %s | stack:%s", nth, (unsigned long)te.th32ThreadID, where, stack);
+                n++;
+            }
+            ResumeThread(h);
+        }
+        CloseHandle(h);
+    } while (Thread32Next(snap, &te));
+    CloseHandle(snap);
+    NOTE("FREEZE report %d: %d threads listed; device removed reason: see next line if the game asks", nth, n);
+}
 static DWORD WINAPI stats_thread(LPVOID arg)
 {
-    LONG last_present = 0, last_execl = 0; int good_windows = 0, stalled = 0;
+    LONG last_present = 0, last_execl = 0; int good_windows = 0, stalled = 0, frozen_windows = 0, freeze_reports = 0;
     for (;;) {
         LONG dp, de; LONG64 ps, pm, es, em, gm, fm; long fps10;
         Sleep(5000);
         dp = c_present - last_present; last_present = c_present;
         de = c_execlists - last_execl; last_execl = c_execlists;
+        // freeze: nothing presented and nothing submitted for two windows in a row after the game ran normally
+        if (!dp && !de && good_windows >= 6) { if (++frozen_windows >= 2 && freeze_reports < 3) { freeze_reports++; NOTE("FREEZE: no presents and no ExecuteCommandLists for %d s", frozen_windows * 5); freeze_report(freeze_reports); } }
+        else frozen_windows = 0;
         ps = InterlockedExchange64(&t_present_sum, 0); pm = InterlockedExchange64(&t_present_max, 0);
         es = InterlockedExchange64(&t_execl_sum, 0); em = InterlockedExchange64(&t_execl_max, 0);
         gm = InterlockedExchange64(&t_gap_max, 0); fm = InterlockedExchange64(&t_fence_max, 0);
@@ -157,9 +202,9 @@ static DWORD WINAPI stats_thread(LPVOID arg)
         if (fps10 >= 200) { if (good_windows < 6) good_windows++; if (stalled) { stall_note("RECOVERED", fps10); stalled = 0; } }
         else if (fps10 < stall_fps10 && good_windows >= 6 && !stalled) { stalled = 1; stall_note("STALL", fps10); }
         if (pool_res) { char sk[300], pf[300]; sm2_skin_stats(sk, sizeof sk); NOTE("pool: high-water %llu MB of %llu, copies %ld, past-end %ld | %s", (unsigned long long)(pool_hw >> 20), (unsigned long long)(pool_width >> 20), pool_copies, pool_oob, sk); pool_fix_stats(pf, sizeof pf); NOTE("%s", pf); }
-        if (fence_sleep) LOG("fence waits: episodes=%lld hist(<50us %ld, <200us %ld, <1ms %ld, <4ms %ld, <16ms %ld, <64ms %ld, <256ms %ld, more %ld) polls=%ld slept=%ld", (long long)fence_episodes, fence_hist[0], fence_hist[1], fence_hist[2], fence_hist[3], fence_hist[4], fence_hist[5], fence_hist[6], fence_hist[7], c_fence_polls, c_fence_sleeps);
-        LOG("stats: presents=%ld (paced %ld) fence-polls=%ld (slept %ld) execlists=%ld dispatch=%ld dispatchmesh=%ld draw=%ld drawidx=%ld execind=%ld copybuf=%ld setpso=%ld map=%ld barrier=%ld | views srv_buf=%ld uav_buf=%ld srv_tex=%ld uav_tex=%ld | pso gfx=%ld cs=%ld gen=%ld FAIL=%ld | res buf=%ld tex=%ld",
-            c_present, c_present_paced, c_fence_polls, c_fence_sleeps, c_execlists, c_dispatch, c_dispatchmesh, c_draw, c_drawidx, c_execind, c_copybuf, c_setpso, c_map, c_barrier, c_srv_buf, c_uav_buf, c_srv_tex, c_uav_tex, c_pso_gfx, c_pso_cs, c_pso_gen, c_pso_fail, c_res_buf, c_res_tex);
+        if (fence_sleep) LOG("fence waits: episodes=%lld hist(<50us %ld, <200us %ld, <1ms %ld, <4ms %ld, <16ms %ld, <64ms %ld, <256ms %ld, more %ld) polls=%lld slept=%ld", (long long)fence_episodes, fence_hist[0], fence_hist[1], fence_hist[2], fence_hist[3], fence_hist[4], fence_hist[5], fence_hist[6], fence_hist[7], (long long)c_fence_polls, c_fence_sleeps);
+        LOG("stats: presents=%ld (paced %ld) fence-polls=%lld (slept %ld) execlists=%ld dispatch=%ld dispatchmesh=%ld draw=%ld drawidx=%ld execind=%ld copybuf=%ld setpso=%ld map=%ld barrier=%ld | views srv_buf=%ld uav_buf=%ld srv_tex=%ld uav_tex=%ld | pso gfx=%ld cs=%ld gen=%ld FAIL=%ld | res buf=%ld tex=%ld",
+            c_present, c_present_paced, (long long)c_fence_polls, c_fence_sleeps, c_execlists, c_dispatch, c_dispatchmesh, c_draw, c_drawidx, c_execind, c_copybuf, c_setpso, c_map, c_barrier, c_srv_buf, c_uav_buf, c_srv_tex, c_uav_tex, c_pso_gfx, c_pso_cs, c_pso_gen, c_pso_fail, c_res_buf, c_res_tex);
     }
     return 0;
 }
@@ -779,7 +824,7 @@ static UINT64 STDMETHODCALLTYPE hook_GetCompletedValue(ID3D12Fence *f)
     if (!fence_sleep || fence_tls == TLS_OUT_OF_INDEXES) return v;
     s = TlsGetValue(fence_tls);
     if (!s) { s = calloc(1, sizeof *s); if (!s) return v; TlsSetValue(fence_tls, s); }
-    InterlockedIncrement(&c_fence_polls);
+    InterlockedIncrement64(&c_fence_polls);
     if (s->fence == f && s->value == v) {
         QueryPerformanceCounter(&c);
         if (++s->same == 1) s->t0 = (UINT64)c.QuadPart;
