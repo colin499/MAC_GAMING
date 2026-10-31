@@ -9,7 +9,10 @@ set -euo pipefail
 ROOT="$HOME/Library/Application Support/Layover"
 DXC_COMMIT=6e0fab36dc9ac8c423e1b08fed3aeb0e739d9e54
 OUT="$ROOT/tools/dxc"
-WORK="${DXC_WORK:-$ROOT/tools/dxc-build}"
+# The build folder must not contain spaces: DXC's version generator (gen_version.py) is invoked with an
+# unquoted output path and fails under ".../Application Support/..." (seen 2026-10-31). ~/Library/Caches has none.
+WORK="${DXC_WORK:-$HOME/Library/Caches/layover-dxc-build}"
+case "$WORK" in *" "*) echo "build folder '$WORK' contains a space; set DXC_WORK to a path without one" >&2; exit 1;; esac
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 mkdir -p "$ROOT/logs"
 exec > >(tee -a "$ROOT/logs/build-dxc.log") 2>&1   # everything also lands in logs/build-dxc.log for diagnosis
