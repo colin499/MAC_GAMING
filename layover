@@ -43,6 +43,8 @@ PREFIX = os.path.join(ROOT, "prefixes", "steam")
 LOGS = os.path.join(ROOT, "logs")
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 TOOLS = os.path.join(ROOT, "tools")
+SM2_SHADER_DIR = os.path.join(TOOLS, "sm2-shaders")   # the d3d12 shim's pool fix: rewritten Spider-Man 2 shaders (layover sm2-shaders)
+DXC_DIR = os.path.join(TOOLS, "dxc")                   # Microsoft's shader tools built by tools/dev/build-dxc.sh
 HERE = os.path.dirname(os.path.realpath(__file__))
 
 # Pinned components, taken from Highball's engine manifest x64-sikarugir10.0_6-r19
@@ -506,12 +508,20 @@ def close_games(cfg, wait=20):
         time.sleep(1)
 
 
+def is_game_process(cmdline):
+    """True for a Mac process line that is a game exe from a Steam library running in our prefix. Wine shows
+    the Windows command line, so the path has backslashes (steamapps\\common\\...), not slashes; the watchdog
+    matched only the slash form until 2026-10-31 and never attached (no stall capture on 10-24 and 10-26)."""
+    low = cmdline.lower().replace("\\", "/")
+    return "steamapps/common/" in low and ".exe" in low and "crs-" not in low and "gameoverlayui" not in low and "steamwebhelper" not in low
+
+
 def running_game_exes():
     """Basenames of game executables running in our prefix (from the Mac process list)."""
     out = sh(["ps", "-axo", "command"])
     found = set()
     for line in out.splitlines():
-        if "steamapps/common" in line and ".exe" in line and "crs-" not in line:
+        if is_game_process(line):
             exe = line.split(".exe")[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1] + ".exe"
             found.add(exe)
     return sorted(found)
@@ -614,7 +624,8 @@ def write_shim_env(cfg, game=None):
     if not os.path.isdir(os.path.dirname(SHIM_ENV_PATH)):
         return None
     log = new_log("d3d12")
-    env = {"LAYOVER_D3D12_LOG": "Z:" + log.replace("/", "\\"), "LAYOVER_SKIN_LOG": "1", "LAYOVER_MAX_FPS": str(game_fps_cap(cfg, game))}
+    env = {"LAYOVER_D3D12_LOG": "Z:" + log.replace("/", "\\"), "LAYOVER_SKIN_LOG": "1", "LAYOVER_MAX_FPS": str(game_fps_cap(cfg, game)),
+           "LAYOVER_POOL_SHADERS": "Z:" + SM2_SHADER_DIR.replace("/", "\\")}   # the pool fix's rewritten shaders (layover sm2-shaders)
     g = cfg["games"].get(str(game), {}) if game else {}
     for k, v in (g.get("env") or {}).items():   # per-game values replace the defaults (the shim keeps the first value it reads)
         if k.startswith(("LAYOVER_", "D3DM_", "HB_")):
@@ -1652,6 +1663,13 @@ def cmd_flight(args):
         warn("Low Power Mode is on (System Settings → Battery) — it caps the GPU; turn it off for playing")
     else:
         ok("Low Power Mode off")
+    if sm2_exe_path():
+        missing = sm2_shaders_missing()
+        if missing:
+            warn(f"Spider-Man 2 pool-fix shaders not built ({len(missing)} missing): the symbiote scenes glitch and drop to 2 fps"
+                 + (" — run tools/dev/build-dxc.sh (once, 30-60 min), then layover sm2-shaders" if not dxc_tools_present() else " — run layover sm2-shaders"))
+        else:
+            ok("Spider-Man 2 pool-fix shaders built (symbiote + T-pose fix at the root)")
     info("while a game runs Layover keeps the display awake and logs its health (logs/watch.log; a stall saves logs/stall-*.txt)")
 
     # Offline mode
@@ -1824,12 +1842,27 @@ def game_host_pid():
     """Host pid of the game exe running in our prefix (the Wine process for steamapps/common/...exe)."""
     out = sh(["ps", "-axo", "pid=,command="])
     for line in out.splitlines():
-        if "steamapps/common" in line and ".exe" in line and "crs-" not in line and "gameoverlayui" not in line:
+        if is_game_process(line):
             try:
                 return int(line.split(None, 1)[0])
             except ValueError:
                 pass
     return None
+
+
+def metal_compiler_cpu():
+    """CPU % of Apple's Metal shader compiler services right now (MTLCompilerService processes). High while
+    the game runs = shaders being compiled (a stall with this high is a compile storm, not the GPU)."""
+    out = sh(["ps", "-axo", "pcpu=,comm="])
+    total = 0.0
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and "MTLCompilerService" in parts[1]:
+            try:
+                total += float(parts[0])
+            except ValueError:
+                pass
+    return total
 
 
 def shim_log_path():
@@ -1909,6 +1942,7 @@ def stall_capture(pid, name, fps, reason):
     pct, state = battery()
     parts = [f"Layover stall capture {stamp}: {name} (pid {pid}) at {fps:.1f} fps; {reason}",
              f"host memory: {free} MB free, {used} MB in use; game RSS {process_rss_mb(pid)} MB; battery {pct}% ({state}); CPU speed limit {cpu_throttle()}",
+             f"Metal shader compiler (MTLCompilerService) CPU: {metal_compiler_cpu():.0f}%  (high = shaders compiling, not a GPU stall)",
              "", "== pmset -g therm", sh(["pmset", "-g", "therm"]), "", "== memory_pressure", sh(["memory_pressure"])[-800:],
              "", "== top (cpu)", sh(["top", "-l", "1", "-o", "cpu", "-n", "15", "-stats", "pid,cpu,mem,command"])[-2500:],
              "", "== sample of the game (3 s)"]
@@ -2017,7 +2051,8 @@ def cmd_watch(args):
             free, used = host_memory()
             pct, state = battery()
             thr = cpu_throttle()
-            w(f"health: {fps:.1f} fps | game {process_rss_mb(pid)} MB | host free {free} MB | battery {pct}% {state or ''}" + (f" | cpu limit {thr}%" if thr not in (None, 100) else ""))
+            mtl = metal_compiler_cpu()
+            w(f"health: {fps:.1f} fps | game {process_rss_mb(pid)} MB | host free {free} MB | battery {pct}% {state or ''}" + (f" | cpu limit {thr}%" if thr not in (None, 100) else "") + (f" | shader compiler {mtl:.0f}%" if mtl >= 5 else ""))
     w(f"watch: {name} exited")
     if caf and caf.poll() is None:
         caf.terminate()
@@ -2025,6 +2060,139 @@ def cmd_watch(args):
         os.remove(WATCH_PID)
     except OSError:
         pass
+
+
+# --------------------------------------------------------------------------- Spider-Man 2 pool-fix shaders
+# D3DMetal on M1-M4 backs typed buffer views with Metal texture buffers (max 2^28 elements). Spider-Man 2
+# views its 2 GB mesh pool through typed R32 views of 536M elements, so typed reads above 1 GB return 0
+# (T-pose) and typed WRITES there are lost: the symbiote's spline meshes (Harry's / Venom's tendrils) are
+# written into the pool by two compute shaders every frame and come out as garbage triangles, which also
+# costs the GPU seconds per frame (the 60 -> 2 fps collapses in Harry's scenes, 2026-10-24/26/31).
+# The shim (shims/d3d12shim/pool_fix.c) creates those views raw and swaps the four shaders that use them
+# for copies whose typed loads/stores are raw ones. The copies are built here from the game's own exe, the
+# way macprotips/SpiderMan2Fix (public domain) does it: extract the DXBC container by hash, `dxc -dumpbin`
+# to LLVM IR text, rewrite the typed access (tools/sm2shaderfix, their C rewriter), `dxa` back to DXIL,
+# `dxv` to validate and sign. Result hashes are the ones they verified in the game with the same DXC commit.
+SM2_POOL_SHADERS = [  # (hash of the game's shader, register space, register, is UAV, verified result hash, name)
+    (0x3d50acdb571dce22, 0, 1, False, 0x589ed5a9fddc545f, "CS_ModelSkinning"),
+    (0x14902794dd7134e4, 0, 0, False, 0xee434fbf42f24d08, "vertex morph"),
+    (0x9538ca33c087a84c, 0, 1, True, 0xce7b280115b2aa10, "CS_AnimSplineMeshGenIndices (symbiote)"),
+    (0x125a4957ab64d24d, 0, 1, True, 0xb84c589e5ae4b5c5, "CS_AnimSplineMeshGenIndicesFinalize (symbiote)"),
+]
+SM2_SHADERFIX_SRC = os.path.join(HERE, "tools", "sm2shaderfix")
+SM2_SHADERFIX_BIN = os.path.join(TOOLS, "sm2shaderfix")
+
+
+def fnv1_64(data):
+    h = 0xcbf29ce484222325
+    for b in data:
+        h = ((h * 0x100000001b3) & 0xffffffffffffffff) ^ b
+    return h
+
+
+def sm2_exe_path():
+    for lib in steam_libraries(os.path.join(STEAM_DIR, "steamapps")):
+        p = os.path.join(lib, "common", "Marvel's Spider-Man 2", "Spider-Man2.exe")
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def sm2_shader_file(h):
+    return os.path.join(SM2_SHADER_DIR, f"sm2-pool-{h:016x}.dxil")
+
+
+def sm2_shaders_missing():
+    return [name for h, _, _, _, _, name in SM2_POOL_SHADERS if not os.path.isfile(sm2_shader_file(h))]
+
+
+def dxc_tools_present():
+    return all(os.access(os.path.join(DXC_DIR, "bin", t), os.X_OK) for t in ("dxc", "dxa", "dxv"))
+
+
+def sm2_shaderfix_binary():
+    """Compile tools/sm2shaderfix (plain C, POSIX regex) with the system clang when missing or stale."""
+    srcs = [os.path.join(SM2_SHADERFIX_SRC, f) for f in ("main.c", "shaderfix.c")]
+    if not all(os.path.isfile(s) for s in srcs):
+        return None
+    try:
+        stale = not os.path.exists(SM2_SHADERFIX_BIN) or os.path.getmtime(SM2_SHADERFIX_BIN) < max(os.path.getmtime(s) for s in srcs + [os.path.join(SM2_SHADERFIX_SRC, "shaderfix.h")])
+    except OSError:
+        stale = True
+    if stale:
+        os.makedirs(TOOLS, exist_ok=True)
+        r = run(["clang", "-O2", "-Wall", "-o", SM2_SHADERFIX_BIN] + srcs)
+        if r.returncode != 0:
+            bad("could not compile tools/sm2shaderfix: " + r.stderr.strip()[-400:])
+            return None
+    return SM2_SHADERFIX_BIN if os.access(SM2_SHADERFIX_BIN, os.X_OK) else None
+
+
+def cmd_sm2_shaders(args):
+    head("Spider-Man 2 pool-fix shaders (typed pool access -> raw; T-pose + symbiote)")
+    exe = sm2_exe_path()
+    present = [name for h, _, _, _, _, name in SM2_POOL_SHADERS if os.path.isfile(sm2_shader_file(h))]
+    for h, _, _, _, _, name in SM2_POOL_SHADERS:
+        (ok if os.path.isfile(sm2_shader_file(h)) else warn)(f"{name}: {'built' if os.path.isfile(sm2_shader_file(h)) else 'missing'} ({os.path.basename(sm2_shader_file(h))})")
+    if args.status:
+        info(f"folder: {SM2_SHADER_DIR}; the shim turns the fix on only when all {len(SM2_POOL_SHADERS)} files are present (log line 'pool fix: ON')")
+        return
+    if len(present) == len(SM2_POOL_SHADERS) and not args.force:
+        ok("all shaders are built; use --force to rebuild them")
+        return
+    if not exe:
+        die("Spider-Man 2 is not installed in the Windows Steam prefix (its Spider-Man2.exe is the source of the shaders)")
+    if not dxc_tools_present():
+        bad(f"Microsoft's shader tools (dxc, dxa, dxv) are not in {DXC_DIR}/bin")
+        info("build them once (30-60 min, installs cmake + ninja with brew):  tools/dev/build-dxc.sh")
+        info("then run this command again")
+        sys.exit(2)
+    tool = sm2_shaderfix_binary()
+    if not tool:
+        die("the rewrite tool is unavailable (see above)")
+    import tempfile
+    work = tempfile.mkdtemp(prefix="sm2-shaders-")
+    os.makedirs(SM2_SHADER_DIR, exist_ok=True)
+    built = 0
+    env = dict(os.environ, DYLD_LIBRARY_PATH=os.path.join(DXC_DIR, "lib"))
+    for h, space, reg, uav, want, name in SM2_POOL_SHADERS:
+        if os.path.isfile(sm2_shader_file(h)) and not args.force:
+            built += 1
+            continue
+        tag = f"{h:016x}"
+        orig = os.path.join(work, tag + ".dxil"); ll = os.path.join(work, tag + ".ll"); edited = os.path.join(work, tag + "-raw.ll")
+        asm = os.path.join(work, tag + "-raw.dxil"); signed = os.path.join(work, tag + "-signed.dxil")
+        steps = [([tool, "extract", exe, tag, orig], "extract from the exe"),
+                 ([os.path.join(DXC_DIR, "bin", "dxc"), "-dumpbin", orig, "-Fc", ll], "dxc -dumpbin"),
+                 ([tool, "rewrite", ll, edited, str(space), str(reg), "uav" if uav else "srv"], "typed -> raw rewrite"),
+                 ([os.path.join(DXC_DIR, "bin", "dxa"), "-o", asm, edited], "dxa"),
+                 ([os.path.join(DXC_DIR, "bin", "dxv"), asm, "-o", signed], "dxv")]
+        failed = None
+        for cmd, what in steps:
+            r = run(cmd, env=env, timeout=300)
+            if r.returncode != 0:
+                failed = f"{what}: {(r.stderr or r.stdout).strip()[-500:]}"
+                break
+        if failed:
+            bad(f"{name}: {failed}")
+            continue
+        with open(signed, "rb") as f:
+            data = f.read()
+        got = fnv1_64(data)
+        if data[:4] != b"DXBC":
+            bad(f"{name}: dxv did not produce a DXBC container")
+            continue
+        if got != want:
+            warn(f"{name}: result hash {got:016x} differs from the verified {want:016x} (a different DXC build?); installing it anyway, dxv validated it")
+        replace_file(signed, sm2_shader_file(h))
+        ok(f"{name}: built ({len(data)} bytes, hash {got:016x})")
+        built += 1
+    shutil.rmtree(work, ignore_errors=True)
+    if built == len(SM2_POOL_SHADERS):
+        ok(f"all {built} shaders in {SM2_SHADER_DIR}; the pool fix is on at the next launch (shim log: 'pool fix: ON')")
+    else:
+        bad(f"{built} of {len(SM2_POOL_SHADERS)} shaders built; the shim keeps the pool fix OFF until all are present")
+        sys.exit(1)
 
 
 def cmd_kill(args):
@@ -2356,6 +2524,10 @@ def main(argv=None):
     s.add_argument("--stall-fps", type=float, default=8.0)
     s.set_defaults(fn=cmd_watch)
     sub.add_parser("doctor", help="health check").set_defaults(fn=cmd_doctor)
+    s = sub.add_parser("sm2-shaders", help="build Spider-Man 2's pool-fix shaders (symbiote glitch + T-pose at the root; needs tools/dev/build-dxc.sh once)")
+    s.add_argument("--status", action="store_true", help="only show which shaders are built")
+    s.add_argument("--force", action="store_true", help="rebuild even if present")
+    s.set_defaults(fn=cmd_sm2_shaders)
     sub.add_parser("kill", help="stop Steam and the Windows prefix").set_defaults(fn=cmd_kill)
     sub.add_parser("quit", help="same as kill: fully quit Steam (closing its window only hides it)").set_defaults(fn=cmd_kill)
     sub.add_parser("logs", help="show the latest launch log").set_defaults(fn=cmd_logs)

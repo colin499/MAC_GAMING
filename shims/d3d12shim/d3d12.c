@@ -14,6 +14,13 @@
 //   LAYOVER_STALL_FPS=<n>   stall detector (default 8): once the game has run 30 s above 20 fps, a 5 s window
 //                           below n fps logs one STALL line (fps, time per frame inside Present / ExecuteCommandLists /
 //                           fence waits, host memory and the game's working set) and RECOVERED when it is back.
+//   LAYOVER_POOL_FIX=0      turn OFF the pool fix (pool_fix.c, default on for Spider-Man2.exe): typed R32 buffer
+//                           views wider than 2^28 elements become raw views and the four shaders that use them
+//                           (skinning, vertex morph, the two symbiote spline-mesh index generators) are swapped
+//                           for raw-access copies in LAYOVER_POOL_SHADERS\sm2-pool-<hash>.dxil (built by
+//                           `layover sm2-shaders`). Fixes T-pose at the root and the symbiote's lost writes
+//                           (glitched tendrils + 60 -> 2 fps in Harry's scenes). Active only with all 4 files.
+//   LAYOVER_ALLOC_SURVEY=1  log every distinct ManagedBuffer allocation name (size, caller) and a table every minute.
 //   LAYOVER_TSSHIM=1        serve timestamp queries from the CPU clock (Highball's tsshim fix).
 //   LAYOVER_D3D12_LOG=<win path>  log what the game asks of D3D12 (feature queries, pools, views,
 //                           pipelines, command signatures, counters); LAYOVER_D3D12_VERBOSE=1 for all.
@@ -66,6 +73,16 @@ void sm2_skin_install(void);
 int sm2_known_build(void);
 void sm2_skin_stats(char *out, size_t cap);
 void sm2_skin_note_copy(UINT64 doff, UINT64 n);
+void pool_fix_install(HINSTANCE self);
+int pool_fix_active(void);
+int pool_fix_srv(const D3D12_SHADER_RESOURCE_VIEW_DESC *d, D3D12_SHADER_RESOURCE_VIEW_DESC *out);
+int pool_fix_uav(ID3D12Resource *counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC *d, D3D12_UNORDERED_ACCESS_VIEW_DESC *out);
+const void *pool_fix_replacement(const void *code, SIZE_T len, SIZE_T *out_len, const char **name);
+void pool_fix_note_result(int ok);
+SIZE_T pool_stream_sub_size(UINT type);
+long pool_stream_cs_offset(const void *stream, SIZE_T size);
+void pool_fix_stats(char *out, size_t cap);
+UINT64 pool_fnv1(const void *p, SIZE_T n);
 
 static HMODULE load_real(void)
 {
@@ -117,7 +134,8 @@ static void stall_note(const char *what, long fps10)
     ms.dwLength = sizeof ms;
     if (GlobalMemoryStatusEx(&ms)) snprintf(mem, sizeof mem, " | host: load %lu%% avail %llu MB of %llu, commit avail %llu MB", (unsigned long)ms.dwMemoryLoad, (unsigned long long)(ms.ullAvailPhys >> 20), (unsigned long long)(ms.ullTotalPhys >> 20), (unsigned long long)(ms.ullAvailPageFile >> 20));
     pm.cb = sizeof pm;
-    if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof pm)) snprintf(mem + strlen(mem), sizeof mem - strlen(mem), " | game: working set %llu MB (peak %llu) private %llu MB", (unsigned long long)(pm.WorkingSetSize >> 20), (unsigned long long)(pm.PeakWorkingSetSize >> 20), (unsigned long long)(pm.PrivateUsage >> 20));
+    // (Wine fills the classic counters only; PrivateUsage came back as garbage, so report the commit charge)
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof pm)) snprintf(mem + strlen(mem), sizeof mem - strlen(mem), " | game: working set %llu MB (peak %llu) commit %llu MB", (unsigned long long)(pm.WorkingSetSize >> 20), (unsigned long long)(pm.PeakWorkingSetSize >> 20), (unsigned long long)(pm.PagefileUsage >> 20));
     NOTE("%s: %ld.%ld fps%s", what, fps10 / 10, fps10 % 10, mem);
 }
 static DWORD WINAPI stats_thread(LPVOID arg)
@@ -138,7 +156,7 @@ static DWORD WINAPI stats_thread(LPVOID arg)
         // one STALL line with the memory picture; a RECOVERED line when it is back above 20 fps.
         if (fps10 >= 200) { if (good_windows < 6) good_windows++; if (stalled) { stall_note("RECOVERED", fps10); stalled = 0; } }
         else if (fps10 < stall_fps10 && good_windows >= 6 && !stalled) { stalled = 1; stall_note("STALL", fps10); }
-        if (pool_res) { char sk[300]; sm2_skin_stats(sk, sizeof sk); NOTE("pool: high-water %llu MB of %llu, copies %ld, past-end %ld | %s", (unsigned long long)(pool_hw >> 20), (unsigned long long)(pool_width >> 20), pool_copies, pool_oob, sk); }
+        if (pool_res) { char sk[300], pf[300]; sm2_skin_stats(sk, sizeof sk); NOTE("pool: high-water %llu MB of %llu, copies %ld, past-end %ld | %s", (unsigned long long)(pool_hw >> 20), (unsigned long long)(pool_width >> 20), pool_copies, pool_oob, sk); pool_fix_stats(pf, sizeof pf); NOTE("%s", pf); }
         if (fence_sleep) LOG("fence waits: episodes=%lld hist(<50us %ld, <200us %ld, <1ms %ld, <4ms %ld, <16ms %ld, <64ms %ld, <256ms %ld, more %ld) polls=%ld slept=%ld", (long long)fence_episodes, fence_hist[0], fence_hist[1], fence_hist[2], fence_hist[3], fence_hist[4], fence_hist[5], fence_hist[6], fence_hist[7], c_fence_polls, c_fence_sleeps);
         LOG("stats: presents=%ld (paced %ld) fence-polls=%ld (slept %ld) execlists=%ld dispatch=%ld dispatchmesh=%ld draw=%ld drawidx=%ld execind=%ld copybuf=%ld setpso=%ld map=%ld barrier=%ld | views srv_buf=%ld uav_buf=%ld srv_tex=%ld uav_tex=%ld | pso gfx=%ld cs=%ld gen=%ld FAIL=%ld | res buf=%ld tex=%ld",
             c_present, c_present_paced, c_fence_polls, c_fence_sleeps, c_execlists, c_dispatch, c_dispatchmesh, c_draw, c_drawidx, c_execind, c_copybuf, c_setpso, c_map, c_barrier, c_srv_buf, c_uav_buf, c_srv_tex, c_uav_tex, c_pso_gfx, c_pso_cs, c_pso_gen, c_pso_fail, c_res_buf, c_res_tex);
@@ -619,6 +637,8 @@ static HRESULT STDMETHODCALLTYPE hook_CreateHeap(ID3D12Device *dev, const D3D12_
 }
 static void STDMETHODCALLTYPE hook_CreateShaderResourceView(ID3D12Device *dev, ID3D12Resource *res, const D3D12_SHADER_RESOURCE_VIEW_DESC *d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
+    D3D12_SHADER_RESOURCE_VIEW_DESC raw;
+    if (pool_fix_srv(d, &raw)) { InterlockedIncrement(&c_srv_buf); real_CreateShaderResourceView(dev, res, &raw, h); return; }   // pool fix: wide typed view -> raw view
     if (d && d->ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
         InterlockedIncrement(&c_srv_buf);
         int interesting = d->Format == DXGI_FORMAT_R32G32B32_FLOAT || d->Format == DXGI_FORMAT_R32G32B32_UINT || d->Format == DXGI_FORMAT_R32G32B32_SINT || d->Buffer.NumElements >= (1u << 24);
@@ -630,6 +650,8 @@ static void STDMETHODCALLTYPE hook_CreateShaderResourceView(ID3D12Device *dev, I
 }
 static void STDMETHODCALLTYPE hook_CreateUnorderedAccessView(ID3D12Device *dev, ID3D12Resource *res, ID3D12Resource *counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC *d, D3D12_CPU_DESCRIPTOR_HANDLE h)
 {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC raw;
+    if (pool_fix_uav(counter, d, &raw)) { InterlockedIncrement(&c_uav_buf); real_CreateUnorderedAccessView(dev, res, counter, &raw, h); return; }   // pool fix: wide typed view -> raw view
     if (d && d->ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
         InterlockedIncrement(&c_uav_buf);
         int interesting = d->Format == DXGI_FORMAT_R32G32B32_FLOAT || d->Buffer.NumElements >= (1u << 24) || counter;
@@ -649,7 +671,16 @@ static HRESULT STDMETHODCALLTYPE hook_CreateGraphicsPipelineState(ID3D12Device *
 }
 static HRESULT STDMETHODCALLTYPE hook_CreateComputePipelineState(ID3D12Device *dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC *d, REFIID riid, void **out)
 {
-    HRESULT hr = real_CreateComputePipelineState(dev, d, riid, out);
+    HRESULT hr; const void *alt; SIZE_T alt_len; const char *alt_name = "?";
+    // pool fix: one of the four typed-pool shaders -> its raw-access copy (falls back to the game's own on failure)
+    if (d && (alt = pool_fix_replacement(d->CS.pShaderBytecode, d->CS.BytecodeLength, &alt_len, &alt_name))) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC copy = *d; copy.CS.pShaderBytecode = alt; copy.CS.BytecodeLength = alt_len;
+        hr = real_CreateComputePipelineState(dev, &copy, riid, out);
+        pool_fix_note_result(SUCCEEDED(hr));
+        NOTE("pool fix: %s (hash %016llx) replaced by its raw-access copy: %s", alt_name, (unsigned long long)pool_fnv1(d->CS.pShaderBytecode, d->CS.BytecodeLength), SUCCEEDED(hr) ? "ok" : "FAILED, using the game's own shader");
+        if (SUCCEEDED(hr)) { InterlockedIncrement(&c_pso_cs); return hr; }
+    }
+    hr = real_CreateComputePipelineState(dev, d, riid, out);
     InterlockedIncrement(&c_pso_cs);
     if (FAILED(hr)) { InterlockedIncrement(&c_pso_fail); LOG("CreateComputePipelineState FAILED hr=0x%lx cs=%llu bytes hash=%016llx", (unsigned long)hr, d ? (unsigned long long)d->CS.BytecodeLength : 0, d ? (unsigned long long)fnv(d->CS.pShaderBytecode, d->CS.BytecodeLength) : 0); }
     else if (verbose && d) LOG("CreateComputePipelineState ok cs=%llu bytes hash=%016llx pso=%p", (unsigned long long)d->CS.BytecodeLength, (unsigned long long)fnv(d->CS.pShaderBytecode, d->CS.BytecodeLength), out ? *out : NULL);
@@ -657,22 +688,39 @@ static HRESULT STDMETHODCALLTYPE hook_CreateComputePipelineState(ID3D12Device *d
 }
 static HRESULT STDMETHODCALLTYPE hook_CreatePipelineState(ID3D12Device2 *dev, const D3D12_PIPELINE_STATE_STREAM_DESC *d, REFIID riid, void **out)
 {
-    HRESULT hr = real_CreatePipelineState(dev, d, riid, out);
+    HRESULT hr; long cs_at = -1;
+    // pool fix: a compute pipeline made through the stream API with one of the four shaders -> raw-access copy
+    if (d && d->pPipelineStateSubobjectStream && (cs_at = pool_stream_cs_offset(d->pPipelineStateSubobjectStream, d->SizeInBytes)) >= 0) {
+        const UINT8 *s = d->pPipelineStateSubobjectStream; const void *code; UINT64 len; const void *alt; SIZE_T alt_len; const char *alt_name = "?";
+        memcpy(&code, s + cs_at, 8); memcpy(&len, s + cs_at + 8, 8);
+        if ((alt = pool_fix_replacement(code, (SIZE_T)len, &alt_len, &alt_name))) {
+            UINT8 *copy = malloc(d->SizeInBytes);
+            if (copy) {
+                D3D12_PIPELINE_STATE_STREAM_DESC pd = *d; UINT64 al = alt_len;
+                memcpy(copy, s, d->SizeInBytes); memcpy(copy + cs_at, &alt, 8); memcpy(copy + cs_at + 8, &al, 8); pd.pPipelineStateSubobjectStream = copy;
+                hr = real_CreatePipelineState(dev, &pd, riid, out);
+                free(copy);
+                pool_fix_note_result(SUCCEEDED(hr));
+                NOTE("pool fix: %s (stream PSO) replaced by its raw-access copy: %s", alt_name, SUCCEEDED(hr) ? "ok" : "FAILED, using the game's own shader");
+                if (SUCCEEDED(hr)) { InterlockedIncrement(&c_pso_gen); return hr; }
+            }
+        }
+    }
+    hr = real_CreatePipelineState(dev, d, riid, out);
     InterlockedIncrement(&c_pso_gen);
-    // walk the stream for subobject types: 13=MS, 14=AS
+    // walk the stream for subobject types: 24=AS, 25=MS
     char types[256] = ""; size_t o = 0;
     if (d && d->pPipelineStateSubobjectStream) {
         const UINT8 *p = d->pPipelineStateSubobjectStream, *end = p + d->SizeInBytes;
-        static const UINT sz[] = { 8, 16, 16, 16, 16, 16, 16, 16, 16, 24, 4, 32, 8, 4, 4, 16, 36, 4, 8, 8, 8, 8, 16, 16, 8, 8, 8, 8 };
         while (p + 4 <= end) {
-            UINT t = *(const UINT *)p; if (t >= sizeof sz / sizeof *sz) break;
+            UINT t = *(const UINT *)p; SIZE_T step = pool_stream_sub_size(t);
+            if (!step) break;
             if (o < sizeof types - 8) o += snprintf(types + o, sizeof types - o, "%u,", t);
-            UINT step = 8 + sz[t]; if (t == 9 /*stream output*/) step = 8 + 40; if (t == 11 /*input layout*/) step = 8 + 16; if (t == 16 /*view instancing*/) step = 8 + 24; if (t == 1 /*VS*/ || t == 2 || t == 3 || t == 4 || t == 5 || t == 6 || t == 13 || t == 14) step = 8 + 16;
-            step = (step + 7) & ~7u; p += step;
+            p += step;
         }
     }
     if (FAILED(hr)) { InterlockedIncrement(&c_pso_fail); LOG("CreatePipelineState(stream) FAILED hr=0x%lx size=%llu types=%s", (unsigned long)hr, d ? (unsigned long long)d->SizeInBytes : 0, types); }
-    else if (verbose || strstr(types, "13,") || strstr(types, "14,")) LOG("CreatePipelineState(stream) ok size=%llu types=%s pso=%p", d ? (unsigned long long)d->SizeInBytes : 0, types, out ? *out : NULL);
+    else if (verbose || strstr(types, "24,") || strstr(types, "25,")) LOG("CreatePipelineState(stream) ok size=%llu types=%s pso=%p", d ? (unsigned long long)d->SizeInBytes : 0, types, out ? *out : NULL);
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE hook_CreateCommandSignature(ID3D12Device *dev, const D3D12_COMMAND_SIGNATURE_DESC *d, ID3D12RootSignature *rs, REFIID riid, void **out)
@@ -1001,6 +1049,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         install_vram_cap();
         install_logpoints();
         sm2_skin_install();
+        pool_fix_install(inst);
         { char exe[MAX_PATH]; GetModuleFileNameA(NULL, exe, sizeof exe); LOG("d3dlog loaded in %s (pid %lu) tsshim=%d verbose=%d", exe, (unsigned long)GetCurrentProcessId(), tsshim, verbose); }
         CreateThread(NULL, 0, stats_thread, NULL, 0, NULL);   // 5-second pool usage line always; the rest only when logging
     }

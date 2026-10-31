@@ -243,10 +243,46 @@ static void resolve_imp_heap(void)
         return;
     }
 }
+// Allocation survey (LAYOVER_ALLOC_SURVEY=1): every distinct AllocateBuffer name (the game names its
+// pool allocations) with count, bytes, largest request and first caller, logged on first sight and as a
+// table every minute. Used to find which allocations a GPU-written effect (the symbiote's spline meshes)
+// lands in, so they can be steered below 1 GB like skinned models if the pool fix is unavailable.
+static int alloc_survey;
+#define SV_MAX 256
+static struct { char name[40]; UINT64 ret; volatile LONG count; volatile LONG64 bytes; UINT maxsz, fmt, datacopy, memloc; } sv[SV_MAX]; static volatile LONG sv_n; static CRITICAL_SECTION sv_lock;
+static void survey_alloc(Regs *r)
+{
+    UINT64 *sp = (UINT64 *)(r + 1); const char *nm = (const char *)sp[6]; char n[40] = "(null)"; UINT size = (UINT)r->r9; int i, k;
+    if (nm && shim_readable(nm, 40)) { for (i = 0; i < 39 && nm[i] >= 0x20 && nm[i] < 0x7f; i++) n[i] = nm[i]; n[i] = 0; }
+    if (n[0] == '[') return;   // model blobs are named "[<asset hash>]" (thousands of them, seen by on_model_arrived anyway)
+    { int w = 0; for (i = 0; n[i]; ) {   // collapse embedded hashes ("Lean LoD From 0x9aaa...") so one name covers them all
+          int hx = 0; while (((n[i + hx] >= '0' && n[i + hx] <= '9') || (n[i + hx] >= 'a' && n[i + hx] <= 'f')) && hx < 40) hx++;
+          if (hx >= 6) { n[w++] = '*'; i += hx; } else n[w++] = n[i++];
+      } n[w] = 0; }
+    EnterCriticalSection(&sv_lock);
+    for (k = 0; k < sv_n; k++) if (!strcmp(sv[k].name, n)) break;
+    if (k == sv_n) {
+        if (sv_n < SV_MAX) { sv_n++; strcpy(sv[k].name, n); sv[k].ret = sp[0] - (UINT64)exe_base; sv[k].fmt = (UINT)r->r8; sv[k].datacopy = (UINT)sp[7]; sv[k].memloc = (UINT)sp[8];
+            SNOTE("alloc survey: new name '%s' size %u fmt %u datacopy %u memloc %u heap %p ret exe+0x%llx", n, size, (UINT)r->r8, (UINT)sp[7], (UINT)sp[8], (void *)r->rdx, (unsigned long long)sv[k].ret); }
+        else k = -1;
+    }
+    if (k >= 0) { sv[k].count++; sv[k].bytes += size; if (size > sv[k].maxsz) sv[k].maxsz = size; }
+    LeaveCriticalSection(&sv_lock);
+}
+static void survey_dump(void)
+{
+    int k; static int calls;
+    if (!alloc_survey || (++calls % 12) != 1) return;
+    EnterCriticalSection(&sv_lock);
+    for (k = 0; k < sv_n; k++) if (sv[k].count) SNOTE("alloc table: '%s' x%ld %lld KB max %u KB fmt %u datacopy %u memloc %u ret exe+0x%llx", sv[k].name, sv[k].count, (long long)(sv[k].bytes >> 10), sv[k].maxsz >> 10, sv[k].fmt, sv[k].datacopy, sv[k].memloc, (unsigned long long)sv[k].ret);
+    LeaveCriticalSection(&sv_lock);
+}
+
 // pre-hook on AllocateBuffer (rcx mgr, rdx heap, r8 fmt, r9 size): impostor-heap accounting
 typedef void (*PFN_Free)(void *mgr, void *owner, void **rec);
 static void on_alloc(Regs *r)
 {
+    if (alloc_survey) survey_alloc(r);
     if (!imp_heap) { resolve_imp_heap(); if (imp_heap && plug) { void *p = plug; plug = NULL; ((PFN_Free)(exe_base + RVA_FREE))(g_mgr, NULL, &p); SNOTE("plug released"); } }
     if (imp_heap && (void *)r->rdx == imp_heap) {
         UINT64 size = r->r9 & 0xffffffff; LONG64 v = InterlockedExchangeAdd64(&imp_live, (LONG64)size) + (LONG64)size; LONG k = InterlockedIncrement(&imp_allocs); if (v > imp_peak) imp_peak = v;
@@ -303,6 +339,7 @@ void sm2_skin_stats(char *out, size_t cap)
 {
     if (!g_mgr) { out[0] = 0; return; }
     { char rg[300]; region_usage(rg, sizeof rg); shim_note("%s", rg); }
+    survey_dump();
     snprintf(out, cap, "static-low: moved %ld (%lld MB) left-high %ld | skin: models %ld skinned %ld moved %ld (live %lld MB, peak %lld, heap %u MB) freed %ld low-already %ld failed %ld skin-hw %lld heap-failed-bytes %llu alloc-internal: bytes %lld MB blocks %d freedesc %d | impostor: redirected %ld overflow %ld, own heap hw %lld MB of %llu failed-bytes %llu", st_static_moved, (long long)(st_static_bytes >> 20), st_static_full, st_models, st_skinned, st_moved, (long long)(st_live >> 20), (long long)(skin_peak >> 20), skin_mb, st_freed, st_already_low, st_fail, (long long)(skin_hw >> 20), (unsigned long long)(skin_heap ? *(UINT64 *)((UINT8 *)skin_heap + 0x4e0) : 0), (long long)(skin_heap ? *(INT64 *)((UINT8 *)skin_heap + 0xd0) >> 20 : 0), skin_heap ? *(int *)((UINT8 *)skin_heap + 0x114) : 0, skin_heap ? *(int *)((UINT8 *)skin_heap + 0x110) : 0, imp_redirected, imp_overflow, (long long)(imp_hw >> 20), (unsigned long long)(imp_req >> 20), (unsigned long long)(imp_heap ? *(UINT64 *)((UINT8 *)imp_heap + 0x4e0) : 0));
 }
 
@@ -340,7 +377,8 @@ void sm2_skin_install(void)
     if (GetEnvironmentVariableA("LAYOVER_SURVEY_MAX", v, sizeof v)) survey_max = atol(v);
     if (GetEnvironmentVariableA("LAYOVER_LOW_FLAGS", v, sizeof v)) low_flags = _strtoui64(v, NULL, 0);   // 0 = only skinned models
     if (GetEnvironmentVariableA("LAYOVER_LOW_RESERVE_MB", v, sizeof v)) low_reserve_mb = (UINT)atoi(v);   // LAYOVER_SKIN_LOG=2: how many model arrivals to log
-    InitializeCriticalSection(&skin_lock);
+    alloc_survey = GetEnvironmentVariableA("LAYOVER_ALLOC_SURVEY", v, sizeof v) >= 1 && atoi(v) != 0;
+    InitializeCriticalSection(&skin_lock); InitializeCriticalSection(&sv_lock);
     exe_base = (UINT8 *)GetModuleHandleA(NULL);
     g_mgr = exe_base + RVA_MGR;
     g_alloc = (PFN_Allocate)(exe_base + RVA_ALLOCATE); g_create_subheap = (PFN_CreateSubHeap)(exe_base + RVA_CREATE_SUBHEAP);

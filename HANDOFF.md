@@ -1,6 +1,69 @@
-# Handoff notes (2026-10-11; sixth session plus Fallout 4 set-up and smoothing)
+# Handoff notes (2026-10-31; symbiote stall root cause + pool fix)
 
 Read this first if you are a new agent (or future me) picking up Layover.
+
+## Spider-Man 2: the cinematic stalls are the symbiote's lost GPU writes (2026-10-31, fix built, shaders pending)
+
+Symptom (three times: 2026-10-24 22:00, 10-26 14:58/15:00/15:01, 10-31 16:25): during a cinematic where Harry
+uses the symbiote, Spider-Man "glitches out" and the game drops from 60 to 2 fps and lower (shim `frame:` lines:
+GPU fence waits grow 0.5 s -> 0.8 s -> 1.8 s per frame; draws per frame only ~2x normal; no new PSOs, heaps or
+failures; working set 8.2 GB with 16+ GB free; RT off). The Oct 26 stalls recovered by themselves after 15-40 s
+(shot changes); Oct 24 and 31 the user quit.
+
+Root cause (documented and fixed publicly by macprotips/SpiderMan2Fix, public domain; its vendor report is the
+clearest write-up): D3DMetal on M1-M4 backs typed buffer views with Metal texture buffers, capped at 2^28
+elements. The game views its 2046 MB ManagedBuffer pool through typed R32_UINT SRVs/UAVs of 536,346,624
+elements. Typed READS above element 2^28 (1 GB) return 0 (the T-pose; sm2_skin.c works around it by moving the
+DATA low) and typed WRITES there are silently LOST. Two compute shaders, CS_AnimSplineMeshGenIndices and its
+Finalize, write the symbiote spline meshes' triangle indices into the pool every frame through such a UAV; above
+1 GB nothing lands, and the tendrils are drawn from whatever bytes are there: spikes/sheets/giant triangles that
+cost the GPU seconds per frame. That is both the glitch and the stall, and why it recovers when the shot ends.
+
+Fix (implemented, NOT yet active because its shaders are not built):
+- `shims/d3d12shim/pool_fix.c` (on by default for Spider-Man2.exe, `LAYOVER_POOL_FIX=0` off): typed 32-bit
+  buffer views wider than 2^28 elements are created as RAW views, and the four shaders that use them are
+  swapped at pipeline creation (CreateComputePipelineState and the stream API) by 64-bit FNV-1 hash for
+  rewritten copies whose typed loads/stores are raw loads/stores at index*4:
+  3d50acdb571dce22 CS_ModelSkinning (SRV t1), 14902794dd7134e4 vertex morph (SRV t0),
+  9538ca33c087a84c CS_AnimSplineMeshGenIndices (UAV u1), 125a4957ab64d24d ...Finalize (UAV u1).
+  Both halves go together (a raw view under a typed shader reads garbage), so the fix is active ONLY when the
+  exe is the known build and all four files `sm2-pool-<hash>.dxil` load from LAYOVER_POOL_SHADERS
+  (`~/Library/Application Support/Layover/tools/sm2-shaders`, set by write_shim_env). Otherwise the 5 s stats
+  carry `pool-fix: off (shaders not built) | wide typed views seen srv N uav N`. All four hashes were verified
+  present in this exe (v2.810.0.0, hashcheck over all 2061 DXBC containers).
+- `layover sm2-shaders` builds the copies from the game's own exe: extract container by hash ->
+  `dxc -dumpbin` -> `tools/sm2shaderfix rewrite` (their C rewriter, vendored verbatim, Unlicense) ->
+  `dxa` -> `dxv` (validate + sign) -> hash check against their verified results -> install. `--status` shows.
+- The DXC tools (dxc, dxa, dxv) must be built from source once: `tools/dev/build-dxc.sh` (pinned to the DXC
+  commit they verified with, so the hashes match; 30-60 min; installs cmake + ninja via brew; output
+  `~/Library/Application Support/Layover/tools/dxc`). The agent sandbox refused to clone/build external code
+  and to compile+run the vendored rewriter, so THE USER has to run: `tools/dev/build-dxc.sh` then
+  `layover sm2-shaders`, then play. `layover flight` warns while the shaders are missing.
+- Expectations once ON: shim log `pool fix: ON`, `pool fix: <name> replaced by its raw-access copy: ok` x4
+  during loading, `raw views srv N uav N` counting up, no stall in Harry's scenes, symbiote tendrils drawn
+  properly. sm2_skin steering stays on (harmless, proven); it could be retired later by setting
+  LAYOVER_SKIN_MB=0 and checking the city for T-poses and gray buildings.
+- Fallback (steer the spline-mesh data low like skinned models) was tried 2026-10-31 evening in three unattended
+  runs (tools/dev/drive3.sh: `layover play`, Play, Continue; the slot-1 save replays the Harry cinematic and the
+  stall reproduces every time ~95 s after Continue, 60 -> 4-6 fps for 20-40 s, twice per run). `LAYOVER_ALLOC_SURVEY=1`
+  (sm2_skin.c; model names "[hash]" skipped, embedded hashes collapsed) saw only ~15 distinct AllocateBuffer names
+  besides models and "Lean LoD From *": WaterManager::Initialize, BasicPrim, Default Model *, Weather Particle
+  Indices (fmt 57), AnimVertSmoothInfo2::m_Stitch*, ModelStitchInst::AllocAssetData, Asset, VFX Key-frames data,
+  "(null)" (impostors), and the hero_spiderman_miles_venomxray / _up models (skinned, already moved low). Nothing
+  spline-mesh-like: the symbiote index buffer is NOT an AllocateBuffer allocation (frame/transient allocator or a
+  region inside a model blob), so steering is not available without more reverse engineering. The shader
+  rewrite (pool fix) is the path. The stall capture (logs/stall-2026-10-31_16-51-43.txt) showed MTLCompilerService
+  at 0 % and every thread waiting: GPU-bound, not a compile storm.
+- The user ran tools/dev/build-dxc.sh once at 17:00: cmake configured, ninja stopped after ~7 s (a few TableGen
+  objects; cause unknown, no log then). The script now tees to logs/build-dxc.log; read it if it fails again.
+
+Also fixed today: the watchdog (`layover watch`) never attached to the game (both 10-26 and 10-31 said "the
+game did not start") because it matched `steamapps/common` while Wine shows the Windows command line with
+backslashes; `is_game_process()` now handles both, so stall captures (logs/stall-*.txt with `sample`) work.
+The health line and the stall capture now include MTLCompilerService CPU (a stall with it high is a shader
+compile storm, not the GPU). The shim's STALL line reports commit instead of the garbage "private" value.
+The game's gray mid-distance blocks (below) may well be the same typed-view bug in another shader; check them
+again once the pool fix is on.
 
 ## Spider-Man 2 stall during a cinematic (2026-10-24 22:00:58, cause NOT found; diagnostics added)
 

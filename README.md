@@ -176,6 +176,12 @@ window back to the front to continue.
 * **A game update** (Spider-Man 2 patches) changes the executable; the shim checks the exe's build
   stamp and turns its game-specific patches off instead of patching the wrong code. Characters would
   T-pose again until the shim is updated for the new build (see HANDOFF.md).
+* **Spider-Man 2's symbiote scenes** (Harry's or Venom's tendrils) glitch and drop to 2 fps until the
+  pool fix is on: D3DMetal on M1-M4 loses typed buffer writes past 1 GB of the game's mesh pool, so the
+  tendrils are drawn from garbage. The shim's pool fix (`shims/d3d12shim/pool_fix.c`, after
+  macprotips/SpiderMan2Fix) makes those views raw and swaps the four shaders involved for raw-access copies
+  built from your own copy of the game: run `tools/dev/build-dxc.sh` once (Microsoft's shader tools, 30-60
+  min) and then `layover sm2-shaders`. `layover flight` says whether the shaders are built.
 * **Performance** is below a Windows PC. DX11 games through DXMT are generally good on an M4 Pro;
   DX12 games vary a lot.
 * **Steam's UI** runs with GPU rendering off (`-cef-disable-gpu`), so store pages are a bit
@@ -214,9 +220,10 @@ and dxmt.report for DXMT-specific game notes.
 layover            the program (Python 3, no dependencies beyond macOS)
 wrapper/           steamwebhelper wrapper: prebuilt .exe plus C source (rebuilds with brew's mingw-w64)
 shims/amd_ags/     AMD AGS replacement DLL: prebuilt .dll plus C++ source and AMD's header (make rebuilds it)
-shims/d3d12shim/   our d3d12.dll in front of D3DMetal: Spider-Man 2 T-pose fix (sm2_skin.c), frame limiter,
-                   fence spin-wait relief, frame timing + stall detector, optional D3D12 trace. `make` rebuilds it;
-                   every launch deploys it
+shims/d3d12shim/   our d3d12.dll in front of D3DMetal: Spider-Man 2 T-pose fix (sm2_skin.c), pool fix (pool_fix.c:
+                   typed pool views -> raw + rewritten shaders, fixes the symbiote), frame limiter, fence spin-wait
+                   relief, frame timing + stall detector, optional D3D12 trace. `make` rebuilds it; every launch deploys it
+tools/sm2shaderfix/ the shader rewriter behind `layover sm2-shaders` (C, from macprotips/SpiderMan2Fix, public domain)
 tools/dev/         agent tooling: drive the game unattended, disassembly helpers, minidump reader
 Layover.command    double-click launcher for the menu
 ~/Library/Application Support/Layover/
