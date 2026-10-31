@@ -2036,6 +2036,12 @@ def cmd_watch(args):
                     w(f"recovered: {fps:.1f} fps")
                     stalled = False
             elif fps < args.stall_fps and good >= 6 and not stalled:
+                if fps == 0:   # no presents at all: usually the game shutting down, not a stall; give it a moment
+                    time.sleep(3)
+                    try:
+                        os.kill(pid, 0)
+                    except OSError:
+                        break
                 stalled = True
                 reason = f"after {good * 5}+ s above 20 fps"
                 w(f"STALL: {fps:.1f} fps {reason}")

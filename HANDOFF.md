@@ -2,7 +2,15 @@
 
 Read this first if you are a new agent (or future me) picking up Layover.
 
-## Spider-Man 2: the cinematic stalls are the symbiote's lost GPU writes (2026-10-31, fix built, shaders pending)
+## Spider-Man 2: the cinematic stalls are the symbiote's lost GPU writes (2026-10-31, FIXED: pool fix ON)
+
+RESULT 2026-10-31 17:10: the user built the DXC tools (tools/dev/build-dxc.sh, ~4 min on the M4 Pro once the
+build folder had no space in its path) and `layover sm2-shaders` produced the four shaders, byte-identical to
+SpiderMan2Fix's verified ones. Verification run (drive3.sh poolfix1, log d3d12-2026-10-31_17-10-23.log): `pool fix:
+ON`, 4 shaders replaced ok, wide SRV + UAV made raw, and a flat 60 fps for the whole 170 s after Continue, through
+both windows where the three baseline runs of the same save collapsed to 4-6 fps. The user watched; ask about the
+look of the tendrils. The watchdog now ignores a 0 fps window when the game is exiting (shutdown false positive).
+Before the fix, the details:
 
 Symptom (three times: 2026-10-24 22:00, 10-26 14:58/15:00/15:01, 10-31 16:25): during a cinematic where Harry
 uses the symbiote, Spider-Man "glitches out" and the game drops from 60 to 2 fps and lower (shim `frame:` lines:
