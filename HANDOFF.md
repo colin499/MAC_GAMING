@@ -1,6 +1,44 @@
-# Handoff notes (2026-10-31; symbiote stall root cause + pool fix)
+# Handoff notes (2026-11-01: library app + generic backend; 2026-10-31: symbiote stall root cause + pool fix)
 
 Read this first if you are a new agent (or future me) picking up Layover.
+
+## Library app + "any game" backend (2026-11-01)
+
+The pinball menu (app/menu.swift) is gone (git history 61ecc8f); Layover.app is now a long-lived AppKit library
+window, `app/LayoverApp/*.swift` (Model, Theme, Backend, Covers, GameTile, DetailPane, LibraryView, AppDelegate,
+Snapshot, main), built by `app_binary()` in `layover` (CLT swiftc, `-swift-version 5 -target arm64-apple-macosx14.0`,
+SDK fallback MacOSX15* because the CLT default SDK 26.2 is newer than swiftc 6.1.2). The bundle's zsh shim exports
+LAYOVER_SCRIPT/LAYOVER_PYTHON and execs LayoverApp; without it, `layover app-launch` (AppleScript list) is the
+fallback. The app polls `layover library --json --include-free` (2 s while something downloads or an action is
+pending, 10 s idle, on activate) and runs actions as subprocesses (`play/install/remove/game/profile/compat ... --json`,
+`steam`, `kill`, `flight --set-offline|--online`); everything it runs is appended to logs/app.log.
+Headless check: `./layover app --snapshot out.png`, or `LayoverApp --mock app/LayoverApp/fixtures/downloading.json
+--snapshot out.png --select 440 --pending 480:install` (fixtures = saved library documents, hand-edited for states).
+
+Backend facts (all local, no API key): `appcache/packageinfo.vdf` (magic 0x06565528; package 0 = Steam's
+complimentary set of 196 appids, other packages = purchases: 103387 -> Fallout 4, 1219797 -> Spider-Man 2 + DLC
+3172650) is the ownership source; `appcache/appinfo.vdf` is v29 (magic 0x07564429, string table at the int64 at
+byte 8, record header 60 bytes = 40 + the 20-byte hash added in v28, then binary KeyValues with u32 string-table
+keys; `launch` entries carry a BetaKey list on EVERY entry and "default" marks the public ones);
+`librarycache/assetcache.vdf` maps appid -> {0f capsule, 1f hero, 2f logo, 3f header, 4f icon, 5f hero_blur},
+newer Steam stores them in sha-named subfolders. Parsed once per file mtime into cache/appinfo.json and
+cache/packageinfo.json. This account owns 2 paid games + the free tier (TF2, Dota 2, Spacewar, SFM, FiveM, RedM).
+Covers missing locally come from cdn.cloudflare.steamstatic.com/steam/apps/<id>/library_600x900.jpg (then
+shared.cloudflare.steamstatic.com/store_item_assets/...), into covers/<appid>/<kind>.jpg, by Python
+(`layover covers --fetch`) or by the app (URLSession); 404s are remembered in covers/<appid>/missing.json for 7 days.
+
+`layover compat`: `scan_game_binaries()` (the old game_uses_dx12 generalised: d3d9/10/11/12, vulkan, opengl,
+mscoree, anti-cheat folders/files, *launcher*.exe), cached per buildid in cache/compat/<appid>.json together with
+the store API (appdetails: platforms, DirectX in pc_requirements, drm_notice) and ProtonDB's summary endpoint
+(unofficial), both at most weekly; verdict rules in `compat_verdict()`. `library --json` only reads that cache.
+`PROFILES` (keyed by AppID or "exe:<glob>"): settings/env/ini/launch_options/launcher/notes/checks;
+`apply_profile_if_pending()` runs from cmd_play; user-set values win unless `profile --reset`; INI edits via
+`ini_set()` (order/CRLF preserving, .bak-layover once) under the prefix's Documents (a real folder now, not the
+old symlink); launch options need Steam fully stopped (`set_launch_options`, exit code 6). Exit codes: 3 not
+found/not installed, 4 Steam needs the user, 5 not set up, 6 Steam must be closed; JSON mode moves ok/warn/info
+to stderr. Not done yet: DX9/10 games (no DXVK renderer), external-drive libraries, Fallout 4's launcher click,
+and the Spider-Man 2 gray mid-distance blocks (below).
+
 
 ## Spider-Man 2: the cinematic stalls are the symbiote's lost GPU writes (2026-10-31, FIXED: pool fix ON)
 

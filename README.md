@@ -28,22 +28,42 @@ cd ~/Documents/BRAIN_FOOD/MAC_GAMING
 ```
 
 **No Terminal needed after setup:** `./layover app` (setup does this too) puts **Layover.app** in
-`~/Applications`. Double-click it, or Cmd-Space → "Layover": a pinball-backglass menu (app/menu.swift,
-compiled into the app by `layover app`) lists your installed Windows games on lit inserts, with Open
-Steam / Quit Steam / Flight mode / Back online as rollover buttons and a dot-matrix display showing
-Steam's state. Click, or use arrows + Enter, or the number keys. Pick a game and it launches, starting
-Steam first if needed. Drag the app to the Dock to keep it there. If the menu cannot be built (no
-Swift compiler) the app falls back to a plain list dialog. `Layover.command` still opens the text menu
-in Terminal.
+`~/Applications`. Double-click it, or Cmd-Space → "Layover": a library window (app/LayoverApp/*.swift, AppKit,
+compiled into the app by `layover app`) shows every game you own on Steam as cover art, installed or not, with
+Install / Play / Update / Remove buttons, download progress, size on disk, free disk space, a compatibility
+verdict per game, search, filters (All / Installed / Not installed), and a detail pane with per-game launch
+settings (renderer, fps cap, retina, MetalFX) and Layover's recommended-settings profile. The status bar shows
+Steam's state and account, and has the Flight mode switch. Arrows move, Enter plays or installs, Delete removes,
+Cmd-F searches, Cmd-R refreshes. Install and Remove go through Steam, which asks you to confirm in its own window;
+the app keeps polling Steam's files and updates the tile as the download runs. Drag the app to the Dock to keep
+it there. If the window cannot be built (no Swift compiler) the app falls back to a plain list dialog.
+`Layover.command` still opens the text menu in Terminal. `./layover app --snapshot out.png` renders the window
+to a PNG without showing it (how an agent session checks the UI; `--mock`, `--select`, `--pending` exist too).
+
+Where the list comes from: Steam's own local caches in the Wine prefix (`appcache/packageinfo.vdf` = your
+licenses, `appinfo.vdf` = names/types/launch entries, `librarycache/` = art), so no API key is needed; an
+optional `layover config steam_api_key <key>` adds the Web API's exact list (`layover library --refresh`).
 
 Sign in to Steam, install games as usual (they download into the Wine prefix),
 then:
 
 ```bash
+./layover library               # everything you own: installed or not, size, renderer, compatibility
 ./layover games                 # what is installed (Windows prefix + native Mac Steam)
-./layover play "elden ring"     # launch by name or AppID
-./layover install 1245620       # start a download by AppID
+./layover play "elden ring"     # launch by name or AppID (applies the game's profile the first time)
+./layover install 1245620       # start a download by AppID or name (Steam asks where to put it)
+./layover remove "fallout 4"    # uninstall through Steam (it asks to confirm)
+./layover compat "elden ring"   # will it run? DirectX version, anti-cheat, Steam Deck rating, ProtonDB tier
+./layover profile "fallout 4"   # Layover's recommended settings for a game (--apply / --reset)
+./layover covers --fetch        # cover art for the library window (the app also fetches on its own)
 ```
+
+**From purchase to playing:** buy the game in Steam (or `layover store <appid>`), open Layover.app, press
+Install on its tile, confirm Steam's dialog, watch the download, press Play. The first launch applies the game's
+profile if Layover has one (Spider-Man 2 and Fallout 4 today; `PROFILES` in `layover`: settings, INI edits,
+notes, keyed by AppID or launch-exe pattern), the renderer is picked from the game's DirectX version, and
+`layover compat` tells you beforehand whether it is worth downloading: games with kernel anti-cheat (Easy
+Anti-Cheat, BattlEye, Vanguard) are marked "Won't run", DirectX 9-only games "Likely issues" (no DX9 path yet).
 
 To run `layover` from anywhere: `ln -s ~/Documents/BRAIN_FOOD/MAC_GAMING/layover /opt/homebrew/bin/layover`
 
@@ -217,7 +237,9 @@ and dxmt.report for DXMT-specific game notes.
 ## Layout
 
 ```
-layover            the program (Python 3, no dependencies beyond macOS)
+layover            the program (Python 3, no dependencies beyond macOS); `library --json` is what Layover.app reads
+app/LayoverApp/    the library window (Swift, AppKit; `layover app` compiles it into ~/Applications/Layover.app);
+                   fixtures/ holds saved library documents for `LayoverApp --mock ... --snapshot`
 wrapper/           steamwebhelper wrapper: prebuilt .exe plus C source (rebuilds with brew's mingw-w64)
 shims/amd_ags/     AMD AGS replacement DLL: prebuilt .dll plus C++ source and AMD's header (make rebuilds it)
 shims/d3d12shim/   our d3d12.dll in front of D3DMetal: Spider-Man 2 T-pose fix (sm2_skin.c), pool fix (pool_fix.c:
@@ -232,5 +254,7 @@ Layover.command    double-click launcher for the menu
   downloads/       cached archives (checksums pinned in `layover`)
   logs/            launch logs (steam-*), per-run d3d12 shim logs (d3d12-*), app.log (Layover.app); the 20 newest are kept
                    watch.log (game watchdog health lines), stall-*.txt (process sample + memory/thermal state at a stall)
+  cache/           parsed Steam app info + licenses (appinfo.json, packageinfo.json), compat/<appid>.json verdicts
+  covers/<appid>/  cover art fetched from Steam's CDN (capsule.jpg, header.jpg, hero.jpg)
   config.json      your settings
 ```

@@ -18,6 +18,7 @@ Usage:  layover <command> [options]      (run `layover help` for the list)
 
 import argparse
 import datetime as _dt
+import fnmatch
 import glob
 import hashlib
 import json
@@ -25,10 +26,12 @@ import os
 import plistlib
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
 import time
+import urllib.error
 import urllib.request
 
 APP_NAME = "Layover"
@@ -75,6 +78,14 @@ LEGACY_ENGINES = [os.path.join(ENGINES, "wine-staging-11.18"), os.path.join(ENGI
 STEAM_DIR_WIN = r"C:\Program Files (x86)\Steam"
 STEAM_DIR = os.path.join(PREFIX, "drive_c", "Program Files (x86)", "Steam")
 STEAM_EXE = os.path.join(STEAM_DIR, "steam.exe")
+APPCACHE = os.path.join(STEAM_DIR, "appcache")                  # Steam's local knowledge: apps, licenses, library art
+APPINFO_VDF = os.path.join(APPCACHE, "appinfo.vdf")
+PACKAGEINFO_VDF = os.path.join(APPCACHE, "packageinfo.vdf")
+LIBRARYCACHE = os.path.join(APPCACHE, "librarycache")
+ASSETCACHE_VDF = os.path.join(LIBRARYCACHE, "assetcache.vdf")
+USERDATA = os.path.join(STEAM_DIR, "userdata")
+CACHE_DIR = os.path.join(ROOT, "cache")                         # parsed appcache + compatibility lookups (CACHE above = downloads)
+COVERS = os.path.join(ROOT, "covers")                           # cover art fetched from Steam's CDN (covers/<appid>/<kind>.jpg)
 NATIVE_STEAM_DIR = os.path.join(HOME, "Library", "Application Support", "Steam")
 NATIVE_STEAM_APP = "/Applications/Steam.app"
 
@@ -116,8 +127,10 @@ DEFAULT_CONFIG = {
     # spatial upscaling fill the panel; 2 with retina off = full-panel output from a 1728x1117 render),
     # env {...}. A game whose settings differ from the running Steam's gets Steam restarted first.
     "games": {},
+    "steam_api_key": "",       # optional: exact owned-games list via the Steam Web API (steamcommunity.com/dev/apikey)
+    "online_lookups": True,    # `layover compat` may ask the Steam store and ProtonDB (cached 7 days; never on the library path)
 }
-GAME_KEYS = ("renderer", "msync", "fps_cap", "metal_hud", "steam_overlay", "retina", "metalfx")
+GAME_KEYS = ("renderer", "msync", "fps_cap", "metal_hud", "steam_overlay", "retina", "metalfx", "advertise_avx", "d3dmetal_identity")
 
 MICROSOFT_VID = 0x045E
 
@@ -127,24 +140,41 @@ class C:
     B = "\033[1m"; G = "\033[32m"; Y = "\033[33m"; R = "\033[31m"; D = "\033[2m"; X = "\033[0m"
 
 
+JSON_MODE = False   # set by main() for `--json` runs: stdout carries one JSON document, messages go to stderr
+
+
 def tty():
     return sys.stdout.isatty()
+
+
+def _out():
+    return sys.stderr if JSON_MODE else sys.stdout
 
 
 def paint(s, col):
     return f"{col}{s}{C.X}" if tty() else s
 
 
-def ok(msg): print(paint("  ✓ ", C.G) + msg)
-def warn(msg): print(paint("  ! ", C.Y) + msg)
-def bad(msg): print(paint("  ✗ ", C.R) + msg)
-def info(msg): print(paint("  · ", C.D) + msg)
-def head(msg): print("\n" + paint(msg, C.B))
+def ok(msg): print(paint("  ✓ ", C.G) + msg, file=_out())
+def warn(msg): print(paint("  ! ", C.Y) + msg, file=_out())
+def bad(msg): print(paint("  ✗ ", C.R) + msg, file=_out())
+def info(msg): print(paint("  · ", C.D) + msg, file=_out())
+def head(msg): print("\n" + paint(msg, C.B), file=_out())
 
 
 def die(msg, code=1):
-    bad(msg)
+    """Exit codes: 1 error, 3 not found / not installed, 4 Steam needs the user, 5 not set up, 6 Steam must be closed."""
+    if JSON_MODE:
+        print(json.dumps({"ok": False, "error": msg, "code": code}))
+    else:
+        bad(msg)
     sys.exit(code)
+
+
+def emit(payload):
+    """The result document of an action in `--json` mode (nothing otherwise: the human lines were printed)."""
+    if JSON_MODE:
+        print(json.dumps(payload))
 
 
 def run(cmd, **kw):
@@ -184,7 +214,7 @@ def save_config(cfg):
 
 
 def ensure_dirs():
-    for d in (ROOT, CACHE, ENGINES, RENDERERS, LOGS, TOOLS, os.path.dirname(PREFIX)):
+    for d in (ROOT, CACHE, ENGINES, RENDERERS, LOGS, TOOLS, CACHE_DIR, COVERS, os.path.dirname(PREFIX)):
         os.makedirs(d, exist_ok=True)
 
 
@@ -313,56 +343,6 @@ def extract(archive, dest):
 
 
 # --------------------------------------------------------------------------- renderer choice
-def game_uses_dx12(game):
-    """Does this game need DirectX 12? Looks for the Agility SDK folder (D3D12/) or a
-    *_dx12.dll next to the executables, then string-scans every .exe for its d3d12.dll /
-    d3d11.dll imports. The scan reads whole files: Spider-Man 2's exe is 194 MB and its
-    import table sits past the first 64 MB. Result is cached per AppID once known."""
-    lib = game.get("library")
-    installdir = game.get("installdir")
-    if not lib or not installdir:
-        return None
-    root = os.path.join(os.path.dirname(lib), "steamapps", "common", installdir) if not lib.endswith("steamapps") else os.path.join(lib, "common", installdir)
-    if not os.path.isdir(root):
-        return None
-    hits = {"d3d12": False, "d3d11": False}
-    for dirpath, dirs, files in os.walk(root):
-        if dirpath[len(root):].count(os.sep) > 2:
-            dirs[:] = []
-            continue
-        if any(d.lower() == "d3d12" for d in dirs):      # DirectX 12 Agility SDK ships here
-            hits["d3d12"] = True
-        for fn in files:
-            low = fn.lower()
-            if low.endswith("_dx12.dll") or low == "d3d12core.dll":
-                hits["d3d12"] = True
-            if not low.endswith(".exe"):
-                continue
-            fp = os.path.join(dirpath, fn)
-            try:
-                if os.path.getsize(fp) < 512 * 1024:
-                    continue
-                with open(fp, "rb") as f:
-                    tail = b""
-                    while True:
-                        chunk = f.read(16 << 20)
-                        if not chunk:
-                            break
-                        blob = (tail + chunk).lower()
-                        if b"d3d12.dll" in blob:
-                            hits["d3d12"] = True
-                        if b"d3d11.dll" in blob:
-                            hits["d3d11"] = True
-                        tail = chunk[-16:]
-            except OSError:
-                continue
-    if hits["d3d12"]:
-        return True
-    if hits["d3d11"]:
-        return False
-    return None
-
-
 def resolve_renderer(cfg, game=None, games=None):
     """Turn 'auto' into a concrete renderer. With a specific game: that game's need. Without
     one (plain `layover steam`): D3DMetal if any installed game needs DirectX 12, so that
@@ -1024,8 +1004,19 @@ def installed_games(steamapps):
                     "needs_update": bool(flags & (2 | 256 | 1024)) or flags not in (4,),
                     "library": lib,
                     "installdir": st.get("installdir", ""),
+                    "bytes_to_download": _int(st.get("BytesToDownload")), "bytes_downloaded": _int(st.get("BytesDownloaded")),
+                    "bytes_to_stage": _int(st.get("BytesToStage")), "bytes_staged": _int(st.get("BytesStaged")),
+                    "last_updated": _int(st.get("LastUpdated")), "last_played": _int(st.get("LastPlayed")),
+                    "buildid": st.get("buildid", ""), "target_buildid": st.get("TargetBuildID", ""),
                 })
     return games
+
+
+def _int(v, default=0):
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return default
 
 
 def all_games():
@@ -1049,7 +1040,7 @@ def find_game(query, games):
     subs = [g for g in games if q in g["name"].lower()]
     if len(subs) == 1:
         return subs[0]
-    if not subs:
+    if not subs or JSON_MODE:
         return None
     print("  Which one?")
     for i, g in enumerate(subs, 1):
@@ -1139,6 +1130,619 @@ def set_offline_mode(where, offline):
     with open(p, "w") as f:
         f.write(text)
     return True
+
+
+
+# --------------------------------------------------------------------------- steam appcache (binary KeyValues)
+# Steam keeps what it knows about apps and licenses in binary KeyValues files under appcache/, and that is
+# what its own library view is built from. No network, no API key:
+#   appinfo.vdf                   one record per app the client has seen (owned, installed, store pages): name,
+#                                 type, oslist, launch entries, installdir, Steam Deck rating. v27/v28/v29 headers.
+#   packageinfo.vdf               one record per license package the account holds. Package 0 is Steam's
+#                                 complimentary set (TF2, Dota 2, demos, tools); every other package is a purchase.
+#   librarycache/assetcache.vdf   appid -> the cover/hero/header/logo files cached for the library UI (newer Steam
+#                                 puts them in sha-named subfolders of librarycache/<appid>/).
+BINKV_END = (0x08, 0x0B)
+ASSET_SLOTS = {"0f": "capsule", "1f": "hero", "2f": "logo", "3f": "header", "4f": "icon", "5f": "hero_blur"}
+COVER_KINDS = ("capsule", "header", "hero", "logo", "icon", "hero_blur")
+COVER_FILES = {"capsule": ("library_600x900.jpg", "library_600x900_2x.jpg", "library_capsule.jpg"),
+               "header": ("header.jpg", "library_header.jpg"), "hero": ("library_hero.jpg",),
+               "logo": ("logo.png", "logo.jpg"), "icon": (), "hero_blur": ("library_hero_blur.jpg",)}
+COVER_CDN = ("https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/{file}",
+             "https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/{appid}/{file}")
+COVER_CDN_FILE = {"capsule": "library_600x900.jpg", "header": "header.jpg", "hero": "library_hero.jpg", "logo": "logo.png"}
+NON_GAME_TYPES = ("tool", "dlc", "config", "music", "video", "series", "depot", "hardware", "beta", "advertising", "guide", "mod", "plugin")
+STEAMID64_BASE = 76561197960265728
+UA = f"{APP_NAME}/{VERSION} (macOS)"
+# Valve's EAppState bits (appmanifest StateFlags)
+APP_STATE_BITS = {1: "uninstalled", 2: "update_required", 4: "fully_installed", 8: "encrypted", 16: "locked",
+                  32: "files_missing", 64: "app_running", 128: "files_corrupt", 256: "update_running", 512: "update_paused",
+                  1024: "update_started", 2048: "uninstalling", 4096: "backup_running", 65536: "reconfiguring",
+                  131072: "validating", 262144: "adding_files", 524288: "preallocating", 1048576: "downloading",
+                  2097152: "staging", 4194304: "committing", 8388608: "update_stopping"}
+DOWNLOADING_BITS = 256 | 1024 | 131072 | 262144 | 524288 | 1048576 | 2097152 | 4194304
+
+
+def binkv_read(data, pos, strings=None):
+    """Parse one binary KeyValues dict starting at pos. Returns (dict, position after the end marker).
+    Keys are NUL-terminated strings, or (appinfo v29) u32 indices into a string table."""
+    out = {}
+    n = len(data)
+    while pos < n:
+        t = data[pos]
+        pos += 1
+        if t in BINKV_END:
+            return out, pos
+        if strings is not None:
+            idx, = struct.unpack_from("<I", data, pos)
+            pos += 4
+            key = strings[idx] if idx < len(strings) else str(idx)
+        else:
+            e = data.index(b"\0", pos)
+            key = data[pos:e].decode("utf-8", "replace")
+            pos = e + 1
+        if t == 0x00:
+            val, pos = binkv_read(data, pos, strings)
+        elif t == 0x01:
+            e = data.index(b"\0", pos)
+            val = data[pos:e].decode("utf-8", "replace")
+            pos = e + 1
+        elif t == 0x02:
+            val, = struct.unpack_from("<i", data, pos); pos += 4
+        elif t == 0x03:
+            val, = struct.unpack_from("<f", data, pos); pos += 4
+        elif t in (0x04, 0x06):
+            val, = struct.unpack_from("<I", data, pos); pos += 4
+        elif t == 0x05:
+            e = pos
+            while data[e:e + 2] != b"\0\0":
+                e += 2
+            val = data[pos:e].decode("utf-16-le", "replace")
+            pos = e + 2
+        elif t == 0x07:
+            val, = struct.unpack_from("<Q", data, pos); pos += 8
+        elif t == 0x0A:
+            val, = struct.unpack_from("<q", data, pos); pos += 8
+        else:
+            raise ValueError(f"binary KeyValues: unknown node type {t:#x} at offset {pos - 1}")
+        out[key] = val
+    raise ValueError("binary KeyValues: unterminated dict")
+
+
+def parse_appinfo(path=APPINFO_VDF):
+    """{appid: appinfo dict} from Steam's appinfo.vdf (versions 0x27, 0x28, 0x29). ValueError on an unknown format.
+    Record: appid u32 (0 ends the file), size u32, 40-byte header (+20-byte hash from v28), binary KeyValues."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) < 16:
+        raise ValueError("appinfo.vdf: too short")
+    magic, _universe = struct.unpack_from("<II", data, 0)
+    ver = magic & 0xFF
+    if magic >> 8 != 0x075644 or ver not in (0x27, 0x28, 0x29):
+        raise ValueError(f"appinfo.vdf: unsupported format {magic:#x}")
+    strings = None
+    pos = 8
+    if ver >= 0x29:
+        st_off, = struct.unpack_from("<q", data, 8)
+        pos = 16
+        count, = struct.unpack_from("<I", data, st_off)
+        strings = []
+        p = st_off + 4
+        for _ in range(count):
+            e = data.index(b"\0", p)
+            strings.append(data[p:e].decode("utf-8", "replace"))
+            p = e + 1
+    header = 40 + (20 if ver >= 0x28 else 0)
+    apps = {}
+    while pos + 8 <= len(data):
+        appid, size = struct.unpack_from("<II", data, pos)
+        if appid == 0:
+            break
+        start = pos + 8
+        try:
+            kv, _ = binkv_read(data, start + header, strings)
+            apps[str(appid)] = kv.get("appinfo", kv)
+        except (ValueError, IndexError, struct.error):
+            pass   # one odd record must not hide the rest
+        pos = start + size
+    if not apps:
+        raise ValueError("appinfo.vdf: no readable records")
+    return apps
+
+
+def parse_packageinfo(path=PACKAGEINFO_VDF):
+    """{package id: {appids, depotids, billingtype, licensetype, status}} from packageinfo.vdf (the licenses)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    magic, _universe = struct.unpack_from("<II", data, 0)
+    if magic not in (0x06565527, 0x06565528):
+        raise ValueError(f"packageinfo.vdf: unsupported format {magic:#x}")
+    pos = 8
+    pkgs = {}
+    while pos + 4 <= len(data):
+        pkgid, = struct.unpack_from("<I", data, pos)
+        if pkgid == 0xFFFFFFFF:
+            break
+        pos += 4 + 20 + 4 + (8 if magic == 0x06565528 else 0)   # sha1, change number, (token)
+        kv, pos = binkv_read(data, pos)
+        body = kv.get(str(pkgid))
+        if body is None:
+            body = next(iter(kv.values()), {}) if kv else {}
+        if not isinstance(body, dict):
+            body = {}
+        ints = lambda d: sorted({int(v) for v in (d or {}).values() if str(v).isdigit()})
+        pkgs[str(pkgid)] = {"appids": ints(body.get("appids")), "depotids": ints(body.get("depotids")),
+                            "billingtype": body.get("billingtype"), "licensetype": body.get("licensetype"), "status": body.get("status")}
+    return pkgs
+
+
+def parse_assetcache(path=ASSETCACHE_VDF):
+    """{appid: {capsule|hero|logo|header|icon|hero_blur: path relative to librarycache/<appid>/}}; {} if absent."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        kv, _ = binkv_read(data, 0)
+    except (OSError, ValueError, IndexError, struct.error):
+        return {}
+    root = kv.get("", kv)
+    apps = root.get("0", {}) if isinstance(root, dict) else {}
+    out = {}
+    for appid, slots in apps.items():
+        if isinstance(slots, dict):
+            out[str(appid)] = {ASSET_SLOTS[k]: v for k, v in slots.items() if k in ASSET_SLOTS and isinstance(v, str)}
+    return out
+
+
+def _kv(d, *path, default=None):
+    """Nested lookup with case-insensitive keys (Steam writes 'Steam'/'steam', 'ReleaseState'/'releasestate')."""
+    for k in path:
+        if not isinstance(d, dict):
+            return default
+        if k in d:
+            d = d[k]
+        else:
+            low = {str(x).lower(): x for x in d}
+            if str(k).lower() not in low:
+                return default
+            d = d[low[str(k).lower()]]
+    return d
+
+
+def appinfo_summary(info):
+    """The part of one appinfo record Layover shows and decides on."""
+    common = info.get("common") or {}
+    config = info.get("config") or {}
+    ext = info.get("extended") or {}
+    launch = []
+    entries = config.get("launch") or {}
+    for k in sorted(entries, key=lambda x: int(x) if str(x).isdigit() else 0):
+        e = entries[k]
+        if not isinstance(e, dict):
+            continue
+        osl = str(_kv(e, "config", "oslist", default="") or "")
+        if osl and "windows" not in osl:
+            continue
+        betas = str(_kv(e, "config", "betakey", default="") or "")   # which branches show the entry; "default" = everyone
+        if betas and "default" not in [b.strip() for b in betas.split(",")]:
+            continue
+        desc = e.get("description") or _kv(e, "description_loc", "english", default="") or ""
+        launch.append({"exe": str(e.get("executable", "")).replace("\\", "/"), "args": str(e.get("arguments", "")),
+                       "description": str(desc), "type": str(e.get("type", "")),
+                       "needs_dlc": str(_kv(e, "config", "ownsdlc", default="") or "")})
+    assoc = common.get("associations") or {}
+    names = lambda kind: [str(a.get("name")) for a in assoc.values() if isinstance(a, dict) and a.get("type") == kind and a.get("name")]
+    deck = _kv(common, "steam_deck_compatibility", "category")
+    try:
+        deck = int(deck) if deck is not None and str(deck).strip() != "" else None
+    except (TypeError, ValueError):
+        deck = None
+    return {
+        "name": str(common.get("name", "")),
+        "type": str(common.get("type", "")).lower(),
+        "oslist": str(common.get("oslist", "")),
+        "osarch": str(common.get("osarch", "")),
+        "release_state": str(_kv(common, "ReleaseState", default="") or ""),
+        "controller_support": str(common.get("controller_support", "")),
+        "deck_category": deck,
+        "developer": str(ext.get("developer") or (names("developer") or [""])[0]),
+        "publisher": str(ext.get("publisher") or (names("publisher") or [""])[0]),
+        "installdir": str(config.get("installdir", "")),
+        "launch": launch,
+        "dlc": [x.strip() for x in str(ext.get("listofdlc", "")).split(",") if x.strip().isdigit()],
+        "parent": str(common.get("parent")) if common.get("parent") else None,
+        "library_assets": bool(common.get("library_assets_full") or common.get("library_assets")),
+    }
+
+
+def _file_key(path):
+    try:
+        st = os.stat(path)
+        return [st.st_mtime_ns, st.st_size]
+    except OSError:
+        return None
+
+
+def _json_cache(name, source, version, build):
+    """build(source) once per (mtime, size) of the source file, remembered in cache/<name>.json.
+    Returns (data, error); error is set when the file could not be parsed (Steam changed the format)."""
+    key = _file_key(source)
+    if key is None:
+        return None, f"{os.path.basename(source)} missing"
+    cpath = os.path.join(CACHE_DIR, name + ".json")
+    try:
+        with open(cpath) as f:
+            c = json.load(f)
+        if c.get("key") == key and c.get("version") == version:
+            return c.get("data"), c.get("error")
+    except (OSError, ValueError):
+        pass
+    data, err = None, None
+    try:
+        data = build(source)
+    except (ValueError, IndexError, struct.error, OSError) as e:
+        err = f"{os.path.basename(source)}: {e}"
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(cpath + ".tmp", "w") as f:
+            json.dump({"key": key, "version": version, "data": data, "error": err}, f)
+        os.replace(cpath + ".tmp", cpath)
+    except OSError:
+        pass
+    return data, err
+
+
+def cached_appinfo():
+    return _json_cache("appinfo", APPINFO_VDF, 1, lambda p: {a: appinfo_summary(i) for a, i in parse_appinfo(p).items()})
+
+
+def cached_packageinfo():
+    return _json_cache("packageinfo", PACKAGEINFO_VDF, 1, parse_packageinfo)
+
+
+def account_id(steamid64):
+    try:
+        return int(steamid64) - STEAMID64_BASE
+    except (TypeError, ValueError):
+        return None
+
+
+def localconfig_paths():
+    return sorted(glob.glob(os.path.join(USERDATA, "*", "config", "localconfig.vdf")))
+
+
+def localconfig_apps():
+    """{appid: {last_played, playtime_min, launch_options}} from every account's localconfig.vdf (apps the
+    account has touched: played, configured, launch options set)."""
+    out = {}
+    for p in localconfig_paths():
+        try:
+            with open(p, errors="replace") as f:
+                root = parse_vdf(f.read())
+        except OSError:
+            continue
+        apps = _kv(root, "UserLocalConfigStore", "Software", "Valve", "Steam", "apps", default={}) or {}
+        for appid, a in apps.items():
+            if not isinstance(a, dict) or not str(appid).isdigit():
+                continue
+            cur = out.setdefault(str(appid), {"last_played": 0, "playtime_min": 0, "launch_options": ""})
+            for src, dst in (("LastPlayed", "last_played"), ("Playtime", "playtime_min")):
+                try:
+                    cur[dst] = max(cur[dst], int(a.get(src, 0) or 0))
+                except (TypeError, ValueError):
+                    pass
+            if a.get("LaunchOptions"):
+                cur["launch_options"] = str(a["LaunchOptions"])
+    return out
+
+
+def web_owned_games(cfg, refresh=False):
+    """Optional exact list via the Steam Web API (config steam_api_key; the profile's Game Details must be
+    public). Cached 24 h in cache/owned_web.json; only fetched by `layover library --refresh`. None if unset."""
+    key = (cfg.get("steam_api_key") or "").strip()
+    if not key:
+        return None
+    cpath = os.path.join(CACHE_DIR, "owned_web.json")
+    try:
+        with open(cpath) as f:
+            c = json.load(f)
+        if not refresh and time.time() - c.get("time", 0) < 86400:
+            return c.get("games")
+    except (OSError, ValueError):
+        c = None
+    if not refresh:
+        return c.get("games") if c else None
+    sid = next((s for s in steam_accounts("windows") if str(s).isdigit()), None)
+    if not sid:
+        return None
+    url = (f"https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?key={key}&steamid={sid}"
+           "&include_appinfo=1&include_played_free_games=1&format=json")
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=8) as r:
+            games = json.load(r).get("response", {}).get("games", [])
+    except (OSError, ValueError):
+        return c.get("games") if c else None
+    res = {str(g["appid"]): {"name": g.get("name", ""), "playtime_min": g.get("playtime_forever", 0),
+                             "last_played": g.get("rtime_last_played", 0)} for g in games if "appid" in g}
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(cpath, "w") as f:
+            json.dump({"time": time.time(), "games": res}, f)
+    except OSError:
+        pass
+    return res
+
+
+def appcache_status():
+    """Parser errors for the UI ("Steam changed its app info format")."""
+    _, a = cached_appinfo()
+    _, p = cached_packageinfo()
+    return {"appinfo_error": a, "packageinfo_error": p}
+
+
+def owned_games(include_free=True, cfg=None):
+    """Every game this account can install, from Steam's local caches: purchases (packageinfo), Steam's
+    complimentary titles (package 0; owned=False, returned only with include_free), played apps (localconfig),
+    installed apps (appmanifests). Each entry carries appid, name, type, owned, source[], dlc_owned[] and the
+    appinfo summary fields (oslist, launch, deck_category, developer, ...)."""
+    apps, _ = cached_appinfo()
+    apps = apps or {}
+    pkgs, _ = cached_packageinfo()
+    pkgs = pkgs or {}
+    played = localconfig_apps()
+    installed = {g["appid"]: g for g in all_games() if g["where"] == "windows"}
+    web = web_owned_games(cfg or load_config()) or {}
+    licensed, free = set(), set()
+    for pid, pk in pkgs.items():
+        (free if str(pid) == "0" else licensed).update(str(a) for a in (pk or {}).get("appids", []))
+    try:
+        assets = {d for d in os.listdir(LIBRARYCACHE) if d.isdigit()}
+    except OSError:
+        assets = set()
+    ids = licensed | set(installed) | set(web) | {a for a, p in played.items() if p["last_played"] or p["playtime_min"]}
+    if include_free:
+        ids |= free
+    out = {}
+    dlc_parents = {}
+    for appid in ids:
+        s = apps.get(appid) or {}
+        typ = s.get("type") or ("game" if appid in installed else ("game" if appid in web else "unknown"))
+        if typ == "dlc":
+            parent = s.get("parent")
+            if parent and appid in licensed:
+                dlc_parents.setdefault(parent, []).append(appid)
+            continue
+        if typ in NON_GAME_TYPES:
+            continue
+        source = []
+        if appid in licensed:
+            source.append("license")
+        if appid in free:
+            source.append("free")
+        if appid in web:
+            source.append("web")
+        if appid in played and (played[appid]["last_played"] or played[appid]["playtime_min"]):
+            source.append("played")
+        if appid in installed:
+            source.append("installed")
+        if appid in assets:
+            source.append("assets")
+        if typ in ("demo", "unknown") and not ({"installed", "played", "license", "web"} & set(source)):
+            continue   # Steam's complimentary demos and ids it never described: not worth a tile
+        owned = bool({"license", "installed", "played", "web"} & set(source))
+        name = s.get("name") or installed.get(appid, {}).get("name") or web.get(appid, {}).get("name") or f"App {appid}"
+        g = dict(s)
+        g.update({"appid": appid, "name": name, "type": typ, "owned": owned, "source": source, "dlc_owned": [],
+                  "last_played": max(played.get(appid, {}).get("last_played", 0), web.get(appid, {}).get("last_played", 0) or 0),
+                  "playtime_min": max(played.get(appid, {}).get("playtime_min", 0), web.get(appid, {}).get("playtime_min", 0) or 0),
+                  "launch_options": played.get(appid, {}).get("launch_options", "")})
+        g.setdefault("launch", [])
+        out[appid] = g
+    for parent, dlcs in dlc_parents.items():
+        if parent in out:
+            out[parent]["dlc_owned"] = sorted(dlcs)
+    return sorted(out.values(), key=lambda g: g["name"].lower())
+
+
+def find_owned(query, include_free=True):
+    """An owned (or free) game by appid, exact name, or unique name fragment; None otherwise."""
+    q = str(query).strip().lower()
+    games = owned_games(include_free=include_free)
+    for g in games:
+        if g["appid"] == q or g["name"].lower() == q:
+            return g
+    subs = [g for g in games if q in g["name"].lower()]
+    return subs[0] if len(subs) == 1 else None
+
+
+def find_any_game(query):
+    """Installed game (find_game) or, failing that, an owned-but-not-installed one shaped like an installed entry."""
+    g = find_game(query, all_games())
+    if g:
+        g.setdefault("installed", True)
+        return g
+    o = find_owned(query)
+    if o:
+        return {"appid": o["appid"], "name": o["name"], "where": "windows", "ready": False, "installed": False,
+                "owned": o["owned"], "size": 0, "flags": 0, "needs_update": False, "library": None, "installdir": o.get("installdir", "")}
+    return None
+
+
+def renderer_for(cfg, appid, dx12=None):
+    """resolve_renderer() without the executable scan, for listings. Returns (renderer, why)."""
+    g = cfg["games"].get(str(appid), {})
+    if g.get("renderer"):
+        return g["renderer"], "game"
+    if (cfg.get("renderer") or "auto") != "auto":
+        return cfg["renderer"], "default"
+    if dx12 is None:
+        return "dxmt", "unknown"
+    return ("d3dmetal" if dx12 else "dxmt"), "auto"
+
+
+def running_game_installdirs():
+    """steamapps/common/<installdir> folder names of games running in our prefix (lowercase)."""
+    dirs = set()
+    for line in sh(["ps", "-axo", "command"]).splitlines():
+        if is_game_process(line):
+            m = re.search(r"steamapps[/\\]common[/\\]([^/\\]+)[/\\]", line, re.I)
+            if m:
+                dirs.add(m.group(1).lower())
+    return dirs
+
+
+# --------------------------------------------------------------------------- cover art
+def cover_paths(appid, assets=None):
+    """Local image per kind (capsule 600x900, header, hero, logo, icon, hero_blur) or None: our covers/ folder
+    (CDN downloads, full size), then Steam's librarycache (asset cache slots, then well-known names in the
+    appid folder and its sha subfolders). The 32x32 icon is never used as a capsule."""
+    assets = assets if assets is not None else parse_assetcache()
+    appid = str(appid)
+    out = {k: None for k in COVER_KINDS}
+    own = os.path.join(COVERS, appid)
+    for kind in COVER_KINDS:
+        for ext in ("jpg", "png"):
+            p = os.path.join(own, f"{kind}.{ext}")
+            if os.path.isfile(p):
+                out[kind] = p
+                break
+    base = os.path.join(LIBRARYCACHE, appid)
+    for kind, rel in (assets.get(appid) or {}).items():
+        if kind in out and not out[kind]:
+            p = os.path.join(base, rel.replace("\\", "/"))
+            if os.path.isfile(p):
+                out[kind] = p
+    if os.path.isdir(base) and not all(out[k] for k in ("capsule", "header", "hero")):
+        try:
+            dirs = [base] + [os.path.join(base, d) for d in sorted(os.listdir(base)) if os.path.isdir(os.path.join(base, d))]
+        except OSError:
+            dirs = [base]
+        for kind, names in COVER_FILES.items():
+            if out[kind]:
+                continue
+            for d in dirs:
+                hit = next((os.path.join(d, n) for n in names if os.path.isfile(os.path.join(d, n))), None)
+                if hit:
+                    out[kind] = hit
+                    break
+    return out
+
+
+def cover_urls(appid):
+    return {k: COVER_CDN[0].format(appid=appid, file=f) for k, f in COVER_CDN_FILE.items()}
+
+
+def _rm(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def fetch_url(url, dest, timeout=6):
+    """Download url to dest atomically. True on success, False on an HTTP error (404: there is no such
+    file), None on a network error (offline: try again later)."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r, open(dest + ".part", "wb") as f:
+            shutil.copyfileobj(r, f)
+        os.replace(dest + ".part", dest)
+        return True
+    except urllib.error.HTTPError:
+        _rm(dest + ".part")
+        return False
+    except (OSError, ValueError):
+        _rm(dest + ".part")
+        return None
+
+
+def fetch_covers(appids, kinds=("capsule", "header", "hero"), budget_s=25.0, assets=None):
+    """Fill covers/<appid>/<kind>.jpg from Steam's CDN for whatever the local caches lack. A 404 is remembered
+    in covers/<appid>/missing.json for 7 days. Returns {appid: {kind: have|ok|missing|error|skipped}}."""
+    assets = assets if assets is not None else parse_assetcache()
+    t0 = time.time()
+    report = {}
+    for appid in appids:
+        appid = str(appid)
+        have = cover_paths(appid, assets)
+        own = os.path.join(COVERS, appid)
+        mpath = os.path.join(own, "missing.json")
+        try:
+            with open(mpath) as f:
+                missing = json.load(f)
+        except (OSError, ValueError):
+            missing = {}
+        rep = report.setdefault(appid, {})
+        for kind in kinds:
+            if have.get(kind):
+                rep[kind] = "have"
+                continue
+            if time.time() - missing.get(kind, 0) < 7 * 86400:
+                rep[kind] = "missing"
+                continue
+            if time.time() - t0 > budget_s:
+                rep[kind] = "skipped"
+                continue
+            fname = COVER_CDN_FILE.get(kind)
+            if not fname:
+                rep[kind] = "missing"
+                continue
+            dest = os.path.join(own, kind + os.path.splitext(fname)[1])
+            os.makedirs(own, exist_ok=True)
+            res = None
+            for tmpl in COVER_CDN:
+                res = fetch_url(tmpl.format(appid=appid, file=fname), dest)
+                if res:
+                    break
+            if res:
+                rep[kind] = "ok"
+            elif res is False:
+                missing[kind] = time.time()
+                rep[kind] = "missing"
+            else:
+                rep[kind] = "error"
+        if missing:
+            try:
+                with open(mpath, "w") as f:
+                    json.dump(missing, f)
+            except OSError:
+                pass
+    return report
+
+
+def spawn_detached(argv):
+    """Run `layover <argv...>` as a detached background process (output to logs/background.log)."""
+    try:
+        os.makedirs(LOGS, exist_ok=True)
+        log = open(os.path.join(LOGS, "background.log"), "ab")
+        subprocess.Popen([sys.executable, os.path.abspath(__file__)] + list(argv), stdout=log, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+        return True
+    except OSError:
+        return False
+
+
+# --------------------------------------------------------------------------- compatibility (cache readers; the scan lives in cmd_compat)
+COMPAT_DIR = os.path.join(CACHE_DIR, "compat")
+COMPAT_LABELS = {"should_work": "Should work", "varies": "Varies", "likely_issues": "Likely issues", "wont_run": "Won't run", "unknown": "Unknown"}
+
+
+def compat_cache_path(appid):
+    return os.path.join(COMPAT_DIR, f"{appid}.json")
+
+
+def compat_cached(appid):
+    """The last computed verdict for the library listing (no scanning here): {verdict, label, reasons, unverified, checked}."""
+    try:
+        with open(compat_cache_path(appid)) as f:
+            c = json.load(f)
+        v = c.get("verdict")
+        if isinstance(v, dict) and v.get("verdict"):
+            return v
+    except (OSError, ValueError):
+        pass
+    return {"verdict": "unknown", "label": COMPAT_LABELS["unknown"], "reasons": [], "unverified": True, "checked": None}
+
+
 
 
 # --------------------------------------------------------------------------- controller
@@ -1240,6 +1844,614 @@ def padtest(seconds):
             print(r.stderr[-800:])
             return
     subprocess.run([exe, str(seconds)])
+
+
+# --------------------------------------------------------------------------- compatibility
+# Verdict per game, from (a) the installed files (graphics API imports, anti-cheat components, launcher exes),
+# (b) Steam's app info (OS list, Steam Deck rating) and (c) optional online lookups (Steam store page text,
+# ProtonDB tier) cached 7 days in cache/compat/<appid>.json. `layover library` only reads the cache.
+ANTICHEAT_MARKERS = {   # folder / file names (lowercase) -> product; kernel-level anti-cheat never runs under Wine
+    "easyanticheat": "Easy Anti-Cheat", "easyanticheat_x64.dll": "Easy Anti-Cheat", "easyanticheat_eos_setup.exe": "Easy Anti-Cheat",
+    "battleye": "BattlEye", "beclient_x64.dll": "BattlEye", "beservice.exe": "BattlEye", "beservice_x64.exe": "BattlEye",
+    "vgc.exe": "Riot Vanguard", "vgk.sys": "Riot Vanguard", "gameguard.des": "nProtect GameGuard", "x3.xem": "XIGNCODE3",
+    "xigncode": "XIGNCODE3", "pbsvc.exe": "PunkBuster", "pbsvc_x64.exe": "PunkBuster",
+}
+ANTICHEAT_WORDS = ("Easy Anti-Cheat", "EasyAntiCheat", "BattlEye", "Vanguard", "Ricochet", "nProtect", "GameGuard", "XIGNCODE", "PunkBuster")
+EXE_NEEDLES = {"d3d12": b"d3d12.dll", "d3d11": b"d3d11.dll", "d3d10": b"d3d10.dll", "d3d9": b"d3d9.dll",
+               "vulkan": b"vulkan-1.dll", "opengl": b"opengl32.dll", "dotnet": b"mscoree.dll"}
+DECK_NAMES = {1: "Unsupported", 2: "Playable", 3: "Verified"}
+
+
+def game_root(game):
+    """steamapps/common/<installdir> of an installed game, or None."""
+    lib = game.get("library")
+    installdir = game.get("installdir")
+    if not lib or not installdir:
+        return None
+    root = os.path.join(lib, "common", installdir) if lib.endswith("steamapps") else os.path.join(os.path.dirname(lib), "steamapps", "common", installdir)
+    return root if os.path.isdir(root) else None
+
+
+def scan_game_binaries(game):
+    """What the installed files say: graphics APIs imported by the executables (whole files are read: Spider-Man
+    2's import table sits past 140 MB), anti-cheat components, launcher executables. None if the folder is missing."""
+    root = game_root(game)
+    if not root:
+        return None
+    hits = {k: False for k in EXE_NEEDLES}
+    hits.update({"anticheat": set(), "launcher_exes": [], "exes": 0})
+    for dirpath, dirs, files in os.walk(root):
+        if dirpath[len(root):].count(os.sep) > 2:
+            dirs[:] = []
+            continue
+        for d in dirs:
+            low = d.lower()
+            if low == "d3d12":                      # DirectX 12 Agility SDK ships here
+                hits["d3d12"] = True
+            if low in ANTICHEAT_MARKERS:
+                hits["anticheat"].add(ANTICHEAT_MARKERS[low])
+        for fn in files:
+            low = fn.lower()
+            if low in ANTICHEAT_MARKERS:
+                hits["anticheat"].add(ANTICHEAT_MARKERS[low])
+            if low.endswith("_dx12.dll") or low == "d3d12core.dll":
+                hits["d3d12"] = True
+            if not low.endswith(".exe"):
+                continue
+            hits["exes"] += 1
+            if "launcher" in low:
+                hits["launcher_exes"].append(fn)
+            fp = os.path.join(dirpath, fn)
+            try:
+                if os.path.getsize(fp) < 512 * 1024:
+                    continue
+                with open(fp, "rb") as f:
+                    tail = b""
+                    while True:
+                        chunk = f.read(16 << 20)
+                        if not chunk:
+                            break
+                        blob = (tail + chunk).lower()
+                        for key, needle in EXE_NEEDLES.items():
+                            if not hits[key] and needle in blob:
+                                hits[key] = True
+                        tail = chunk[-16:]
+            except OSError:
+                continue
+    hits["anticheat"] = sorted(hits["anticheat"])
+    return hits
+
+
+def read_compat_cache(appid):
+    try:
+        with open(compat_cache_path(appid)) as f:
+            c = json.load(f)
+        return c if isinstance(c, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_compat_cache(appid, cache):
+    try:
+        os.makedirs(COMPAT_DIR, exist_ok=True)
+        with open(compat_cache_path(appid) + ".tmp", "w") as f:
+            json.dump(cache, f)
+        os.replace(compat_cache_path(appid) + ".tmp", compat_cache_path(appid))
+    except OSError:
+        pass
+
+
+def local_scan(game, refresh=False):
+    """scan_game_binaries() once per build of the game, remembered in the compat cache."""
+    cache = read_compat_cache(game["appid"])
+    build = game.get("buildid") or ""
+    if not refresh and cache.get("local") is not None and cache.get("local_buildid") == build:
+        return cache["local"]
+    local = scan_game_binaries(game)
+    if local is not None:
+        cache["local"] = local
+        cache["local_buildid"] = build
+        write_compat_cache(game["appid"], cache)
+    return local
+
+
+def game_uses_dx12(game):
+    """Does this game need DirectX 12? From the install's executables (see scan_game_binaries); cached per build."""
+    local = local_scan(game)
+    if not local:
+        return None
+    if local["d3d12"]:
+        return True
+    if local["d3d11"]:
+        return False
+    return None
+
+
+def fetch_json(url, timeout=8):
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=timeout) as r:
+            return json.load(r)
+    except (OSError, ValueError):
+        return None
+
+
+def store_details(appid):
+    """Steam store facts (public API, no key): Windows platform, DirectX version named in the requirements,
+    anti-cheat / DRM names in the notices. {"missing": True} for an unlisted app, None when offline."""
+    d = fetch_json(f"https://store.steampowered.com/api/appdetails?appids={appid}&filters=categories,pc_requirements,platforms,drm_notice,name")
+    if not isinstance(d, dict):
+        return None
+    e = d.get(str(appid)) or {}
+    if not e.get("success"):
+        return {"missing": True}
+    data = e.get("data") or {}
+    req = data.get("pc_requirements") or {}
+    text = " ".join(str(v) for v in (req.values() if isinstance(req, dict) else [])) + " " + str(data.get("drm_notice") or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    m = re.search(r"DirectX\D{0,24}?(9|10|11|12)\b", text, re.I)
+    low = text.lower()
+    return {"name": data.get("name"), "windows": bool((data.get("platforms") or {}).get("windows", True)),
+            "directx": int(m.group(1)) if m else None, "categories": [c.get("description", "") for c in data.get("categories") or []],
+            "anticheat": sorted({w for w in ANTICHEAT_WORDS if w.lower() in low}), "denuvo": "denuvo" in low}
+
+
+def protondb_summary(appid):
+    """ProtonDB's community tier (unofficial endpoint; absent when it fails): a good proxy for Wine in general."""
+    d = fetch_json(f"https://www.protondb.com/api/v1/reports/summaries/{appid}.json")
+    if not isinstance(d, dict) or not d.get("tier"):
+        return None
+    return {"tier": d.get("tier"), "confidence": d.get("confidence"), "total": d.get("total"),
+            "trending": d.get("trendingTier"), "best": d.get("bestReportedTier")}
+
+
+def compat_verdict(info, local, store, pdb):
+    """Combine the signals into {verdict, label, reasons, unverified, checked}. First blocker wins."""
+    reasons = []
+    verdict = None
+    store = store if isinstance(store, dict) and not store.get("missing") else None
+    ac = set((local or {}).get("anticheat") or []) | set((store or {}).get("anticheat") or [])
+    if ac:
+        verdict = "wont_run"
+        reasons.append("anti-cheat: " + ", ".join(sorted(ac)) + " (kernel-level anti-cheat does not run under Wine)")
+    osl = info.get("oslist") or ""
+    if (osl and "windows" not in osl) or (store and store.get("windows") is False):
+        verdict = verdict or "wont_run"
+        reasons.append("no Windows build" + (f" (Steam lists: {osl})" if osl else ""))
+    tier = (pdb or {}).get("tier")
+    if tier:
+        reasons.append(f"ProtonDB: {tier}" + (f" ({pdb.get('total')} reports)" if pdb.get("total") else "") + " (Linux Proton, same Wine code)")
+        if verdict is None and tier == "borked":
+            verdict = "likely_issues"
+    deck = info.get("deck_category")
+    if deck in DECK_NAMES:
+        reasons.append("Steam Deck " + DECK_NAMES[deck] + " (Valve's own Proton rating)")
+    if local:
+        if local.get("d3d12"):
+            reasons.append("DirectX 12 (D3DMetal; performance varies by game)")
+        elif local.get("d3d11"):
+            reasons.append("DirectX 11 (DXMT; generally good)")
+        elif local.get("d3d10") or local.get("d3d9"):
+            reasons.append("DirectX 9/10 only: no DXMT/D3DMetal path, Wine's slow OpenGL fallback (wined3d)")
+            verdict = verdict or "likely_issues"
+        elif local.get("vulkan"):
+            reasons.append("Vulkan (MoltenVK)")
+        elif local.get("opengl"):
+            reasons.append("OpenGL")
+        else:
+            reasons.append("no graphics API imports found in the executables")
+        if local.get("dotnet"):
+            reasons.append(".NET runtime used (Wine needs the right redistributable; Steam usually installs it)")
+        if local.get("launcher_exes"):
+            reasons.append("starts through a launcher window: " + ", ".join(local["launcher_exes"][:3]) + " (needs a click; a controller alone cannot)")
+        if verdict is None:
+            verdict = "varies" if local.get("d3d12") else ("should_work" if (local.get("d3d11") or local.get("vulkan")) else "unknown")
+    else:
+        dx = (store or {}).get("directx")
+        if dx:
+            reasons.append(f"store page lists DirectX {dx}")
+            if dx <= 10:
+                verdict = verdict or "likely_issues"
+        if verdict is None:
+            if tier in ("platinum", "gold") or deck == 3:
+                verdict = "should_work"
+            elif tier == "silver" or deck == 2 or dx == 12:
+                verdict = "varies"
+            elif tier == "bronze" or deck == 1:
+                verdict = "likely_issues"
+            elif dx == 11:
+                verdict = "should_work"
+            else:
+                verdict = "unknown"
+        if not local and info.get("type") != "unknown":
+            reasons.append("not installed: install it for a check of the actual files")
+    if (store or {}).get("denuvo"):
+        reasons.append("Denuvo DRM (runs under Wine; counts hardware activations)")
+    if info.get("launch_options"):
+        reasons.append("Steam launch options set: " + info["launch_options"])
+    online = bool(store or pdb)
+    return {"verdict": verdict, "label": COMPAT_LABELS[verdict], "reasons": reasons, "unverified": not online,
+            "checked": time.time() if online else None}
+
+
+def compute_compat(cfg, appid, refresh=False, online=None):
+    """Recompute one game's verdict (scans installed files once per build, asks the store/ProtonDB at most
+    weekly when online_lookups is on). Returns (verdict, cache)."""
+    appid = str(appid)
+    info = find_owned(appid) or {"appid": appid, "name": f"App {appid}", "type": "unknown"}
+    installed = next((g for g in all_games() if g["appid"] == appid and g["where"] == "windows"), None)
+    cache = read_compat_cache(appid)
+    local = None
+    if installed:
+        local = local_scan(installed, refresh=refresh)
+        cache = read_compat_cache(appid)
+        if local and (local["d3d12"] or local["d3d11"]):
+            g = cfg["games"].setdefault(appid, {})
+            if g.get("dx12") != bool(local["d3d12"]):
+                g["dx12"] = bool(local["d3d12"])
+                save_config(cfg)
+    want_online = cfg.get("online_lookups", True) if online is None else online
+    stale = time.time() - (cache.get("online_checked") or 0) > 7 * 86400
+    if want_online and (refresh or stale):
+        store = store_details(appid)
+        time.sleep(0.3)   # the store API allows ~200 calls per 5 minutes
+        pdb = protondb_summary(appid)
+        if store is not None:
+            cache["store"] = store
+        if pdb is not None:
+            cache["protondb"] = pdb
+        if store is not None or pdb is not None:
+            cache["online_checked"] = time.time()
+    v = compat_verdict(info, local, cache.get("store"), cache.get("protondb"))
+    cache["verdict"] = v
+    cache["name"] = info.get("name")
+    write_compat_cache(appid, cache)
+    return v, cache
+
+
+def cmd_compat(args):
+    """Will this game run? Verdict with reasons; `--refresh` re-scans and asks the store/ProtonDB again."""
+    cfg = load_config()
+    if args.all:
+        ids = [g["appid"] for g in owned_games(include_free=args.include_free)]
+    elif args.appid:
+        ids = []
+        for q in args.appid:
+            o = find_owned(q) or find_any_game(q)
+            if not o:
+                die(f"no game matches '{q}' (layover library)", 3)
+            ids.append(o["appid"])
+    else:
+        die("usage: layover compat <game> [--refresh] | --all", 2)
+    results = {}
+    for appid in ids:
+        v, cache = compute_compat(cfg, appid, refresh=args.refresh, online=False if args.offline else None)
+        results[appid] = {"compat": v, "local": cache.get("local"), "store": cache.get("store"), "protondb": cache.get("protondb"), "name": cache.get("name")}
+        if not JSON_MODE:
+            colour = {"should_work": C.G, "varies": C.Y, "likely_issues": C.Y, "wont_run": C.R}.get(v["verdict"], C.D)
+            head(f"{cache.get('name') or appid}  ·  " + paint(v["label"], colour) + ("" if not v["unverified"] else "  (local facts only; no store/ProtonDB data)"))
+            for r in v["reasons"]:
+                info(r)
+    if JSON_MODE:
+        print(json.dumps({"ok": True, "results": results}))
+
+
+# --------------------------------------------------------------------------- game profiles
+# What Layover knows about particular games: settings, INI edits and notes applied the first time a game is
+# played (`apply_profile_if_pending` from cmd_play) and on demand (`layover profile <game> --apply|--reset`).
+# Keys: an AppID, or "exe:<glob>" matched against the game's launch executables. A profile never overrides a
+# setting the user set by hand (`layover game ...`) unless --reset is used. INI paths: "Documents/..." is the
+# prefix's Documents folder (C:\users\<you>\Documents), "installdir:..." is relative to the game's folder.
+PROFILES = {
+    "2651280": {   # Marvel's Spider-Man 2 (DirectX 12 -> D3DMetal + Layover's d3d12 shim; see HANDOFF.md)
+        "settings": {"fps_cap": 60},
+        "notes": [
+            "In the game: preset Medium or High, FSR Quality (not Dynamic), dynamic resolution target off or 60, VSync off. The 60 fps cap comes from Layover.",
+            "The first run of every area is slower while D3DMetal compiles shaders; it smooths out on the second visit.",
+            "Symbiote scenes need the pool-fix shaders (layover sm2-shaders, once); `layover flight` says whether they are built.",
+            "A game update changes the executable: the shim turns its patches off until it is updated for the new build (HANDOFF.md).",
+        ],
+        "checks": ["sm2_shaders"],
+    },
+    "377160": {   # Fallout 4 (DirectX 11 -> DXMT). Retina off + MetalFX 2x: render 1728x1117, output 3456x2234 at a quarter of the GPU work.
+        "settings": {"retina": False, "metalfx": 2.0, "fps_cap": 60},
+        "ini": [{"file": "Documents/My Games/Fallout4/Fallout4Prefs.ini", "section": "Display",
+                 "set": {"iSize W": "1728", "iSize H": "1117", "bFull Screen": "0", "bBorderless": "1", "bMaximizeWindow": "0",
+                         "bVolumetricLightingEnable": "0", "iVolumetricLightingQuality": "1",
+                         "fShadowDistance": "14000.0000", "fDirShadowDistance": "14000.0000", "iShadowMapResolution": "2048",
+                         "iPresentInterval": "1"}}],
+        "launcher": {"exe": "Fallout4Launcher.exe", "note": "click PLAY in the launcher window (a controller alone cannot)"},
+        "notes": [
+            "Borderless 1728x1117 with god rays off and High shadows: the launcher's Ultra preset at the full panel played laggy and glitchy.",
+            "If it is still laggy: launcher Options -> High preset (keep the resolution), then Medium shadows.",
+            "The Creation Engine's physics need 60 fps or less; keep the cap.",
+        ],
+    },
+    "exe:*launcher*.exe": {
+        "notes": ["Starts through a launcher window: click PLAY in it (keep the trackpad handy; a controller alone cannot)."],
+    },
+}
+
+
+def _merge_profile(dst, src):
+    for k, v in src.items():
+        if k in ("settings", "env"):
+            dst.setdefault(k, {}).update(v)
+        elif k in ("notes", "ini", "checks"):
+            dst.setdefault(k, []).extend(x for x in v if x not in dst.get(k, []))
+        else:
+            dst[k] = v
+    return dst
+
+
+def profile_for(appid, launch_exes=()):
+    """The merged profile for a game (exe-glob entries first, the AppID entry last) or None."""
+    merged = {}
+    exes = [os.path.basename(str(e)).lower() for e in launch_exes if e]
+    for key, prof in PROFILES.items():
+        if key.startswith("exe:") and any(fnmatch.fnmatch(e, key[4:].lower()) for e in exes):
+            _merge_profile(merged, prof)
+    if str(appid) in PROFILES:
+        _merge_profile(merged, PROFILES[str(appid)])
+    return merged or None
+
+
+def profile_version(profile):
+    return hashlib.sha1(json.dumps(profile, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def prefix_documents():
+    """The Windows user's Documents folder inside the prefix (C:\\users\\<you>\\Documents)."""
+    users = os.path.join(PREFIX, "drive_c", "users")
+    cands = [os.environ.get("USER", ""), os.path.basename(HOME)]
+    try:
+        cands += [d for d in sorted(os.listdir(users)) if d not in ("Public", "")]
+    except OSError:
+        pass
+    for c in cands:
+        p = os.path.join(users, c, "Documents")
+        if c and os.path.isdir(p):
+            return p
+    return os.path.join(users, os.environ.get("USER", "user"), "Documents")
+
+
+def profile_ini_path(spec, game=None):
+    if spec.startswith("Documents/"):
+        return os.path.join(prefix_documents(), spec[len("Documents/"):])
+    if spec.startswith("installdir:"):
+        root = game_root(game) if game else None
+        return os.path.join(root, spec[len("installdir:"):]) if root else None
+    return os.path.join(PREFIX, "drive_c", spec)
+
+
+def ini_set(path, section, values):
+    """Set keys in [section] of an INI file in place, keeping order, comments and line endings; missing keys are
+    appended to the section. A <file>.bak-layover copy is made once. Returns the number of lines changed."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    nl = "\r\n" if b"\r\n" in raw else "\n"
+    lines = raw.decode("utf-8", "replace").split(nl)
+    want = {k.lower(): (k, str(v)) for k, v in values.items()}
+    out, done = [], set()
+    in_sec = found = False
+    changed = 0
+
+    def flush_missing():
+        nonlocal changed
+        # insert before trailing blank lines so the section stays tidy
+        tail = []
+        while out and out[-1].strip() == "":
+            tail.insert(0, out.pop())
+        for lk, (k, v) in want.items():
+            if lk not in done:
+                out.append(f"{k}={v}")
+                done.add(lk)
+                changed += 1
+        out.extend(tail)
+
+    for line in lines:
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            if in_sec:
+                flush_missing()
+            in_sec = s[1:-1].strip().lower() == section.lower()
+            found = found or in_sec
+            out.append(line)
+            continue
+        if in_sec and "=" in line and not s.startswith((";", "#")):
+            k, _, v = line.partition("=")
+            lk = k.strip().lower()
+            if lk in want and lk not in done:
+                nv = want[lk][1]
+                if v.strip() != nv:
+                    line = f"{k.strip()}={nv}"
+                    changed += 1
+                done.add(lk)
+        out.append(line)
+    if in_sec:
+        flush_missing()
+    if not found:
+        if out and out[-1].strip() != "":
+            out.append("")
+        out.append(f"[{section}]")
+        in_sec = True
+        flush_missing()
+    if changed:
+        bak = path + ".bak-layover"
+        if not os.path.exists(bak):
+            shutil.copy2(path, bak)
+        with open(path, "wb") as f:
+            f.write(nl.join(out).encode("utf-8"))
+    return changed
+
+
+def set_launch_options(appid, text):
+    """Write Steam's per-game Launch Options into localconfig.vdf. Only while Steam is fully stopped (it rewrites
+    the file on exit); returns the number of files changed."""
+    if steam_running() or prefix_running():
+        die("Steam must be closed before launch options can be written (layover kill)", 6)
+    n = 0
+    for p in localconfig_paths():
+        with open(p, errors="replace") as f:
+            src = f.read()
+        m = re.search(r'("Software"\s*\{\s*"[Vv]alve"\s*\{\s*"[Ss]team"\s*\{\s*"[Aa]pps"\s*\{)', src)
+        if not m:
+            continue
+        esc = text.replace("\\", "\\\\").replace('"', '\\"')
+        block = re.search(r'(\n(\t*)"%s"\s*\{)(.*?)(\n\2\})' % re.escape(str(appid)), src[m.end():], re.S)
+        if block:
+            start = m.end() + block.start()
+            body = block.group(3)
+            if re.search(r'"LaunchOptions"\s+"', body):
+                body = re.sub(r'("LaunchOptions"\s+")(?:[^"\\]|\\.)*(")', lambda mm: mm.group(1) + esc + mm.group(2), body, count=1)
+            else:
+                body += f'\n{block.group(2)}\t"LaunchOptions"\t\t"{esc}"'
+            new = src[:start] + block.group(1) + body + block.group(4) + src[m.end() + block.end():]
+        else:
+            indent = "\t" * 5
+            new = src[:m.end()] + f'\n{indent}"{appid}"\n{indent}{{\n{indent}\t"LaunchOptions"\t\t"{esc}"\n{indent}}}' + src[m.end():]
+        if new != src:
+            with open(p, "w") as f:
+                f.write(new)
+            n += 1
+    return n
+
+
+def apply_profile(cfg, appid, force=False, game=None):
+    """Apply a game's profile: settings (where the user has none, or all with force), env, INI edits (when the
+    file exists; otherwise remembered as pending), launch options (only with Steam stopped). Returns a report."""
+    appid = str(appid)
+    info = find_owned(appid) or {}
+    prof = profile_for(appid, [l.get("exe") for l in info.get("launch", [])])
+    rep = {"appid": appid, "available": bool(prof), "settings": [], "kept": [], "ini": [], "pending_ini": False, "launch_options": None}
+    if not prof:
+        return rep
+    g = cfg["games"].setdefault(appid, {})
+    for k, v in (prof.get("settings") or {}).items():
+        if k in g and g[k] != v and not force and g.get("profile_set", {}).get(k) != g[k]:
+            rep["kept"].append(k)          # the user's own, different value stays
+            continue
+        g[k] = v
+        g.setdefault("profile_set", {})[k] = v
+        rep["settings"].append(k)
+    if prof.get("env"):
+        env = g.setdefault("env", {})
+        for k, v in prof["env"].items():
+            if k not in env or force:
+                env[k] = str(v)
+    installed = game or next((x for x in all_games() if x["appid"] == appid and x["where"] == "windows"), None)
+    for spec in prof.get("ini") or []:
+        path = profile_ini_path(spec["file"], installed)
+        if not path or not os.path.isfile(path):
+            rep["pending_ini"] = True          # the game writes it on its first run; retried at the next play
+            rep["ini"].append({"file": spec["file"], "status": "not there yet"})
+            continue
+        try:
+            n = ini_set(path, spec["section"], spec["set"])
+            rep["ini"].append({"file": spec["file"], "status": f"{n} line{'s' if n != 1 else ''} changed" if n else "already as recommended"})
+        except OSError as e:
+            rep["ini"].append({"file": spec["file"], "status": f"failed: {e}"})
+    if prof.get("launch_options") and (force or not info.get("launch_options")):
+        if steam_running() or prefix_running():
+            rep["launch_options"] = "skipped (Steam running)"
+        else:
+            rep["launch_options"] = f"{set_launch_options(appid, prof['launch_options'])} file(s) written"
+    g["profile_applied"] = profile_version(prof)
+    g["profile_pending_ini"] = rep["pending_ini"]
+    if not g["profile_pending_ini"]:
+        g.pop("profile_pending_ini", None)
+    save_config(cfg)
+    return rep
+
+
+def profile_status(cfg, appid, launch):
+    """For the library listing: is there a profile, is it applied, its notes."""
+    prof = profile_for(appid, [l.get("exe") if isinstance(l, dict) else l for l in (launch or [])])
+    if not prof:
+        return {"available": False, "applied": None, "version": None, "pending_ini": False, "notes": []}
+    g = cfg["games"].get(str(appid), {})
+    ver = profile_version(prof)
+    return {"available": True, "applied": g.get("profile_applied") == ver, "version": ver,
+            "pending_ini": bool(g.get("profile_pending_ini")), "notes": prof.get("notes", []),
+            "settings": prof.get("settings", {}), "launcher": prof.get("launcher")}
+
+
+def apply_profile_if_pending(cfg, appid):
+    """Called by `play`: first launch (or a changed profile, or an INI the game had not written yet) applies it."""
+    st = profile_status(cfg, appid, (find_owned(str(appid)) or {}).get("launch", []))
+    if not st["available"] or (st["applied"] and not st["pending_ini"]):
+        return False
+    rep = apply_profile(cfg, appid)
+    bits = []
+    if rep["settings"]:
+        bits.append("settings " + ", ".join(rep["settings"]))
+    for i in rep["ini"]:
+        bits.append(f"{os.path.basename(i['file'])}: {i['status']}")
+    if bits:
+        info(f"applied Layover's profile for this game ({'; '.join(bits)})")
+    return True
+
+
+def profile_warnings(appid):
+    """(level, message) pairs from a profile's checks (used by `layover flight` and the listing)."""
+    out = []
+    prof = profile_for(appid)
+    for check in (prof or {}).get("checks", []):
+        if check == "sm2_shaders" and sm2_exe_path():
+            missing = sm2_shaders_missing()
+            if missing:
+                out.append(("warn", f"Spider-Man 2 pool-fix shaders not built ({len(missing)} missing): the symbiote scenes glitch and drop to 2 fps"
+                            + (" — run tools/dev/build-dxc.sh (once, 30-60 min), then layover sm2-shaders" if not dxc_tools_present() else " — run layover sm2-shaders")))
+            else:
+                out.append(("ok", "Spider-Man 2 pool-fix shaders built (symbiote + T-pose fix at the root)"))
+    return out
+
+
+def cmd_profile(args):
+    """Show or apply Layover's recommended settings for a game."""
+    cfg = load_config()
+    g = find_any_game(args.game)
+    if not g:
+        die(f"no game matches '{args.game}' (layover library)", 3)
+    appid = g["appid"]
+    info_ = find_owned(appid) or {}
+    prof = profile_for(appid, [l.get("exe") for l in info_.get("launch", [])])
+    if args.apply or args.reset:
+        rep = apply_profile(cfg, appid, force=args.reset, game=g if g.get("installed", True) and g.get("library") else None)
+        if JSON_MODE:
+            print(json.dumps({"ok": True, "report": rep, "status": profile_status(cfg, appid, info_.get("launch", []))}))
+            return
+        if not rep["available"]:
+            info(f"no profile for {g['name']}; nothing to apply")
+            return
+        ok(f"{g['name']}: profile {'reset' if args.reset else 'applied'}")
+        if rep["settings"]:
+            info("settings set: " + ", ".join(rep["settings"]))
+        if rep["kept"]:
+            info("your own values kept: " + ", ".join(rep["kept"]) + " (--reset replaces them)")
+        for i in rep["ini"]:
+            info(f"{i['file']}: {i['status']}")
+        if rep["launch_options"]:
+            info(f"launch options: {rep['launch_options']}")
+        return
+    st = profile_status(cfg, appid, info_.get("launch", []))
+    if JSON_MODE:
+        print(json.dumps({"ok": True, "appid": appid, "name": g["name"], "profile": prof, "status": st}))
+        return
+    head(g["name"])
+    if not prof:
+        info("no bundled profile; the defaults apply (renderer by DirectX version, global fps cap/retina)")
+        return
+    info(("applied" if st["applied"] else "not applied yet (happens at the next play)") + (", INI edit pending" if st["pending_ini"] else ""))
+    if prof.get("settings"):
+        info("settings: " + ", ".join(f"{k}={v}" for k, v in prof["settings"].items()))
+    for spec in prof.get("ini", []):
+        info(f"{spec['file']} [{spec['section']}]: " + ", ".join(f"{k}={v}" for k, v in spec["set"].items()))
+    if prof.get("launcher"):
+        info(f"launcher: {prof['launcher'].get('exe', '')} — {prof['launcher'].get('note', '')}")
+    for n in prof.get("notes", []):
+        info("note: " + n)
+    for level, msg in profile_warnings(appid):
+        (warn if level == "warn" else ok)(msg)
 
 
 # --------------------------------------------------------------------------- commands
@@ -1383,7 +2595,7 @@ def cmd_setup(args):
 
 def require_setup():
     if not engine_ready() or not steam_installed():
-        die("not set up yet → run: layover setup")
+        die("not set up yet → run: layover setup", 5)
 
 
 STATE_PATH = os.path.join(ROOT, "running.json")
@@ -1502,12 +2714,20 @@ def cmd_play(args):
     games = all_games()
     g = find_game(args.game, games)
     if not g:
-        die(f"no installed game matches '{args.game}' (layover games)")
+        o = find_owned(args.game)
+        if o and getattr(args, "install", False):
+            cmd_install(argparse.Namespace(appid=o["appid"], json=JSON_MODE))
+            return
+        if o:
+            die(f"{o['name']} is not installed (layover install {o['appid']})", 3)
+        die(f"no game matches '{args.game}' (layover library)", 3)
     if g["where"] == "mac":
         ok(f"launching {g['name']} in native Mac Steam")
         subprocess.run(["open", f"steam://rungameid/{g['appid']}"])
+        emit({"ok": True, "appid": g["appid"], "where": "mac"})
         return
     require_setup()
+    apply_profile_if_pending(cfg, g["appid"])
     renderer = resolve_renderer(cfg, g["appid"])
     restart = None
     fp = launch_fingerprint(cfg, g["appid"])
@@ -1537,6 +2757,9 @@ def cmd_play(args):
         wine(cfg, ["start", f"steam://rungameid/{g['appid']}"], game=g["appid"], wait=False)
         spawn_watch(g["appid"], g["name"])
         ok(f"asked Steam to launch {g['name']} ({renderer})")
+        if JSON_MODE:   # the app watches steam.launch_prompt_appid in `library --json` instead of waiting here
+            emit({"ok": True, "appid": g["appid"], "renderer": renderer, "restarted_steam": bool(restart), "started_steam": False})
+            return
         time.sleep(8)
         if steam_launch_prompt(g["appid"]):
             warn("Steam wants an answer before it starts the game: look at its window (a sync or notice dialog)")
@@ -1546,20 +2769,224 @@ def cmd_play(args):
         log = launch_steam(cfg, game=g["appid"], offline=offline)
         spawn_watch(g["appid"], g["name"])
         ok(f"starting Steam → {g['name']} ({renderer}); log: {log}")
+        emit({"ok": True, "appid": g["appid"], "renderer": renderer, "restarted_steam": bool(restart), "started_steam": True})
 
 
 def cmd_install(args):
+    """Start a download through Steam (steam://install; Steam shows its install dialog, which needs a click)."""
     require_setup()
     cfg = load_config()
-    appid = args.appid
+    appid = str(args.appid)
     if not appid.isdigit():
-        die("give the numeric Steam AppID (it's in the store page URL, e.g. store.steampowered.com/app/1245620)")
+        o = find_owned(appid)
+        if not o:
+            die("give the numeric Steam AppID (it's in the store page URL, e.g. store.steampowered.com/app/1245620) or an owned game's name", 3)
+        appid = o["appid"]
     url = f"steam://install/{appid}"
+    started = False
     if steam_running():
+        wine(cfg, ["start", "steam://open/main"], wait=False)
         wine(cfg, ["start", url], wait=False)
     else:
         launch_steam(cfg, extra_args=[url])
+        started = True
     ok(f"asked Steam to install app {appid}")
+    info("Steam shows its install dialog (location, shortcuts): confirm it in Steam's window")
+    emit({"ok": True, "appid": appid, "needs_user": True, "started_steam": started, "message": "Confirm the install in Steam's window"})
+
+
+def library_snapshot(cfg, include_free=False):
+    """Everything the library app shows, in one dict (fast: cached app info, no executable scans, no network)."""
+    games_all = all_games()
+    installed = {g["appid"]: g for g in games_all if g["where"] == "windows"}
+    assets = parse_assetcache()
+    dl_dir = os.path.join(STEAM_DIR, "steamapps", "downloading")
+    try:
+        pending_dl = {d for d in os.listdir(dl_dir) if d.isdigit()}
+    except OSError:
+        pending_dl = set()
+    running = steam_running()
+    running_dirs = running_game_installdirs() if running else set()
+    running_game = next((a for a, g in installed.items() if g.get("installdir", "").lower() in running_dirs), None)
+    games = []
+    for o in owned_games(include_free=True, cfg=cfg):
+        if not o["owned"] and not include_free:
+            continue
+        appid = o["appid"]
+        g = installed.get(appid)
+        gc = cfg["games"].get(appid, {})
+        flags = g["flags"] if g else 0
+        downloading = bool(flags & DOWNLOADING_BITS) or (g is None and appid in pending_dl)
+        btd = (g or {}).get("bytes_to_download", 0)
+        bd = (g or {}).get("bytes_downloaded", 0)
+        progress = (bd / btd) if (downloading and btd) else (1.0 if g and g["ready"] else 0.0)
+        dx12 = gc.get("dx12")
+        renderer, why = renderer_for(cfg, appid, dx12)
+        install_path = os.path.join(g["library"], "common", g["installdir"]) if g and g.get("installdir") else None
+        games.append({
+            "appid": appid, "name": o["name"], "type": o["type"], "where": "windows", "owned": o["owned"], "source": o["source"],
+            "installed": g is not None, "ready": bool(g and g["ready"]), "needs_update": bool(g and g["needs_update"] and not downloading),
+            "state_flags": flags, "state": [n for b, n in APP_STATE_BITS.items() if flags & b],
+            "downloading": downloading, "paused": bool(flags & 512), "progress": round(min(max(progress, 0.0), 1.0), 4),
+            "size": (g or {}).get("size", 0), "bytes_to_download": btd, "bytes_downloaded": bd,
+            "bytes_to_stage": (g or {}).get("bytes_to_stage", 0), "bytes_staged": (g or {}).get("bytes_staged", 0),
+            "installdir": (g or {}).get("installdir") or o.get("installdir", ""), "install_path": install_path,
+            "buildid": (g or {}).get("buildid", ""), "last_updated": (g or {}).get("last_updated", 0),
+            "last_played": max(o.get("last_played", 0), (g or {}).get("last_played", 0)), "playtime_min": o.get("playtime_min", 0),
+            "running": appid == running_game,
+            "renderer": renderer, "renderer_source": why, "dx12": dx12,
+            "settings": {k: v for k, v in gc.items() if k in GAME_KEYS or k == "env"},
+            "effective": {"renderer": renderer, "fps_cap": game_fps_cap(cfg, appid), "retina": effective_retina(cfg, appid),
+                          "metalfx": game_metalfx(cfg, appid)},
+            "profile": profile_status(cfg, appid, o.get("launch", [])),
+            "covers": cover_paths(appid, assets), "cover_urls": cover_urls(appid),
+            "compat": compat_cached(appid),
+            "launch": o.get("launch", []), "launch_options": o.get("launch_options", ""),
+            "oslist": o.get("oslist", ""), "controller_support": o.get("controller_support", ""),
+            "deck_category": o.get("deck_category"), "release_state": o.get("release_state", ""),
+            "developer": o.get("developer", ""), "publisher": o.get("publisher", ""), "dlc_owned": o.get("dlc_owned", []),
+        })
+    for g in games_all:   # native Mac Steam games (none on this Mac today, kept for completeness)
+        if g["where"] != "mac":
+            continue
+        games.append({"appid": g["appid"], "name": g["name"], "type": "game", "where": "mac", "owned": True, "source": ["installed"],
+                      "installed": True, "ready": g["ready"], "needs_update": g["needs_update"], "state_flags": g["flags"],
+                      "state": [n for b, n in APP_STATE_BITS.items() if g["flags"] & b], "downloading": bool(g["flags"] & DOWNLOADING_BITS),
+                      "paused": False, "progress": 1.0 if g["ready"] else 0.0, "size": g["size"], "bytes_to_download": 0, "bytes_downloaded": 0,
+                      "bytes_to_stage": 0, "bytes_staged": 0, "installdir": g["installdir"], "install_path": None, "buildid": "",
+                      "last_updated": 0, "last_played": g.get("last_played", 0), "playtime_min": 0, "running": False, "renderer": "native",
+                      "renderer_source": "mac", "dx12": None, "settings": {}, "effective": {}, "profile": profile_status(cfg, g["appid"], []),
+                      "covers": {k: None for k in COVER_KINDS}, "cover_urls": cover_urls(g["appid"]), "compat": compat_cached(g["appid"]),
+                      "launch": [], "launch_options": "", "oslist": "macos", "controller_support": "", "deck_category": None,
+                      "release_state": "", "developer": "", "publisher": "", "dlc_owned": []})
+    accounts = []
+    for sid, a in steam_accounts("windows").items():
+        if isinstance(a, dict):
+            accounts.append({"steamid": sid, "account_id": account_id(sid), "account_name": a.get("AccountName", ""),
+                             "persona": a.get("PersonaName", ""), "most_recent": a.get("MostRecent") == "1"})
+    st = running_state() if running else {}
+    prompt = next((a for a in installed if steam_launch_prompt(a)), None) if running else None
+    disk_path = STEAM_DIR if os.path.isdir(STEAM_DIR) else HOME
+    vfs = os.statvfs(disk_path)
+    owned_n = sum(1 for g in games if g["owned"])
+    return {
+        "schema": 1, "generated": _dt.datetime.now().isoformat(timespec="seconds"),
+        "layover": {"version": VERSION, "engine": ENGINE_ID, "engine_ready": engine_ready(), "steam_installed": steam_installed(),
+                    "root": ROOT, "covers_dir": COVERS, "repo": HERE, "d3d12_shim": bool(cfg.get("d3d12_shim", True)),
+                    "renderer_default": cfg.get("renderer", "auto"), "fps_cap_default": cfg.get("fps_cap", 0)},
+        "appcache": appcache_status(),
+        "steam": {"running": running, "native_running": native_steam_running(), "connection": steam_connection_state() if running else None,
+                  "offline": wants_offline(), "running_renderer": st.get("renderer"), "running_retina": st.get("retina"),
+                  "running_game": running_game, "launch_prompt_appid": prompt, "accounts": accounts},
+        "disk": {"path": disk_path, "free": vfs.f_bavail * vfs.f_frsize, "total": vfs.f_blocks * vfs.f_frsize},
+        "counts": {"owned": owned_n, "installed": sum(1 for g in games if g["installed"]), "free": len(games) - owned_n,
+                   "downloading": sum(1 for g in games if g["downloading"])},
+        "games": games,
+    }
+
+
+def cmd_library(args):
+    """Owned games (installed or not), with state, art and settings. `--json` is what Layover.app reads."""
+    cfg = load_config()
+    if args.refresh:
+        for n in ("appinfo", "packageinfo"):
+            _rm(os.path.join(CACHE_DIR, n + ".json"))
+        web_owned_games(cfg, refresh=True)
+    snap = library_snapshot(cfg, include_free=args.include_free)
+    if args.fetch_covers:
+        need = [g["appid"] for g in snap["games"] if g["where"] == "windows" and not (g["covers"].get("capsule") and g["covers"].get("hero"))]
+        if need:
+            spawn_detached(["covers", "--fetch"] + need[:80])
+    if JSON_MODE:
+        print(json.dumps(snap))
+        return
+    st = snap["steam"]
+    head(f"Steam library  ·  Steam {'running' if st['running'] else 'off'}" + (f" · {st['connection']}" if st.get("connection") else "")
+         + (" · offline mode" if st["offline"] else "") + f"  ·  {human(snap['disk']['free'])} free")
+    for title, pick in (("Installed", lambda g: g["installed"]), ("Owned, not installed", lambda g: g["owned"] and not g["installed"]),
+                        ("Free titles (not installed)", lambda g: not g["owned"] and not g["installed"])):
+        rows = [g for g in snap["games"] if pick(g)]
+        if not rows:
+            continue
+        print(paint(f"\n  {title}", C.B))
+        for g in rows:
+            if g["downloading"]:
+                state = paint(f"downloading {g['progress'] * 100:.0f}%", C.Y)
+            elif g["installed"]:
+                state = paint("ready", C.G) if g["ready"] else paint("needs update/validation", C.Y)
+            else:
+                state = paint("not installed", C.D)
+            comp = g["compat"]["label"] if g["compat"]["verdict"] != "unknown" else ""
+            size = human(g["size"]) if g["size"] else ""
+            print(f"  {g['appid']:>8}  {g['name']:<45} {size:>9}  {state:<28} {g['renderer']:<9} {comp}")
+    if not args.include_free and snap["counts"]["free"] == 0:
+        info("`layover library --include-free` also lists Steam's complimentary titles (TF2, Dota 2, ...)")
+    print()
+
+
+def cmd_remove(args):
+    """Uninstall a game through Steam (steam://uninstall; Steam asks for confirmation in its window)."""
+    require_setup()
+    cfg = load_config()
+    g = find_game(str(args.appid), all_games())
+    if not g:
+        die(f"'{args.appid}' is not an installed game (layover library)", 3)
+    if g["where"] == "mac":
+        die(f"{g['name']} is installed in native Mac Steam; remove it there", 3)
+    if g.get("installdir") and g["installdir"].lower() in running_game_installdirs():
+        die(f"{g['name']} is running; quit it first", 4)
+    if not JSON_MODE and not args.yes and tty():
+        try:
+            answer = input(f"  Remove {g['name']} ({human(g['size'])}) from this Mac? [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            info("nothing removed")
+            return
+    url = f"steam://uninstall/{g['appid']}"
+    started = False
+    if steam_running():
+        wine(cfg, ["start", "steam://open/main"], wait=False)
+        wine(cfg, ["start", url], wait=False)
+    else:
+        launch_steam(cfg, extra_args=[url])
+        started = True
+    ok(f"asked Steam to remove {g['name']} ({human(g['size'])})")
+    info("Steam asks for confirmation in its window; saves in Steam Cloud are kept")
+    emit({"ok": True, "appid": g["appid"], "name": g["name"], "size": g["size"], "needs_user": True, "started_steam": started,
+          "message": "Confirm the removal in Steam's window"})
+
+
+def cmd_covers(args):
+    """Report or fetch cover art (library capsule, header, hero) for owned games."""
+    ids = [str(a) for a in args.appid] or [g["appid"] for g in owned_games(include_free=args.include_free)]
+    kinds = tuple(k.strip() for k in args.kinds.split(",") if k.strip()) if args.kinds else ("capsule", "header", "hero")
+    if args.fetch:
+        rep = fetch_covers(ids, kinds)
+    else:
+        assets = parse_assetcache()
+        rep = {a: {k: ("have" if cover_paths(a, assets).get(k) else "missing") for k in kinds} for a in ids}
+    if JSON_MODE:
+        print(json.dumps({"ok": True, "covers": rep, "dir": COVERS}))
+        return
+    for a, r in rep.items():
+        info(f"{a}: " + ", ".join(f"{k} {v}" for k, v in r.items()))
+    info(f"downloads land in {COVERS}")
+
+
+def cmd_store(args):
+    """Open a game's store page (inside Windows Steam if it runs, else in the browser)."""
+    appid = str(args.appid)
+    if not appid.isdigit():
+        o = find_owned(appid)
+        if not o:
+            die("give a Steam AppID or an owned game's name", 3)
+        appid = o["appid"]
+    if steam_running():
+        wine(load_config(), ["start", f"steam://store/{appid}"], wait=False)
+    else:
+        subprocess.run(["open", f"https://store.steampowered.com/app/{appid}"])
+    emit({"ok": True, "appid": appid})
 
 
 def cmd_controller(args):
@@ -1663,13 +3090,9 @@ def cmd_flight(args):
         warn("Low Power Mode is on (System Settings → Battery) — it caps the GPU; turn it off for playing")
     else:
         ok("Low Power Mode off")
-    if sm2_exe_path():
-        missing = sm2_shaders_missing()
-        if missing:
-            warn(f"Spider-Man 2 pool-fix shaders not built ({len(missing)} missing): the symbiote scenes glitch and drop to 2 fps"
-                 + (" — run tools/dev/build-dxc.sh (once, 30-60 min), then layover sm2-shaders" if not dxc_tools_present() else " — run layover sm2-shaders"))
-        else:
-            ok("Spider-Man 2 pool-fix shaders built (symbiote + T-pose fix at the root)")
+    for g in win:   # per-game profile checks (Spider-Man 2's pool-fix shaders, ...)
+        for level, msg in profile_warnings(g["appid"]):
+            (warn if level == "warn" else ok)(msg)
     info("while a game runs Layover keeps the display awake and logs its health (logs/watch.log; a stall saves logs/stall-*.txt)")
 
     # Offline mode
@@ -1739,13 +3162,16 @@ def cmd_renderer(args):
 def cmd_game(args):
     """Show or set a per-game override (keys in GAME_KEYS, plus `env` as KEY=VALUE pairs)."""
     cfg = load_config()
-    g = find_game(args.game, all_games())
+    g = find_any_game(args.game)
     if not g:
-        die(f"no installed game matches '{args.game}' (layover games)")
+        die(f"no game matches '{args.game}' (layover library)", 3)
     cur = cfg["games"].get(g["appid"], {})
     if args.key is None:
-        head(g["name"])
         shown = {k: v for k, v in cur.items() if k != "dx12"}
+        if JSON_MODE:
+            print(json.dumps({"ok": True, "appid": g["appid"], "name": g["name"], "settings": shown}))
+            return
+        head(g["name"])
         info(json.dumps(shown, indent=2) if shown else "no overrides (uses the global settings)")
         info("keys: " + ", ".join(GAME_KEYS) + ", env; `layover game <game> <key> default` removes one")
         return
@@ -1780,11 +3206,19 @@ def cmd_game(args):
             die("metalfx needs a factor such as 2 or 1.5 (0 = off)")
         if cur[key] <= 1.0:
             cur.pop(key, None)
+    elif key == "d3dmetal_identity":
+        if val not in D3DMETAL_IDENTITIES:
+            die("d3dmetal_identity must be one of: " + ", ".join(D3DMETAL_IDENTITIES))
+        cur[key] = val
     else:
         cur[key] = val.lower() in ("1", "true", "on", "yes", "y")
-    cfg["games"][g["appid"]] = cur
+    if cur:
+        cfg["games"][g["appid"]] = cur
+    else:
+        cfg["games"].pop(g["appid"], None)
     save_config(cfg)
     ok(f"{g['name']}: {key} = {cur.get(key, 'default')}")
+    emit({"ok": True, "appid": g["appid"], "key": key, "value": cur.get(key), "settings": {k: v for k, v in cur.items() if k != "dx12"}})
     info("applies at the next `layover play` of this game (Steam is restarted if it was started with other settings)")
     if key == "metalfx" and key in cur:
         res = "1728x1117" if not effective_retina(cfg, g["appid"]) else "3456x2234"
@@ -2254,56 +3688,61 @@ def cmd_uninstall(args):
 # --------------------------------------------------------------------------- the Finder app
 APP_DIR = os.path.expanduser("~/Applications/Layover.app")
 APP_SRC_ICON = os.path.join(HERE, "app", "Layover.icns")
-MENU_SRC = os.path.join(HERE, "app", "menu.swift")                     # the pinball-backglass picker (AppKit)
-MENU_BIN = os.path.join(APP_DIR, "Contents", "MacOS", "LayoverMenu")
-MENU_ACTIONS = ["Open Steam", "Quit Steam", "Flight mode", "Back online"]
+APP_SRC_DIR = os.path.join(HERE, "app", "LayoverApp")                  # the library window (AppKit, Swift)
+APP_BIN = os.path.join(APP_DIR, "Contents", "MacOS", "LayoverApp")
+APP_BUILD_STAMP = os.path.join(APP_DIR, "Contents", "Resources", "LayoverApp.sources")
+MENU_ACTIONS = ["Open Steam", "Quit Steam", "Flight mode", "Back online"]   # the no-Swift fallback dialog
 
 
-def menu_binary(quiet=True):
-    """Compile app/menu.swift into the app bundle when missing or stale. Returns the path or None.
-    The Command Line Tools' newest SDK can be ahead of their swiftc (seen 2026-10-11: SDK 26.2 vs Swift
-    6.1.2 -> "this SDK is not supported by the compiler"), so older SDKs in the same folder are tried too."""
-    if not os.path.exists(MENU_SRC):
+def app_sources():
+    return sorted(glob.glob(os.path.join(APP_SRC_DIR, "*.swift")))
+
+
+def app_binary(quiet=True):
+    """Compile app/LayoverApp/*.swift into the bundle when missing or stale (newest source, or a changed file
+    list). Returns the path or None. The Command Line Tools' newest SDK can be ahead of their swiftc (seen
+    2026-10-11: SDK 26.2 vs Swift 6.1.2 -> "this SDK is not supported by the compiler"), so the MacOSX15+
+    SDKs in the same folder are tried from newest to oldest."""
+    srcs = app_sources()
+    if not srcs:
         return None
+    stamp = "\n".join(os.path.basename(p) for p in srcs)
     try:
-        if os.path.exists(MENU_BIN) and os.path.getmtime(MENU_BIN) >= os.path.getmtime(MENU_SRC):
-            return MENU_BIN
+        newest = max(os.path.getmtime(p) for p in srcs)
+        with open(APP_BUILD_STAMP) as f:
+            same_list = f.read() == stamp
+        if same_list and os.path.exists(APP_BIN) and os.path.getmtime(APP_BIN) >= newest:
+            return APP_BIN
     except OSError:
         pass
-    os.makedirs(os.path.dirname(MENU_BIN), exist_ok=True)
-    sdks = [None] + sorted(glob.glob("/Library/Developer/CommandLineTools/SDKs/MacOSX1[5-9]*.sdk"), reverse=True)
-    for sdk in sdks:
-        cmd = ["xcrun", "swiftc", "-O", "-swift-version", "5"] + (["-sdk", sdk] if sdk else []) + ["-framework", "AppKit", "-o", MENU_BIN, MENU_SRC]
-        r = run(cmd)
-        if r.returncode == 0 and os.path.exists(MENU_BIN):
-            if not quiet:
-                ok("menu built" + (f" (SDK {os.path.basename(sdk)})" if sdk else ""))
-            return MENU_BIN
+    os.makedirs(os.path.dirname(APP_BIN), exist_ok=True)
+    os.makedirs(os.path.dirname(APP_BUILD_STAMP), exist_ok=True)
     if not quiet:
-        warn("could not build the menu (swiftc); Layover.app falls back to a plain list dialog")
+        info("building the library app (swiftc, about 20 s)")
+    sdks = [None] + sorted(glob.glob("/Library/Developer/CommandLineTools/SDKs/MacOSX1[5-9]*.sdk"), reverse=True)
+    last_err = ""
+    for sdk in sdks:
+        cmd = ["xcrun", "swiftc", "-O", "-swift-version", "5", "-target", "arm64-apple-macosx14.0", "-module-name", "LayoverApp"] \
+            + (["-sdk", sdk] if sdk else []) + ["-framework", "AppKit", "-o", APP_BIN] + srcs
+        r = run(cmd)
+        if r.returncode == 0 and os.path.exists(APP_BIN):
+            with open(APP_BUILD_STAMP, "w") as f:
+                f.write(stamp)
+            for old in ("LayoverMenu",):   # the pre-2026-11 pinball menu binary
+                try:
+                    os.remove(os.path.join(os.path.dirname(APP_BIN), old))
+                except OSError:
+                    pass
+            if not quiet:
+                ok("library app built" + (f" (SDK {os.path.basename(sdk)})" if sdk else ""))
+            return APP_BIN
+        errs = [l for l in (r.stderr or "").splitlines() if "error:" in l]
+        if errs and "not supported by the compiler" not in r.stderr:
+            last_err = errs[0]
+            break   # a real compile error: other SDKs will not help
+    if not quiet:
+        warn("could not build the library app (swiftc)" + (f": {last_err[:160]}" if last_err else "") + "; Layover.app falls back to a plain list dialog")
     return None
-
-
-def pick_in_menu(names, status):
-    """Show the backglass menu; returns the chosen name, None for cancel, or False if the menu is unavailable."""
-    binary = menu_binary()
-    if not binary:
-        return False
-    args = [binary]
-    for n in names:
-        args += ["--game", n]
-    for a in MENU_ACTIONS:
-        args += ["--action", a]
-    args += ["--status", status]
-    try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=3600)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    if r.returncode == 0 and r.stdout.strip():
-        return r.stdout.strip().splitlines()[-1]
-    if r.returncode == 1:
-        return None
-    return False
 
 
 def osa(script):
@@ -2332,28 +3771,41 @@ def cmd_app(args):
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>Layover</string>
   <key>CFBundleIconFile</key><string>Layover</string>
-  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>LayoverScript</key><string>{os.path.join(HERE, 'layover')}</string>
+  <key>LayoverPython</key><string>{sys.executable}</string>
 </dict></plist>
 """)
     launcher = os.path.join(macos, "Layover")
     with open(launcher, "w") as f:
         f.write(f"""#!/bin/zsh
-# Layover.app: launches `layover app-launch` from the repo without a Terminal window.
-# Any python3 will do (the program only uses the standard library): Homebrew's if present, else Apple's.
+# Layover.app: opens the library window (LayoverApp, Swift) which drives `layover` from the repo; without the
+# Swift build it falls back to `layover app-launch` (a plain list dialog). Any python3 will do (stdlib only).
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+export LAYOVER_SCRIPT="{os.path.join(HERE, 'layover')}"
 for py in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
-  [ -x "$py" ] && exec "$py" "{os.path.join(HERE, 'layover')}" app-launch >> "{os.path.join(LOGS, 'app.log')}" 2>&1
+  [ -x "$py" ] && export LAYOVER_PYTHON="$py" && break
 done
+APP="$(dirname "$0")/LayoverApp"
+[ -x "$APP" ] && exec "$APP" >> "{os.path.join(LOGS, 'app.log')}" 2>&1
+[ -n "$LAYOVER_PYTHON" ] && exec "$LAYOVER_PYTHON" "$LAYOVER_SCRIPT" app-launch >> "{os.path.join(LOGS, 'app.log')}" 2>&1
 osascript -e 'display dialog "Layover needs python3 (install the Xcode Command Line Tools or Homebrew python)." buttons {{"OK"}} with icon stop'
 """)
     os.chmod(launcher, 0o755)
     if os.path.exists(APP_SRC_ICON):
         shutil.copy2(APP_SRC_ICON, os.path.join(res, "Layover.icns"))
-    menu_binary(quiet=False)
+    binary = app_binary(quiet=False)
     run(["touch", APP_DIR])   # make Finder notice the icon
+    if getattr(args, "snapshot", None):
+        if not binary:
+            die("no library app binary to snapshot")
+        r = run([binary, "--snapshot", args.snapshot, "--wait-covers", "5"])
+        print(r.stdout.strip() or r.stderr.strip())
+        return
     ok(f"{APP_DIR} built (double-click it, or Spotlight → Layover)")
-    info("it lists your installed Windows games and launches the one you pick; Steam starts on its own if needed")
+    info("the library window shows every game you own; Install, Play and Remove from there. Steam starts on its own if needed")
 
 
 def cmd_app_launch(args):
@@ -2373,16 +3825,13 @@ def cmd_app_launch(args):
         games.sort(key=lambda g: g["name"].lower())
         names = [g["name"] for g in games if g["ready"]]
         status = f"STEAM {'ON' if steam_running() else 'OFF'} · {'FLIGHT MODE' if wants_offline() else 'ONLINE MODE'} · {len(names)} GAME{'S' if len(names) != 1 else ''} READY"
-        pick = pick_in_menu(names, status)
-        if pick is None:
+        # the plain dialog: only reached when the Swift library app could not be built (see cmd_app)
+        items = names + MENU_ACTIONS
+        lst = ", ".join('"' + n.replace('"', "'") + '"' for n in items)
+        default = '"' + (names[0].replace('"', "'") if names else "Open Steam") + '"'
+        pick = osa(f'choose from list {{{lst}}} with title "Layover" with prompt "What do you want to play? ({status.lower()})" default items {{{default}}} OK button name "Launch"')
+        if not pick or pick == "false":
             return
-        if pick is False:   # no menu binary: the plain dialog
-            items = names + MENU_ACTIONS
-            lst = ", ".join('"' + n.replace('"', "'") + '"' for n in items)
-            default = '"' + (names[0].replace('"', "'") if names else "Open Steam") + '"'
-            pick = osa(f'choose from list {{{lst}}} with title "Layover" with prompt "What do you want to play?" default items {{{default}}} OK button name "Launch"')
-            if not pick or pick == "false":
-                return
         if pick == "Open Steam":
             cmd_steam(argparse.Namespace(offline=False, online=False, extra=[]))
             notify("Layover", "Steam is starting")
@@ -2489,11 +3938,56 @@ def main(argv=None):
     s = sub.add_parser("play", help="launch a game by name or AppID")
     s.add_argument("game")
     s.add_argument("--offline", action="store_true", help="start Steam offline if it isn't running")
+    s.add_argument("--install", action="store_true", help="if the game is owned but not installed, start the download instead")
+    s.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_play)
 
-    s = sub.add_parser("install", help="start downloading a game by Steam AppID")
+    s = sub.add_parser("install", help="start downloading a game by Steam AppID (or an owned game's name)")
     s.add_argument("appid")
+    s.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_install)
+
+    s = sub.add_parser("library", help="all owned games: installed or not, state, size, renderer, compatibility")
+    s.add_argument("--json", action="store_true", help="machine-readable (what Layover.app reads)")
+    s.add_argument("--include-free", action="store_true", help="also Steam's complimentary titles (TF2, Dota 2, ...)")
+    s.add_argument("--refresh", action="store_true", help="re-read Steam's caches (and the Web API list if steam_api_key is set)")
+    s.add_argument("--fetch-covers", action="store_true", help="fetch missing cover art in the background")
+    s.set_defaults(fn=cmd_library)
+
+    s = sub.add_parser("remove", help="uninstall a game through Steam (Steam asks for confirmation)")
+    s.add_argument("appid", help="AppID or name of an installed game")
+    s.add_argument("--yes", action="store_true", help="don't ask here (Steam still asks)")
+    s.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_remove)
+
+    s = sub.add_parser("covers", help="report or fetch cover art for owned games")
+    s.add_argument("appid", nargs="*")
+    s.add_argument("--fetch", action="store_true", help="download what is missing from Steam's CDN")
+    s.add_argument("--kinds", help="comma list: capsule,header,hero,logo (default capsule,header,hero)")
+    s.add_argument("--include-free", action="store_true")
+    s.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_covers)
+
+    s = sub.add_parser("compat", help="will it run? DirectX version, anti-cheat, Steam Deck rating, ProtonDB (cached a week)")
+    s.add_argument("appid", nargs="*", help="game name(s)/AppID(s)")
+    s.add_argument("--all", action="store_true", help="every owned game")
+    s.add_argument("--include-free", action="store_true")
+    s.add_argument("--refresh", action="store_true", help="re-scan the files and ask the store/ProtonDB again")
+    s.add_argument("--offline", action="store_true", help="local facts only")
+    s.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_compat)
+
+    s = sub.add_parser("profile", help="Layover's recommended settings for a game (applied at the first play)")
+    s.add_argument("game", help="game name/AppID")
+    s.add_argument("--apply", action="store_true", help="apply now (keeps values you set yourself)")
+    s.add_argument("--reset", action="store_true", help="apply, replacing your own values with the recommended ones")
+    s.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_profile)
+
+    s = sub.add_parser("store", help="open a game's Steam store page")
+    s.add_argument("appid")
+    s.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_store)
 
     s = sub.add_parser("controller", help="detect / pair / test the Xbox controller")
     s.add_argument("--test", action="store_true", help="live input test using Apple's GameController framework")
@@ -2512,10 +4006,11 @@ def main(argv=None):
     s.add_argument("renderer", nargs="?", choices=RENDERER_CHOICES)
     s.set_defaults(fn=lambda a: cmd_renderer(a) if (a.game is None or a.renderer) else die("usage: layover renderer <game|default> <dxmt|wined3d|d3dmetal>"))
 
-    s = sub.add_parser("game", help="show or change one game's overrides (renderer, fps_cap, retina, metalfx, metal_hud, msync, steam_overlay, env)")
-    s.add_argument("game", help="game name/AppID")
+    s = sub.add_parser("game", help="show or change one game's overrides (renderer, fps_cap, retina, metalfx, metal_hud, msync, steam_overlay, advertise_avx, d3dmetal_identity, env)")
+    s.add_argument("game", help="game name/AppID (installed or just owned)")
     s.add_argument("key", nargs="?")
     s.add_argument("value", nargs="?", help="'default' removes the override; env takes KEY=VALUE pairs (KEY= removes)")
+    s.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     s.set_defaults(fn=lambda a: cmd_game(a) if (a.key is None or a.value is not None) else die("usage: layover game <game> [<key> <value>]"))
 
     s = sub.add_parser("config", help="show or change a setting (msync, metal_hud, advertise_avx, retina, steam_overlay, fps_cap, steam_args, d3dmetal_identity)")
@@ -2541,7 +4036,9 @@ def main(argv=None):
     s = sub.add_parser("uninstall", help="remove Layover and everything it installed")
     s.add_argument("--yes", action="store_true")
     s.set_defaults(fn=cmd_uninstall)
-    sub.add_parser("app", help="build ~/Applications/Layover.app (double-click to play, no Terminal)").set_defaults(fn=cmd_app)
+    s = sub.add_parser("app", help="build ~/Applications/Layover.app: the library window (double-click, no Terminal)")
+    s.add_argument("--snapshot", help="render the window to a PNG without showing it (for checking the UI headless)")
+    s.set_defaults(fn=cmd_app)
     sub.add_parser("app-launch", help=argparse.SUPPRESS).set_defaults(fn=cmd_app_launch)
     sub.add_parser("menu", help="interactive menu").set_defaults(fn=cmd_menu)
     sub.add_parser("help", help="show help").set_defaults(fn=lambda a: p.print_help())
@@ -2550,6 +4047,8 @@ def main(argv=None):
     if len(argv) >= 3 and argv[0] == "config" and argv[2].startswith("-"):
         argv.insert(2, "--")   # let values like "-cef-disable-gpu" through argparse
     args = p.parse_args(argv)
+    global JSON_MODE
+    JSON_MODE = bool(getattr(args, "json", False))
     if not args.cmd:
         cmd_menu(args) if tty() else p.print_help()
         return
@@ -2558,6 +4057,11 @@ def main(argv=None):
     except KeyboardInterrupt:
         print()
         sys.exit(130)
+    except Exception as e:   # an unexpected failure still yields one JSON document for the app
+        if not JSON_MODE:
+            raise
+        print(json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}", "code": 1}))
+        sys.exit(1)
 
 
 if __name__ == "__main__":
