@@ -1,6 +1,47 @@
-# Handoff notes (2026-11-01: library app + generic backend; 2026-10-31: symbiote stall root cause + pool fix)
+# Handoff notes (2026-11-12: battery saver + shader swap; 2026-11-01: library app + generic backend; 2026-10-31: symbiote stall root cause + pool fix)
 
 Read this first if you are a new agent (or future me) picking up Layover.
+
+## Battery saver, shader swap, in-game screenshots (2026-11-12; ground rendering still UNCONFIRMED)
+
+User report: Spider-Man 2 "drains the battery super fast" and "still rendering problems with ground landscapes".
+
+**Battery (done, measured).** The user raised the game to 2624x1640 FSR Quality + Ultra shadows on Nov 7;
+that pegs the GPU (30-45 fps, ~95 W, 100% -> 8% in 58 min on Nov 9). New:
+* `battery_saver` (default on) + `battery_fps_cap` (default 40), global or per game. `effective_fps_cap()`.
+  The shim reads `LAYOVER_LIVE` (ROOT/live.env, "fps=N") every second; `layover watch` rewrites it when the
+  power source changes (it loads the config once at start, so a config change needs a relaunch).
+* `PROFILES[appid]["battery"]["registry"]`: values written at launch on battery; the user's own values are
+  kept in `games.<appid>.power_saved` and restored at the next launch on the charger (`apply_power_profile`,
+  both directions verified). Spider-Man 2: `UpscaleQuality` 1 = Performance (1312x820 internal),
+  3 = Quality (1749x1093), 5 clamps to Quality; `ShadowQuality` 2 = Medium, 3 = High, 5 = Ultra. The game log
+  prints "Upscale quality:", "Shadow Quality:", "ConvertScreenToRenderRes" at start.
+* Power without sudo: `ioreg -rw0 -c AppleSmartBattery`, Voltage x InstantAmperage (updates every 30-60 s).
+  Fish market, user's settings: uncapped 44 fps 60 W, cap 40 56-58 W, cap 30 44 W. Sandman interior with the
+  battery profile: 40 fps 62 W (was 21-27 fps without the profile), 30 fps 47 W.
+
+**Shader swap (built, works mechanically, visual effect NOT shown).** `shims/d3d12shim/shader_swap.c` +
+`tools/typed2raw.py` + `layover shaderfix`. The 2046 MB pool has two more wide typed SRVs besides the R32
+ones: fmt 28 RGBA8 (`MainPaintVBView`, t77 space1, vertex paint) and fmt 24 RGB10A2 (`MainVBNrmTanView`,
+t95 space1); both stop at 2^28 elements = 1 GB under D3DMetal. The fix rewrites every shader that loads from
+them to `rawBufferLoad` on the raw view the same shaders already declare (t97 space1) and decodes unorm in
+the shader; the shim swaps by FNV-1 hash at pipeline creation, saves unknown users to a pending folder, and
+`layover play` / `watch` build them (dxc -dumpbin -> rewrite -> dxa -> dxv). 118 shaders fixed, 2 impostor
+VSes skipped (no t97), 2159 pipelines swapped, 0 failed. BUT: A/B in the Sandman interior (save "Manual 4")
+and the fish market shows no visible difference between fix on and fix off, and there is no save in the open
+city on this Mac to reproduce the user's symptom. So it is not known whether this is the ground bug. The
+format-to-register mapping (paint = RGBA8, nrmtan = RGB10A2) is inferred, not proven. Disable for one game
+with `layover game 2651280 env "LAYOVER_SHADER_SWAP=x"`.
+Not looked at yet: UAV fmt 57 R16_UINT over the pool (1,072,693,248 elements: writes above 512 MB are
+lost; user unknown); `g_MainVBRawView` t34 typed shaders (2ce6ae4f, 66f5573a, 6ec1223f); DS/HS shaders.
+Next step: get a screenshot of the defect from the user (`layover shot` while it is on screen) or a save
+in the open city, then A/B there.
+
+**Diagnostics.** `shims/d3d12shim/diag.c`: `LAYOVER_DUMP_SHADERS=<win dir>` dumps every shader as
+`<stage>-<hash>.dxbc`; `LAYOVER_SHOT_DIR` + a `request` file = back-buffer copy to BMP (no Screen Recording
+permission needed); `layover shot [out]` wraps it. Driving the game: tools/dev sendkey.exe; in the save
+list never press R (delete). Loading a save overwrites the autosave: back up the save folder first
+(done this session; backup in ROOT/backups/sm2-saves-2026-11-12_1951, autosave restored).
 
 ## Library app + "any game" backend (2026-11-01)
 

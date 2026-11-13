@@ -38,6 +38,9 @@
 #include <string.h>
 #include <stdint.h>
 
+void diag_install(void); void diag_present(IDXGISwapChain *sc); void diag_swapchain_queue(IUnknown *dev); void diag_shader(const void *code, SIZE_T len, const char *stage); void diag_shader_stream(const void *stream, SIZE_T size); int diag_dumping(void); long diag_dumped(void);
+void shader_swap_install(void); const void *shader_swap_lookup(const void *code, SIZE_T len, SIZE_T *out_len); void shader_swap_result(int ok); int shader_swap_active(void); void shader_swap_stats(char *out, size_t cap);
+static int swap_bytecode(D3D12_SHADER_BYTECODE *b) { SIZE_T n; const void *alt = b->pShaderBytecode ? shader_swap_lookup(b->pShaderBytecode, b->BytecodeLength, &n) : NULL; if (!alt) return 0; b->pShaderBytecode = alt; b->BytecodeLength = n; return 1; }
 static HMODULE real_dll;
 static HINSTANCE self;
 static int tsshim, verbose, logging;
@@ -202,6 +205,7 @@ static DWORD WINAPI stats_thread(LPVOID arg)
         if (fps10 >= 200) { if (good_windows < 6) good_windows++; if (stalled) { stall_note("RECOVERED", fps10); stalled = 0; } }
         else if (fps10 < stall_fps10 && good_windows >= 6 && !stalled) { stalled = 1; stall_note("STALL", fps10); }
         if (pool_res) { char sk[300], pf[300]; sm2_skin_stats(sk, sizeof sk); NOTE("pool: high-water %llu MB of %llu, copies %ld, past-end %ld | %s", (unsigned long long)(pool_hw >> 20), (unsigned long long)(pool_width >> 20), pool_copies, pool_oob, sk); pool_fix_stats(pf, sizeof pf); NOTE("%s", pf); }
+        { char sw[300]; shader_swap_stats(sw, sizeof sw); if (sw[0]) NOTE("%s", sw); }
         if (fence_sleep) LOG("fence waits: episodes=%lld hist(<50us %ld, <200us %ld, <1ms %ld, <4ms %ld, <16ms %ld, <64ms %ld, <256ms %ld, more %ld) polls=%lld slept=%ld", (long long)fence_episodes, fence_hist[0], fence_hist[1], fence_hist[2], fence_hist[3], fence_hist[4], fence_hist[5], fence_hist[6], fence_hist[7], (long long)c_fence_polls, c_fence_sleeps);
         LOG("stats: presents=%ld (paced %ld) fence-polls=%lld (slept %ld) execlists=%ld dispatch=%ld dispatchmesh=%ld draw=%ld drawidx=%ld execind=%ld copybuf=%ld setpso=%ld map=%ld barrier=%ld | views srv_buf=%ld uav_buf=%ld srv_tex=%ld uav_tex=%ld | pso gfx=%ld cs=%ld gen=%ld FAIL=%ld | res buf=%ld tex=%ld",
             c_present, c_present_paced, (long long)c_fence_polls, c_fence_sleeps, c_execlists, c_dispatch, c_dispatchmesh, c_draw, c_drawidx, c_execind, c_copybuf, c_setpso, c_map, c_barrier, c_srv_buf, c_uav_buf, c_srv_tex, c_uav_tex, c_pso_gfx, c_pso_cs, c_pso_gen, c_pso_fail, c_res_buf, c_res_tex);
@@ -486,15 +490,17 @@ static void present_timing(UINT64 t0, UINT64 t1)
 }
 static HRESULT STDMETHODCALLTYPE hook_Present(IDXGISwapChain *sc, UINT sync, UINT flags)
 {
-    UINT64 t0 = now_ticks();
-    HRESULT hr = real_Present(sc, sync, flags);
+    UINT64 t0; HRESULT hr;
+    if (!(flags & DXGI_PRESENT_TEST)) diag_present(sc);
+    t0 = now_ticks(); hr = real_Present(sc, sync, flags);
     if (!(flags & DXGI_PRESENT_TEST)) { present_timing(t0, now_ticks()); InterlockedIncrement(&c_present); fps_pace(); }
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE hook_Present1(IDXGISwapChain1 *sc, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *pp)
 {
-    UINT64 t0 = now_ticks();
-    HRESULT hr = real_Present1(sc, sync, flags, pp);
+    UINT64 t0; HRESULT hr;
+    if (!(flags & DXGI_PRESENT_TEST)) diag_present((IDXGISwapChain *)sc);
+    t0 = now_ticks(); hr = real_Present1(sc, sync, flags, pp);
     if (!(flags & DXGI_PRESENT_TEST)) { present_timing(t0, now_ticks()); InterlockedIncrement(&c_present); fps_pace(); }
     return hr;
 }
@@ -505,31 +511,58 @@ static void patch_swapchain(IDXGISwapChain *sc)
     if (!sc) return;
     patch_slot((void **)&sc->lpVtbl->Present, (void *)hook_Present, (void **)&real_Present);
     if (SUCCEEDED(sc->lpVtbl->QueryInterface(sc, &IID_IDXGISwapChain1, &p)) && p) { IDXGISwapChain1 *s1 = p; patch_slot((void **)&s1->lpVtbl->Present1, (void *)hook_Present1, (void **)&real_Present1); patch_slot((void **)&s1->lpVtbl->Present, (void *)hook_Present, (void **)&real_Present); s1->lpVtbl->Release(s1); }
-    if (!swapchain_patched) { swapchain_patched = 1; NOTE("frame limiter: swapchain %p vtable patched, pacing Present to %llu fps", (void *)sc, (unsigned long long)(qpc_freq / fps_period)); }
+    if (!swapchain_patched) { swapchain_patched = 1; NOTE("frame limiter: swapchain %p vtable patched, pacing Present to %llu fps (0 = no cap)", (void *)sc, (unsigned long long)(fps_period ? qpc_freq / fps_period : 0)); }
 }
 typedef HRESULT (STDMETHODCALLTYPE *PFN_CSC)(IDXGIFactory *, IUnknown *, DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_CSCH)(IDXGIFactory2 *, IUnknown *, HWND, const DXGI_SWAP_CHAIN_DESC1 *, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *, IDXGIOutput *, IDXGISwapChain1 **);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_CSCW)(IDXGIFactory2 *, IUnknown *, IUnknown *, const DXGI_SWAP_CHAIN_DESC1 *, IDXGIOutput *, IDXGISwapChain1 **);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_CSCC)(IDXGIFactory2 *, IUnknown *, const DXGI_SWAP_CHAIN_DESC1 *, IDXGIOutput *, IDXGISwapChain1 **);
 static PFN_CSC real_CSC; static PFN_CSCH real_CSCH; static PFN_CSCW real_CSCW; static PFN_CSCC real_CSCC;
-static HRESULT STDMETHODCALLTYPE hook_CSC(IDXGIFactory *f, IUnknown *dev, DXGI_SWAP_CHAIN_DESC *d, IDXGISwapChain **out) { HRESULT hr = real_CSC(f, dev, d, out); if (SUCCEEDED(hr) && out && *out) patch_swapchain(*out); return hr; }
-static HRESULT STDMETHODCALLTYPE hook_CSCH(IDXGIFactory2 *f, IUnknown *dev, HWND w, const DXGI_SWAP_CHAIN_DESC1 *d, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fd, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCH(f, dev, w, d, fd, o, out); if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
-static HRESULT STDMETHODCALLTYPE hook_CSCW(IDXGIFactory2 *f, IUnknown *dev, IUnknown *w, const DXGI_SWAP_CHAIN_DESC1 *d, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCW(f, dev, w, d, o, out); if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
-static HRESULT STDMETHODCALLTYPE hook_CSCC(IDXGIFactory2 *f, IUnknown *dev, const DXGI_SWAP_CHAIN_DESC1 *d, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCC(f, dev, d, o, out); if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
+static HRESULT STDMETHODCALLTYPE hook_CSC(IDXGIFactory *f, IUnknown *dev, DXGI_SWAP_CHAIN_DESC *d, IDXGISwapChain **out) { HRESULT hr = real_CSC(f, dev, d, out); if (SUCCEEDED(hr)) diag_swapchain_queue(dev); if (SUCCEEDED(hr) && out && *out) patch_swapchain(*out); return hr; }
+static HRESULT STDMETHODCALLTYPE hook_CSCH(IDXGIFactory2 *f, IUnknown *dev, HWND w, const DXGI_SWAP_CHAIN_DESC1 *d, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fd, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCH(f, dev, w, d, fd, o, out); if (SUCCEEDED(hr)) diag_swapchain_queue(dev); if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
+static HRESULT STDMETHODCALLTYPE hook_CSCW(IDXGIFactory2 *f, IUnknown *dev, IUnknown *w, const DXGI_SWAP_CHAIN_DESC1 *d, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCW(f, dev, w, d, o, out); if (SUCCEEDED(hr)) diag_swapchain_queue(dev); if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
+static HRESULT STDMETHODCALLTYPE hook_CSCC(IDXGIFactory2 *f, IUnknown *dev, const DXGI_SWAP_CHAIN_DESC1 *d, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCC(f, dev, d, o, out); if (SUCCEEDED(hr)) diag_swapchain_queue(dev); if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
+// LAYOVER_LIVE=<win path>: a small file the launcher rewrites while the game runs ("fps=40"; 0 = no cap). Read once
+// a second, so the cap follows the power source: unplug the Mac mid-game and the battery cap applies at once.
+static char live_path[MAX_PATH]; static int live_fps = -1;
+static DWORD WINAPI live_thread(LPVOID arg)
+{
+    FILETIME seen = {0};
+    for (;;) {
+        WIN32_FILE_ATTRIBUTE_DATA a;
+        if (GetFileAttributesExA(live_path, GetFileExInfoStandard, &a) && CompareFileTime(&a.ftLastWriteTime, &seen)) {
+            FILE *f = fopen(live_path, "r"); char line[128];
+            seen = a.ftLastWriteTime;
+            if (f) {
+                while (fgets(line, sizeof line, f)) {
+                    int n;
+                    if (sscanf(line, "fps=%d", &n) == 1 && n != live_fps && (n == 0 || (n >= 15 && n <= 240))) {
+                        EnterCriticalSection(&fps_lock); fps_period = n ? qpc_freq / (UINT64)n : 0; fps_next = 0; LeaveCriticalSection(&fps_lock);
+                        NOTE("frame limiter: live cap %d -> %d fps (%s)", live_fps, n, live_path); live_fps = n;
+                    }
+                }
+                fclose(f);
+            }
+        }
+        Sleep(1000);
+    }
+    return 0;
+}
 static int fps_factory_done;
 static void install_fps_limiter(void)
 {
-    char v[32]; int fps; HMODULE dxgi; IDXGIFactory *f = NULL; void *p;
+    char v[32]; int fps = 0, live; HMODULE dxgi; IDXGIFactory *f = NULL; void *p;
     typedef HRESULT (WINAPI *PFN_CDF1_)(REFIID, void **);
     PFN_CDF1_ cdf1;
     if (fps_factory_done) return;
     fps_factory_done = 1;
-    if (!GetEnvironmentVariableA("LAYOVER_MAX_FPS", v, sizeof v)) return;
-    fps = atoi(v);
-    if (fps <= 0) return;
-    if (fps < 15 || fps > 240) { NOTE("LAYOVER_MAX_FPS=%s ignored (15..240)", v); return; }
+    live = GetEnvironmentVariableA("LAYOVER_LIVE", live_path, sizeof live_path) >= 3;
+    if (GetEnvironmentVariableA("LAYOVER_MAX_FPS", v, sizeof v)) fps = atoi(v);
+    if (fps && (fps < 15 || fps > 240)) { NOTE("LAYOVER_MAX_FPS=%s ignored (15..240)", v); fps = 0; }
+    if (fps <= 0 && !live && GetEnvironmentVariableA("LAYOVER_SHOT_DIR", NULL, 0) == 0) return;
     InitializeCriticalSection(&fps_lock);
-    fps_period = qpc_freq / (UINT64)fps;
+    fps_period = fps > 0 ? qpc_freq / (UINT64)fps : 0; live_fps = fps;
+    if (live) CreateThread(NULL, 0, live_thread, NULL, 0, NULL);
     dxgi = LoadLibraryA("dxgi.dll"); cdf1 = dxgi ? (PFN_CDF1_)GetProcAddress(dxgi, "CreateDXGIFactory1") : NULL;
     if (!cdf1 || FAILED(cdf1(&IID_IDXGIFactory1, (void **)&f)) || !f) { NOTE("frame limiter: no DXGI factory (dxgi %p); cap not applied", (void *)dxgi); fps_period = 0; return; }
     patch_slot((void **)&f->lpVtbl->CreateSwapChain, (void *)hook_CSC, (void **)&real_CSC);
@@ -541,7 +574,7 @@ static void install_fps_limiter(void)
         f2->lpVtbl->Release(f2);
     } else NOTE("frame limiter: IDXGIFactory2 not available; only IDXGIFactory::CreateSwapChain is covered");
     f->lpVtbl->Release(f);
-    NOTE("frame limiter armed: %d fps (LAYOVER_MAX_FPS); waiting for the game's swapchain", fps);
+    NOTE("frame limiter armed: %d fps (LAYOVER_MAX_FPS)%s; waiting for the game's swapchain", fps, live ? ", live cap file watched" : "");
 }
 
 // ---- logpoints (LAYOVER_LOGPOINTS=rva,rva,...): INT3 at exe+rva, logged by a vectored handler -----
@@ -688,8 +721,8 @@ static void STDMETHODCALLTYPE hook_CreateShaderResourceView(ID3D12Device *dev, I
         InterlockedIncrement(&c_srv_buf);
         int interesting = d->Format == DXGI_FORMAT_R32G32B32_FLOAT || d->Format == DXGI_FORMAT_R32G32B32_UINT || d->Format == DXGI_FORMAT_R32G32B32_SINT || d->Buffer.NumElements >= (1u << 24);
         if (verbose || interesting)
-            LOG("SRV buffer res=%p (width %llu) fmt=%u first=%llu num=%u stride=%u flags=%u", res, (unsigned long long)res_width(res), (unsigned)d->Format,
-                (unsigned long long)d->Buffer.FirstElement, d->Buffer.NumElements, d->Buffer.StructureByteStride, (unsigned)d->Buffer.Flags);
+            LOG("SRV buffer res=%p (width %llu) fmt=%u first=%llu num=%u stride=%u flags=%u at %llx", res, (unsigned long long)res_width(res), (unsigned)d->Format,
+                (unsigned long long)d->Buffer.FirstElement, d->Buffer.NumElements, d->Buffer.StructureByteStride, (unsigned)d->Buffer.Flags, (unsigned long long)h.ptr);
     } else if (d) InterlockedIncrement(&c_srv_tex);
     real_CreateShaderResourceView(dev, res, d, h);
 }
@@ -708,7 +741,19 @@ static void STDMETHODCALLTYPE hook_CreateUnorderedAccessView(ID3D12Device *dev, 
 }
 static HRESULT STDMETHODCALLTYPE hook_CreateGraphicsPipelineState(ID3D12Device *dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *d, REFIID riid, void **out)
 {
-    HRESULT hr = real_CreateGraphicsPipelineState(dev, d, riid, out);
+    HRESULT hr;
+    if (d && diag_dumping()) { diag_shader(d->VS.pShaderBytecode, d->VS.BytecodeLength, "vs"); diag_shader(d->PS.pShaderBytecode, d->PS.BytecodeLength, "ps"); diag_shader(d->GS.pShaderBytecode, d->GS.BytecodeLength, "gs"); diag_shader(d->HS.pShaderBytecode, d->HS.BytecodeLength, "hs"); diag_shader(d->DS.pShaderBytecode, d->DS.BytecodeLength, "ds"); }
+    if (d && shader_swap_active()) {   // shader swap: fixed copies of this pipeline's shaders (falls back to the game's own on failure)
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC copy = *d;
+        if (swap_bytecode(&copy.VS) | swap_bytecode(&copy.PS) | swap_bytecode(&copy.DS) | swap_bytecode(&copy.HS) | swap_bytecode(&copy.GS)) {
+            copy.CachedPSO.pCachedBlob = NULL; copy.CachedPSO.CachedBlobSizeInBytes = 0;
+            hr = real_CreateGraphicsPipelineState(dev, &copy, riid, out);
+            shader_swap_result(SUCCEEDED(hr));
+            if (SUCCEEDED(hr)) { InterlockedIncrement(&c_pso_gfx); return hr; }
+            LOG("shader swap: CreateGraphicsPipelineState with a replaced shader FAILED hr=0x%lx; using the game's own", (unsigned long)hr);
+        }
+    }
+    hr = real_CreateGraphicsPipelineState(dev, d, riid, out);
     InterlockedIncrement(&c_pso_gfx);
     if (FAILED(hr)) { InterlockedIncrement(&c_pso_fail); LOG("CreateGraphicsPipelineState FAILED hr=0x%lx vs=%llu ps=%llu gs=%llu hs=%llu ds=%llu rtv=%u fmt0=%u dsv=%u so=%u", (unsigned long)hr, d ? (unsigned long long)d->VS.BytecodeLength : 0, d ? (unsigned long long)d->PS.BytecodeLength : 0, d ? (unsigned long long)d->GS.BytecodeLength : 0, d ? (unsigned long long)d->HS.BytecodeLength : 0, d ? (unsigned long long)d->DS.BytecodeLength : 0, d ? d->NumRenderTargets : 0, d ? (unsigned)d->RTVFormats[0] : 0, d ? (unsigned)d->DSVFormat : 0, d ? d->StreamOutput.NumEntries : 0); }
     else if (verbose && d) LOG("CreateGraphicsPipelineState ok vs=%016llx ps=%016llx", (unsigned long long)fnv(d->VS.pShaderBytecode, d->VS.BytecodeLength), (unsigned long long)fnv(d->PS.pShaderBytecode, d->PS.BytecodeLength));
@@ -717,6 +762,7 @@ static HRESULT STDMETHODCALLTYPE hook_CreateGraphicsPipelineState(ID3D12Device *
 static HRESULT STDMETHODCALLTYPE hook_CreateComputePipelineState(ID3D12Device *dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC *d, REFIID riid, void **out)
 {
     HRESULT hr; const void *alt; SIZE_T alt_len; const char *alt_name = "?";
+    if (d) diag_shader(d->CS.pShaderBytecode, d->CS.BytecodeLength, "cs");
     // pool fix: one of the four typed-pool shaders -> its raw-access copy (falls back to the game's own on failure)
     if (d && (alt = pool_fix_replacement(d->CS.pShaderBytecode, d->CS.BytecodeLength, &alt_len, &alt_name))) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC copy = *d; copy.CS.pShaderBytecode = alt; copy.CS.BytecodeLength = alt_len;
@@ -724,6 +770,16 @@ static HRESULT STDMETHODCALLTYPE hook_CreateComputePipelineState(ID3D12Device *d
         pool_fix_note_result(SUCCEEDED(hr));
         NOTE("pool fix: %s (hash %016llx) replaced by its raw-access copy: %s", alt_name, (unsigned long long)pool_fnv1(d->CS.pShaderBytecode, d->CS.BytecodeLength), SUCCEEDED(hr) ? "ok" : "FAILED, using the game's own shader");
         if (SUCCEEDED(hr)) { InterlockedIncrement(&c_pso_cs); return hr; }
+    }
+    if (d && shader_swap_active()) {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC copy = *d;
+        if (swap_bytecode(&copy.CS)) {
+            copy.CachedPSO.pCachedBlob = NULL; copy.CachedPSO.CachedBlobSizeInBytes = 0;
+            hr = real_CreateComputePipelineState(dev, &copy, riid, out);
+            shader_swap_result(SUCCEEDED(hr));
+            if (SUCCEEDED(hr)) { InterlockedIncrement(&c_pso_cs); return hr; }
+            LOG("shader swap: CreateComputePipelineState with a replaced shader FAILED hr=0x%lx; using the game's own", (unsigned long)hr);
+        }
     }
     hr = real_CreateComputePipelineState(dev, d, riid, out);
     InterlockedIncrement(&c_pso_cs);
@@ -734,6 +790,7 @@ static HRESULT STDMETHODCALLTYPE hook_CreateComputePipelineState(ID3D12Device *d
 static HRESULT STDMETHODCALLTYPE hook_CreatePipelineState(ID3D12Device2 *dev, const D3D12_PIPELINE_STATE_STREAM_DESC *d, REFIID riid, void **out)
 {
     HRESULT hr; long cs_at = -1;
+    if (d && d->pPipelineStateSubobjectStream) diag_shader_stream(d->pPipelineStateSubobjectStream, d->SizeInBytes);
     // pool fix: a compute pipeline made through the stream API with one of the four shaders -> raw-access copy
     if (d && d->pPipelineStateSubobjectStream && (cs_at = pool_stream_cs_offset(d->pPipelineStateSubobjectStream, d->SizeInBytes)) >= 0) {
         const UINT8 *s = d->pPipelineStateSubobjectStream; const void *code; UINT64 len; const void *alt; SIZE_T alt_len; const char *alt_name = "?";
@@ -749,6 +806,27 @@ static HRESULT STDMETHODCALLTYPE hook_CreatePipelineState(ID3D12Device2 *dev, co
                 NOTE("pool fix: %s (stream PSO) replaced by its raw-access copy: %s", alt_name, SUCCEEDED(hr) ? "ok" : "FAILED, using the game's own shader");
                 if (SUCCEEDED(hr)) { InterlockedIncrement(&c_pso_gen); return hr; }
             }
+        }
+    }
+    if (d && d->pPipelineStateSubobjectStream && shader_swap_active()) {   // shader swap in a pipeline-state stream: shader subobjects 1..6, cached PSO (19) dropped
+        UINT8 *copy = malloc(d->SizeInBytes); SIZE_T off = 0; int swapped = 0, okwalk = 1;
+        if (copy) {
+            memcpy(copy, d->pPipelineStateSubobjectStream, d->SizeInBytes);
+            while (off + 4 <= d->SizeInBytes) {
+                UINT t = *(const UINT *)(copy + off); SIZE_T step = pool_stream_sub_size(t);
+                if (!step || d->SizeInBytes - off < step) { okwalk = off + 4 > d->SizeInBytes; break; }
+                if (t >= 1 && t <= 6) { D3D12_SHADER_BYTECODE b; memcpy(&b, copy + off + 8, sizeof b); if (swap_bytecode(&b)) { memcpy(copy + off + 8, &b, sizeof b); swapped = 1; } }
+                off += step;
+            }
+            if (swapped && okwalk) {
+                D3D12_PIPELINE_STATE_STREAM_DESC pd = *d; pd.pPipelineStateSubobjectStream = copy;
+                for (off = 0; off + 4 <= d->SizeInBytes; ) { UINT t = *(const UINT *)(copy + off); SIZE_T step = pool_stream_sub_size(t); if (!step) break; if (t == 19) memset(copy + off + 8, 0, 16); off += step; }
+                hr = real_CreatePipelineState(dev, &pd, riid, out);
+                shader_swap_result(SUCCEEDED(hr));
+                if (SUCCEEDED(hr)) { free(copy); InterlockedIncrement(&c_pso_gen); return hr; }
+                LOG("shader swap: CreatePipelineState(stream) with a replaced shader FAILED hr=0x%lx; using the game's own", (unsigned long)hr);
+            }
+            free(copy);
         }
     }
     hr = real_CreatePipelineState(dev, d, riid, out);
@@ -1095,6 +1173,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         install_logpoints();
         sm2_skin_install();
         pool_fix_install(inst);
+        diag_install();
+        shader_swap_install();
         { char exe[MAX_PATH]; GetModuleFileNameA(NULL, exe, sizeof exe); LOG("d3dlog loaded in %s (pid %lu) tsshim=%d verbose=%d", exe, (unsigned long)GetCurrentProcessId(), tsshim, verbose); }
         CreateThread(NULL, 0, stats_thread, NULL, 0, NULL);   // 5-second pool usage line always; the rest only when logging
     }

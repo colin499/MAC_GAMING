@@ -44,6 +44,7 @@ ENGINES = os.path.join(ROOT, "engines")
 RENDERERS = os.path.join(ROOT, "renderers")
 PREFIX = os.path.join(ROOT, "prefixes", "steam")
 LOGS = os.path.join(ROOT, "logs")
+SHOTS = os.path.join(LOGS, "shots")
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 TOOLS = os.path.join(ROOT, "tools")
 SM2_SHADER_DIR = os.path.join(TOOLS, "sm2-shaders")   # the d3d12 shim's pool fix: rewritten Spider-Man 2 shaders (layover sm2-shaders)
@@ -113,6 +114,12 @@ DEFAULT_CONFIG = {
     "steam_args": ["-cef-disable-gpu"],
     "fps_cap": 0,              # cap frame rate (0 = off): cooler and quieter. D3DMetal games: our d3d12 shim paces
                                # Present (LAYOVER_MAX_FPS, applied at the next game launch); DXMT games: DXMT's own cap.
+    # On battery the cap drops to this (0 = keep fps_cap). D3D12 games follow the power source live: unplug
+    # mid-game and the shim's limiter switches within a second (`layover watch` rewrites live.env); D3D11
+    # games (DXMT) take it at launch. Games with a battery profile (PROFILES[..]["battery"]) also get their
+    # own lighter graphics settings for a battery launch and their normal ones back on the charger.
+    "battery_fps_cap": 40,
+    "battery_saver": True,     # the switch for all of the above
     "audiobuf": True,          # insert Highball's CoreAudio buffer fix (off if it causes trouble)
     "webhelper_wrapper": False,  # single-process CEF wrapper: needed on the old Wine Staging engine, not on this one
     # What D3DMetal calls the GPU. "apple": the adapter Wine registered in the prefix's registry
@@ -130,7 +137,7 @@ DEFAULT_CONFIG = {
     "steam_api_key": "",       # optional: exact owned-games list via the Steam Web API (steamcommunity.com/dev/apikey)
     "online_lookups": True,    # `layover compat` may ask the Steam store and ProtonDB (cached 7 days; never on the library path)
 }
-GAME_KEYS = ("renderer", "msync", "fps_cap", "metal_hud", "steam_overlay", "retina", "metalfx", "advertise_avx", "d3dmetal_identity")
+GAME_KEYS = ("renderer", "msync", "fps_cap", "battery_fps_cap", "battery_saver", "metal_hud", "steam_overlay", "retina", "metalfx", "advertise_avx", "d3dmetal_identity")
 
 MICROSOFT_VID = 0x045E
 
@@ -552,6 +559,44 @@ def game_fps_cap(cfg, game=None):
         return 0
 
 
+def on_battery():
+    """True when the Mac runs from its battery (pmset's first line names the power source)."""
+    return "Battery Power" in sh(["pmset", "-g", "batt"]).split("\n", 1)[0]
+
+
+def battery_saver_on(cfg, game=None):
+    g = cfg["games"].get(str(game), {}) if game else {}
+    return bool(g.get("battery_saver", cfg.get("battery_saver", True)))
+
+
+def effective_fps_cap(cfg, game=None, battery=None):
+    """The cap for the current power source: fps_cap on the charger, the lower of fps_cap and battery_fps_cap
+    on battery (battery_saver on)."""
+    cap = game_fps_cap(cfg, game)
+    if battery is None:
+        battery = on_battery()
+    if not battery or not battery_saver_on(cfg, game):
+        return cap
+    g = cfg["games"].get(str(game), {}) if game else {}
+    try:
+        b = int(g.get("battery_fps_cap", cfg.get("battery_fps_cap", 0)) or 0)
+    except (TypeError, ValueError):
+        b = 0
+    return min(cap, b) if cap and b else (b or cap)
+
+
+LIVE_ENV = os.path.join(ROOT, "live.env")   # read by the d3d12 shim once a second while a game runs (LAYOVER_LIVE)
+
+
+def write_live(fps):
+    try:
+        with open(LIVE_ENV + ".tmp", "w") as f:
+            f.write(f"fps={int(fps)}\n")
+        os.replace(LIVE_ENV + ".tmp", LIVE_ENV)
+    except OSError:
+        pass
+
+
 def game_metalfx(cfg, game=None):
     """MetalFX spatial upscale factor for a DXMT game (0 = off). DXMT keeps the game's backbuffer at the
     size the game asked for and makes the Metal layer `factor` times larger, so with retina off a game
@@ -570,7 +615,7 @@ def dxmt_env(cfg, game=None):
     (LAYOVER_MAX_FPS in d3d12shim.env, see write_shim_env)."""
     env = {}
     conf = []
-    fps = game_fps_cap(cfg, game)
+    fps = effective_fps_cap(cfg, game)
     if fps:
         conf.append(f"d3d11.preferredMaxFrameRate={fps}")   # DXMT's limiter (D3D11 games); D3DMetal has none
     f = game_metalfx(cfg, game)
@@ -604,8 +649,20 @@ def write_shim_env(cfg, game=None):
     if not os.path.isdir(os.path.dirname(SHIM_ENV_PATH)):
         return None
     log = new_log("d3d12")
-    env = {"LAYOVER_D3D12_LOG": "Z:" + log.replace("/", "\\"), "LAYOVER_SKIN_LOG": "1", "LAYOVER_MAX_FPS": str(game_fps_cap(cfg, game)),
-           "LAYOVER_POOL_SHADERS": "Z:" + SM2_SHADER_DIR.replace("/", "\\")}   # the pool fix's rewritten shaders (layover sm2-shaders)
+    cap = effective_fps_cap(cfg, game)
+    write_live(cap)
+    os.makedirs(SHOTS, exist_ok=True)
+    win = lambda p: "Z:" + p.replace("/", "\\")
+    env = {"LAYOVER_D3D12_LOG": win(log), "LAYOVER_SKIN_LOG": "1", "LAYOVER_MAX_FPS": str(cap),
+           "LAYOVER_LIVE": win(LIVE_ENV),            # the cap follows the power source while the game runs (layover watch)
+           "LAYOVER_SHOT_DIR": win(SHOTS),           # `layover shot`: a frame grabbed inside the game (no Screen Recording permission needed)
+           "LAYOVER_POOL_SHADERS": win(SM2_SHADER_DIR)}   # the pool fix's rewritten shaders (layover sm2-shaders)
+    fix = SHADERFIX.get(str(game)) if game else None
+    if fix:   # typed-view shader fixes: replacements built by `layover shaderfix`, unknown users saved to pending
+        swap, pending = shaderfix_dirs(game)
+        os.makedirs(swap, exist_ok=True); os.makedirs(pending, exist_ok=True)
+        env.update({"LAYOVER_SHADER_SWAP": win(swap), "LAYOVER_SHADER_PENDING": win(pending),
+                    "LAYOVER_SHADER_WATCH": ",".join(f"{sp}:{reg}" for sp, reg in fix["watch"])})
     g = cfg["games"].get(str(game), {}) if game else {}
     for k, v in (g.get("env") or {}).items():   # per-game values replace the defaults (the shim keeps the first value it reads)
         if k.startswith(("LAYOVER_", "D3DM_", "HB_")):
@@ -2151,6 +2208,10 @@ PROFILES = {
             "A game update changes the executable: the shim turns its patches off until it is updated for the new build (HANDOFF.md).",
         ],
         "checks": ["sm2_shaders"],
+        # A launch on battery: FSR Performance instead of the user's upscale quality and Medium shadows, so the GPU
+        # finishes a frame well inside the battery cap's budget and idles for the rest of it (the power saving).
+        # The user's own values come back at the first launch on the charger (apply_power_profile).
+        "battery": {"registry": {r"HKCU\Software\Insomniac Games\Marvel's Spider-Man 2\Graphics": {"UpscaleQuality": 1, "ShadowQuality": 2}}},
     },
     "377160": {   # Fallout 4 (DirectX 11 -> DXMT). Retina off + MetalFX 2x: render 1728x1117, output 3456x2234 at a quarter of the GPU work.
         "settings": {"retina": False, "metalfx": 2.0, "fps_cap": 60},
@@ -2728,6 +2789,14 @@ def cmd_play(args):
         return
     require_setup()
     apply_profile_if_pending(cfg, g["appid"])
+    if g["appid"] in SHADERFIX:
+        b, _, f = shaderfix_build(g["appid"])
+        if b or f:
+            info(f"shader fixes: {b} built" + (f", {f} failed" if f else ""))
+    battery_now = on_battery()
+    if battery_now and battery_saver_on(cfg, g["appid"]):
+        cap = effective_fps_cap(cfg, g["appid"], True)
+        info("on battery: " + (f"{cap} fps cap" if cap else "no cap set") + " (layover config battery_saver off to play at full power)")
     renderer = resolve_renderer(cfg, g["appid"])
     restart = None
     fp = launch_fingerprint(cfg, g["appid"])
@@ -2749,6 +2818,9 @@ def cmd_play(args):
         install_d3d12_shim()
         apply_retina(cfg, g["appid"])
         write_shim_env(cfg, g["appid"])
+        pp = apply_power_profile(cfg, g["appid"], battery_now)
+        if pp:
+            info("game graphics: battery profile applied" if pp == "battery" else "game graphics: your own settings are back (on the charger)")
         wait_for_steam_logon()
         if steam_launch_prompt(g["appid"]):
             warn("Steam is still showing a dialog from the last launch of this game; answer it in Steam's window")
@@ -2766,6 +2838,9 @@ def cmd_play(args):
             notify("Layover", "Steam is asking something before it starts the game: look at its window")
     else:
         offline = True if args.offline else None
+        pp = apply_power_profile(cfg, g["appid"], battery_now)
+        if pp:
+            info("game graphics: battery profile applied" if pp == "battery" else "game graphics: your own settings are back (on the charger)")
         log = launch_steam(cfg, game=g["appid"], offline=offline)
         spawn_watch(g["appid"], g["name"])
         ok(f"starting Steam → {g['name']} ({renderer}); log: {log}")
@@ -3194,7 +3269,7 @@ def cmd_game(args):
         if val not in RENDERER_CHOICES:
             die("renderer must be one of: " + ", ".join(RENDERER_CHOICES))
         cur[key] = val
-    elif key in ("fps_cap",):
+    elif key in ("fps_cap", "battery_fps_cap"):
         try:
             cur[key] = int(val)
         except ValueError:
@@ -3449,6 +3524,8 @@ def cmd_watch(args):
         w("watch: display kept awake while the game runs (caffeinate)")
     except OSError:
         caf = None
+    wcfg = load_config()
+    live_cap = None
     last = None
     good = 0            # consecutive 5 s windows at 20+ fps
     stalled = False
@@ -3461,6 +3538,13 @@ def cmd_watch(args):
             os.kill(pid, 0)
         except OSError:
             break
+        batt = on_battery()
+        cap = effective_fps_cap(wcfg, args.game, batt)
+        if cap != live_cap:
+            write_live(cap)
+            if live_cap is not None:
+                w(f"power: {'on battery' if batt else 'on the charger'} -> frame cap {cap or 'off'}")
+            live_cap = cap
         cur = shim_presents(shim) if shim else None
         if cur and last and cur[1] != last[1]:
             fps = (cur[0] - last[0]) / 5.0
@@ -3494,12 +3578,271 @@ def cmd_watch(args):
             mtl = metal_compiler_cpu()
             w(f"health: {fps:.1f} fps | game {process_rss_mb(pid)} MB | host free {free} MB | battery {pct}% {state or ''}" + (f" | cpu limit {thr}%" if thr not in (None, 100) else "") + (f" | shader compiler {mtl:.0f}%" if mtl >= 5 else ""))
     w(f"watch: {name} exited")
+    if str(args.game) in SHADERFIX:
+        try:
+            b, u, f = shaderfix_build(args.game)
+            if b or u or f:
+                w(f"shader fixes: built {b}, unchanged {u}, failed {f} (ready for the next launch)")
+        except Exception as e:   # never let a build problem take the watchdog down
+            w(f"shader fixes: build error {e}")
     if caf and caf.poll() is None:
         caf.terminate()
     try:
         os.remove(WATCH_PID)
     except OSError:
         pass
+
+
+# --------------------------------------------------------------------------- shader fixes (typed views -> raw)
+# D3DMetal backs a typed buffer view with a Metal texture buffer, which ends at 2^28 elements. A game that
+# reads a pool bigger than that through 4-byte typed views gets zeros for everything stored above 1 GB.
+# Spider-Man 2 (2026-11-12): 95 of its vertex shaders read VERTEX PAINT (the per-vertex material blend of
+# ground, roads and buildings) through `MainPaintVBView` (R8G8B8A8_UNORM, 536M elements) at t77,space1, and
+# a few read impostor normals through `MainVBNrmTanView` (R10G10B10A2_UNORM) at t95,space1; static geometry
+# lives above 1 GB (the T-pose fix keeps the first GB for skinned models), so ground and blocks lost their
+# painted blends. The same shaders also bind the whole pool raw at t97,space1 (no limit), so the fix is a
+# copy of each shader whose typed loads became raw loads + the format's decode (tools/typed2raw.py), swapped
+# in by the d3d12 shim at pipeline creation (shims/d3d12shim/shader_swap.c). Nothing ships: the shim saves
+# every shader that uses a watched register to <game>/pending while the game runs, and `layover shaderfix`
+# (run automatically before each launch and when the game exits) builds the copies with dxc/dxa/dxv.
+# A shader without a copy is used as it is, so a missing build only means the old picture for that material.
+SHADERFIX_DIR = os.path.join(TOOLS, "shaderfix")
+SHADERFIX = {
+    "2651280": {   # Marvel's Spider-Man 2
+        "watch": [(1, 77), (1, 95)],
+        "specs": ["1:77:rgba8:1:97", "1:95:rgb10a2:1:97"],
+        "what": "vertex paint and packed normals read through the pool's raw view (typed views stop at 1 GB under D3DMetal)",
+    },
+}
+TYPED2RAW = os.path.join(HERE, "tools", "typed2raw.py")
+
+
+def shaderfix_dirs(appid):
+    d = os.path.join(SHADERFIX_DIR, str(appid))
+    return os.path.join(d, "swap"), os.path.join(d, "pending")
+
+
+def shaderfix_counts(appid):
+    swap, pending = shaderfix_dirs(appid)
+    ls = lambda d, ext: [f for f in os.listdir(d) if f.endswith(ext)] if os.path.isdir(d) else []
+    return {"built": len(ls(swap, ".dxil")), "unchanged": len(ls(swap, ".skip")), "pending": len(ls(pending, ".dxbc"))}
+
+
+def _dxbc_uses(data, watch):
+    """Does the container's PSV0 part list a resource at one of the (space, register) pairs?"""
+    import struct
+    if len(data) < 36 or data[:4] != b"DXBC":
+        return False
+    n = struct.unpack_from("<I", data, 28)[0]
+    if n > 64 or 32 + 4 * n > len(data):
+        return False
+    for off in struct.unpack_from(f"<{n}I", data, 32):
+        if data[off:off + 4] == b"PSV0":
+            size = struct.unpack_from("<I", data, off + 4)[0]
+            body = data[off + 8:off + 8 + size]
+            return any(struct.pack("<III", sp, reg, reg) in body for sp, reg in watch)
+    return False
+
+
+def shaderfix_build(appid, quiet=True, source=None):
+    """Build a replacement for every shader in the game's pending folder (or `source`, a folder of dumped
+    .dxbc files). Returns (built, unchanged, failed)."""
+    fix = SHADERFIX.get(str(appid))
+    if not fix:
+        return (0, 0, 0)
+    swap, pending = shaderfix_dirs(appid)
+    src = source or pending
+    if not os.path.isdir(src):
+        return (0, 0, 0)
+    files = sorted(f for f in os.listdir(src) if f.endswith(".dxbc"))
+    if not files:
+        return (0, 0, 0)
+    if not dxc_tools_present():
+        if not quiet:
+            warn(f"{len(files)} shaders wait for a fix, but Microsoft's shader tools are not built (tools/dev/build-dxc.sh, once)")
+        return (0, 0, len(files))
+    import importlib.util, tempfile
+    from concurrent.futures import ThreadPoolExecutor
+    spec = importlib.util.spec_from_file_location("typed2raw", TYPED2RAW)
+    t2r = importlib.util.module_from_spec(spec); spec.loader.exec_module(t2r)
+    specs = []
+    for sp in fix["specs"]:
+        f = sp.split(":")
+        specs.append((int(f[0]), int(f[1]), f[2]) + tuple(int(x) for x in f[3:]))
+    os.makedirs(swap, exist_ok=True)
+    work = tempfile.mkdtemp(prefix="shaderfix-")
+    env = dict(os.environ, DYLD_LIBRARY_PATH=os.path.join(DXC_DIR, "lib"))
+    tool = lambda t: os.path.join(DXC_DIR, "bin", t)
+
+    def one(name):
+        path = os.path.join(src, name)
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return "failed"
+        h = f"{fnv1_64(data):016x}"
+        done = lambda: (os.remove(path) if not source else None)
+        if os.path.exists(os.path.join(swap, h + ".dxil")) or os.path.exists(os.path.join(swap, h + ".skip")):
+            done()
+            return "known"
+        if not _dxbc_uses(data, fix["watch"]):
+            done()
+            return "known"
+        ll = os.path.join(work, h + ".ll"); raw = os.path.join(work, h + ".raw"); out = os.path.join(work, h + ".dxil")
+        r = run([tool("dxc"), "-dumpbin", path, "-Fc", ll], env=env, timeout=120)
+        if r.returncode != 0 or not os.path.exists(ll):
+            return "failed"
+        try:
+            with open(ll, encoding="utf-8", errors="surrogateescape") as f:
+                text, stats = t2r.rewrite(f.read(), specs)
+            why = "does not read through the typed views" if text is None else None
+        except t2r.Unsupported as e:
+            text, why = None, str(e)
+        if text is None:
+            with open(os.path.join(swap, h + ".skip"), "w") as f:
+                f.write(why + "\n")
+            done()
+            return "unchanged"
+        with open(ll, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write(t2r.name_values(text))
+        for cmd in ([tool("dxa"), "-o", raw, ll], [tool("dxv"), raw, "-o", out]):
+            r = run(cmd, env=env, timeout=120)
+            if r.returncode != 0:
+                return "failed"
+        with open(out, "rb") as f:
+            if f.read(4) != b"DXBC":
+                return "failed"
+        replace_file(out, os.path.join(swap, h + ".dxil"))
+        done()
+        return "built"
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        res = list(ex.map(one, files))
+    shutil.rmtree(work, ignore_errors=True)
+    return (res.count("built"), res.count("unchanged"), res.count("failed"))
+
+
+def cmd_shaderfix(args):
+    targets = [find_any_game(args.game)["appid"]] if args.game and find_any_game(args.game) else list(SHADERFIX)
+    if args.game and not targets:
+        die(f"no game matches '{args.game}'", 3)
+    out = {}
+    for appid in targets:
+        fix = SHADERFIX.get(str(appid))
+        if not fix:
+            info(f"{appid}: no shader fix is known for this game")
+            continue
+        head(f"shader fix for {appid}: {fix['what']}")
+        if not args.status:
+            b, u, f = shaderfix_build(appid, quiet=False, source=args.source)
+            if b or u or f:
+                (ok if not f else warn)(f"built {b}, needed no change {u}, failed {f}")
+        c = shaderfix_counts(appid)
+        out[str(appid)] = c
+        (ok if c["built"] else warn)(f"{c['built']} fixed shaders ready, {c['unchanged']} checked and left alone, {c['pending']} waiting")
+        if not c["built"] and not c["pending"]:
+            info("play the game once: the shim saves the shaders that need the fix, and they are built when the game exits")
+    emit({"ok": True, "games": out})
+
+
+# --------------------------------------------------------------------------- battery profiles
+# A game's own graphics settings for a launch on battery, kept in the Windows registry of the prefix
+# (PROFILES[appid]["battery"]["registry"] = {key: {value name: dword}}). The user's values are saved in
+# config.json (games.<appid>.power_saved) before the battery values go in and are put back by the first
+# launch on the charger. battery_saver off = never touched.
+def reg_query_dwords(cfg, key):
+    try:
+        r = subprocess.run([WINE, "reg", "query", key], env=wine_env(cfg), capture_output=True, text=True, errors="replace", timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    vals = {}
+    for line in (r.stdout or "").splitlines():
+        m = re.match(r"^\s+(.+?)\s+REG_DWORD\s+0x([0-9a-fA-F]+)\s*$", line)
+        if m:
+            vals[m.group(1)] = int(m.group(2), 16)
+    return vals
+
+
+def apply_power_profile(cfg, appid, battery=None):
+    prof = (PROFILES.get(str(appid)) or {}).get("battery")
+    if not prof or not prof.get("registry"):
+        return None
+    g = cfg["games"].setdefault(str(appid), {})
+    saved = g.get("power_saved")
+    if battery is None:
+        battery = on_battery()
+    want = battery and battery_saver_on(cfg, appid)
+    if want:
+        new_saved = json.loads(json.dumps(saved or {}))
+        applied = False
+        for key, values in prof["registry"].items():
+            cur = reg_query_dwords(cfg, key)
+            if not cur:
+                continue   # the game has not written its settings yet (first run): nothing to adjust
+            for name, val in values.items():
+                if name not in cur:
+                    continue
+                keep = new_saved.setdefault(key, {})
+                if name not in keep:
+                    keep[name] = cur[name]
+                if cur[name] != val:
+                    reg_add(cfg, key, name, val, "REG_DWORD")
+                applied = True
+        if new_saved and new_saved != saved:
+            g["power_saved"] = new_saved
+            save_config(cfg)
+        return "battery" if applied else None
+    if saved:
+        for key, values in saved.items():
+            for name, val in values.items():
+                reg_add(cfg, key, name, val, "REG_DWORD")
+        g.pop("power_saved", None)
+        save_config(cfg)
+        return "restored"
+    return None
+
+
+def cmd_shot(args):
+    """A screenshot taken inside the running game by the d3d12 shim (works without Screen Recording permission)."""
+    d = shot_dir_in_use()
+    os.makedirs(d, exist_ok=True)
+    before = set(os.listdir(d))
+    open(os.path.join(d, "request"), "w").close()
+    new = None
+    for _ in range(50):
+        time.sleep(0.2)
+        new = [f for f in os.listdir(d) if f.endswith(".bmp") and f not in before]
+        if new:
+            break
+    if not new:
+        try:
+            os.remove(os.path.join(d, "request"))
+        except OSError:
+            pass
+        die("no frame arrived: is a DirectX 12 game running under Layover (and drawing)?", 3)
+    time.sleep(0.5)
+    bmp = os.path.join(d, sorted(new)[-1])
+    out = args.out or bmp[:-4] + ".jpg"
+    r = run(["sips", "-s", "format", "jpeg", "-s", "formatOptions", "80", bmp, "--out", out])
+    if r.returncode == 0:
+        os.remove(bmp)
+    else:
+        out = bmp
+    ok(f"saved {out}")
+    emit({"ok": True, "path": out})
+
+
+def shot_dir_in_use():
+    """The folder the running game's shim watches (a per-game env override may point it elsewhere)."""
+    try:
+        with open(SHIM_ENV_PATH) as f:
+            for line in f:
+                if line.startswith("LAYOVER_SHOT_DIR=Z:"):
+                    return line.strip().split("=Z:", 1)[1].replace("\\", "/")
+    except OSError:
+        pass
+    return SHOTS
 
 
 # --------------------------------------------------------------------------- Spider-Man 2 pool-fix shaders
@@ -4018,6 +4361,14 @@ def main(argv=None):
     s.add_argument("value", nargs="?", help="for steam_args, quote the whole list, e.g. \"-cef-disable-gpu -noverifyfiles\"")
     s.set_defaults(fn=lambda a: cmd_config(a) if (a.key is None or a.value is not None) else die("usage: layover config <key> <value>"))
 
+    s = sub.add_parser("shaderfix", help="build the fixed copies of a game's shaders that the shim swaps in (Spider-Man 2: ground/building paint above 1 GB); automatic at launch and exit")
+    s.add_argument("game", nargs="?")
+    s.add_argument("--status", action="store_true", help="only show how many are built / waiting")
+    s.add_argument("--source", help="build from a folder of dumped .dxbc files instead of the pending folder")
+    s.set_defaults(fn=cmd_shaderfix)
+    s = sub.add_parser("shot", help="save a frame of the running DirectX 12 game (taken inside the game; no macOS permission needed)")
+    s.add_argument("out", nargs="?", help="output .jpg (default: logs/shots/shot-<time>.jpg)")
+    s.set_defaults(fn=cmd_shot)
     s = sub.add_parser("watch", help=argparse.SUPPRESS)   # started by `play`: display awake, health log, stall capture
     s.add_argument("game")
     s.add_argument("--name")

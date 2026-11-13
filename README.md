@@ -144,6 +144,13 @@ A 2024 AAA game on a laptop is going to be warm; what Layover can do is stop the
   has no cap of its own, and the game's VSync only ties it to the 120 Hz panel). Verified in Spider-Man 2:
   loading and menus that ran at 100+ fps now sit at exactly 60. It takes effect at the next game launch,
   no Steam restart. `0` turns it off. DirectX 11 games get the same number through DXMT's limiter.
+* **Battery saver** (on by default; `./layover config battery_saver off`). On battery the cap drops to
+  `battery_fps_cap` (default 40; `./layover config battery_fps_cap 30` for the longest play time), and it
+  follows the power source live: plug in or unplug mid-game and the cap changes within 5 seconds, no
+  restart. A game profile can also carry lighter graphics settings for battery; Spider-Man 2's sets FSR
+  Performance and Medium shadows at launch on battery and puts your own values back at the next launch on
+  the charger. Measured on this Mac in Spider-Man 2 (95 Wh battery): the user's settings uncapped drew
+  about 95 W (one hour); battery saver at 40 fps 56-62 W (about 1.5 h); at 30 fps 44-47 W (about 2 h).
 * **Fence-wait relief** (on by default, shim knob `LAYOVER_FENCE_SLEEP=0` turns it off): Spider-Man 2's
   render thread polls a GPU fence in a tight loop about a dozen times per frame while it waits for the
   GPU, which pegged a whole CPU core at all times. After 0.3 ms of polling the shim blocks on the fence's
