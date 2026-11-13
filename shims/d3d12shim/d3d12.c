@@ -38,7 +38,7 @@
 #include <string.h>
 #include <stdint.h>
 
-void diag_install(void); void diag_present(IDXGISwapChain *sc); void diag_swapchain_queue(IUnknown *dev); void diag_shader(const void *code, SIZE_T len, const char *stage); void diag_shader_stream(const void *stream, SIZE_T size); int diag_dumping(void); long diag_dumped(void);
+void diag_view(int kind, ID3D12Resource *res, unsigned fmt, unsigned dim); void diag_install(void); void diag_present(IDXGISwapChain *sc); void diag_swapchain_queue(IUnknown *dev); void diag_shader(const void *code, SIZE_T len, const char *stage); void diag_shader_stream(const void *stream, SIZE_T size); int diag_dumping(void); long diag_dumped(void);
 void shader_swap_install(void); const void *shader_swap_lookup(const void *code, SIZE_T len, SIZE_T *out_len); void shader_swap_result(int ok); int shader_swap_active(void); void shader_swap_stats(char *out, size_t cap);
 static int swap_bytecode(D3D12_SHADER_BYTECODE *b) { SIZE_T n; const void *alt = b->pShaderBytecode ? shader_swap_lookup(b->pShaderBytecode, b->BytecodeLength, &n) : NULL; if (!alt) return 0; b->pShaderBytecode = alt; b->BytecodeLength = n; return 1; }
 static HMODULE real_dll;
@@ -723,7 +723,7 @@ static void STDMETHODCALLTYPE hook_CreateShaderResourceView(ID3D12Device *dev, I
         if (verbose || interesting)
             LOG("SRV buffer res=%p (width %llu) fmt=%u first=%llu num=%u stride=%u flags=%u at %llx", res, (unsigned long long)res_width(res), (unsigned)d->Format,
                 (unsigned long long)d->Buffer.FirstElement, d->Buffer.NumElements, d->Buffer.StructureByteStride, (unsigned)d->Buffer.Flags, (unsigned long long)h.ptr);
-    } else if (d) InterlockedIncrement(&c_srv_tex);
+    } else if (d) { InterlockedIncrement(&c_srv_tex); if (d->Format >= 1 && d->Format <= 18) diag_view('S', res, (unsigned)d->Format, (unsigned)d->ViewDimension); }
     real_CreateShaderResourceView(dev, res, d, h);
 }
 static void STDMETHODCALLTYPE hook_CreateUnorderedAccessView(ID3D12Device *dev, ID3D12Resource *res, ID3D12Resource *counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC *d, D3D12_CPU_DESCRIPTOR_HANDLE h)
@@ -736,7 +736,7 @@ static void STDMETHODCALLTYPE hook_CreateUnorderedAccessView(ID3D12Device *dev, 
         if (verbose || interesting)
             LOG("UAV buffer res=%p (width %llu) fmt=%u first=%llu num=%u stride=%u flags=%u counter=%p", res, (unsigned long long)res_width(res), (unsigned)d->Format,
                 (unsigned long long)d->Buffer.FirstElement, d->Buffer.NumElements, d->Buffer.StructureByteStride, (unsigned)d->Buffer.Flags, counter);
-    } else if (d) InterlockedIncrement(&c_uav_tex);
+    } else if (d) { InterlockedIncrement(&c_uav_tex); diag_view('U', res, (unsigned)d->Format, (unsigned)d->ViewDimension); }
     real_CreateUnorderedAccessView(dev, res, counter, d, h);
 }
 static HRESULT STDMETHODCALLTYPE hook_CreateGraphicsPipelineState(ID3D12Device *dev, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *d, REFIID riid, void **out)

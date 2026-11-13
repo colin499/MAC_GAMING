@@ -1,8 +1,45 @@
-# Handoff notes (2026-11-12: battery saver + shader swap; 2026-11-01: library app + generic backend; 2026-10-31: symbiote stall root cause + pool fix)
+# Handoff notes (2026-11-13: Spider-Man 2 flat ground fixed; 2026-11-12: battery saver + shader swap; 2026-11-01: library app + generic backend; 2026-10-31: symbiote stall root cause + pool fix)
 
 Read this first if you are a new agent (or future me) picking up Layover.
 
-## Battery saver, shader swap, in-game screenshots (2026-11-12; ground rendering still UNCONFIRMED)
+## Spider-Man 2 flat ground / missing mid-distance blocks: FIXED 2026-11-13 (impostor shaders)
+
+Symptom (reproduced from a rooftop in Queens, open world): mid-distance city blocks are a flat pale plane
+with only trees, props and the elevated rail on it; streets, grass and low buildings are missing; they fill
+in up close. Same bug as "gray city blocks" (2026-10-17).
+
+Cause: `VS_Impostor` / `VS_ImpostorCaster` (hashes f95452bda7cdc958, d5810f3b07502368, plus 8d33f0c207a64bea)
+draw those blocks. Each vertex is ONE R10G10B10A2 texel read from `MainVBNrmTanView` (t95,space1), the
+4-byte typed view of the 2046 MB pool that D3DMetal cuts at 2^28 elements = 1 GB. Impostor vertices stored
+above 1 GB read as zero, the whole block collapses to a point. Steering impostor allocations low
+(sm2_skin.c) never covered all of them. These shaders have no raw view (t97) to redirect to, which is why
+the 2026-11-12 shader swap skipped exactly them.
+
+Fix: the view itself becomes raw and the shaders read it in place.
+* shim `pool_fix_srv`: `LAYOVER_RAW_FORMATS=24` creates wide (> 2^28 elements) SRVs of that format as raw.
+* `layover`: `SHADERFIX[appid]` has `inplace` (fallback spec when the redirect has no raw view),
+  `raw_formats`, `exe`. `shaderfix_seed()` scans the game's executable for DXBC containers that use a watched
+  register and builds them before the first launch (13 in the exe, 3 in place; stamp swap/seed.json with
+  the exe's size + mtime). `LAYOVER_RAW_FORMATS` is only set when that build was clean
+  (`shaderfix_raw_ready`), because an unrewritten t95 reader would get garbage from a raw view. Every other
+  t95 reader is redirected to t97 and never touches t95. After a game update the seed rebuilds by itself at
+  the next `layover play`; `layover shaderfix` forces it.
+* Verified by A/B in the same view (shots in the session scratchpad): before = flat plane, after = streets,
+  lawns, houses. 129 replacement shaders, 0 failed, "not fixed yet 0".
+
+Ruled out on the way (do not retry): relocation off (`LAYOVER_SKIN_MB=0`) still shows it; the 2026-11-12
+paint/normal redirect alone does not change it; uint -> BC `CopyTextureRegion` (7,000+ per session, BC6H
+reflection probes 64x64 uint -> 256x256) works under D3DMetal as it is (a buffer round trip gave the same
+picture; removed); the city ground is not the terrain clip map / virtual texture system.
+Still not looked at: UAV fmt 57 R16_UINT over the pool (`g_WetnessU16Uav`, `g_MeshSplatU16Uav`: writes above
+512 MB are lost; rain wetness / splats on geometry stored high may be missing).
+`LAYOVER_VIEW_SURVEY=1` (diag.c) logs one line per distinct texture view format.
+
+How to get a test view without a free-roam save: load a mission save, pause, Abandon Mission (confirm) ->
+open world. Keys need `KEY:60` holds and ~600 ms between presses; menu screenshots lag one frame. Always
+back up the save folder first and restore after (done: backups/sm2-saves-2026-11-13_1135).
+
+## Battery saver, shader swap, in-game screenshots (2026-11-12; the ground fix is in the section above)
 
 User report: Spider-Man 2 "drains the battery super fast" and "still rendering problems with ground landscapes".
 

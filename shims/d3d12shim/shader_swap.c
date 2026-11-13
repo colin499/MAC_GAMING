@@ -6,6 +6,8 @@
 // buildings lose their painted material blends. The same shaders also have a raw view of the pool, so
 // `layover shaderfix` (tools/typed2raw.py + dxc/dxa/dxv) builds copies that read the same bytes through the
 // raw view, and this module hands D3DMetal the copy whenever the game creates a pipeline with the original.
+// Shaders without a raw view (the impostor shaders that draw mid-distance city blocks) read the typed register
+// in place; the shim then creates that view raw (pool_fix.c, LAYOVER_RAW_FORMATS).
 //
 //   LAYOVER_SHADER_SWAP=<win dir>     replacements: <fnv1 hash of the ORIGINAL>.dxil; <hash>.skip marks a
 //                                     shader that was looked at and needs nothing

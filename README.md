@@ -193,6 +193,15 @@ Launchpad or Game Center for it), Shift+Tab (Steam's overlay), or clicking outsi
 game then sits paused with the picture still updating, which looks like a freeze; bring the game
 window back to the front to continue.
 
+## Spider-Man 2 fixes that build themselves
+
+Three rendering bugs in this game come from one D3DMetal limit (a typed view of a buffer stops at 1 GB of
+the game's 2 GB mesh pool): characters in a T-pose, the symbiote stall, and mid-distance city blocks drawn
+as a flat plane without streets or buildings. Layover fixes all three. The last one needs rewritten copies
+of some of the game's shaders; `layover play` builds them from the game's files with Microsoft's shader
+tools (`tools/dev/build-dxc.sh`, once) and rebuilds after a game update. `./layover shaderfix --status`
+shows the state; `./layover shot` saves a frame from inside the game.
+
 ## Honest limitations
 
 * **Anti-cheat multiplayer games** (EAC, BattlEye, Vanguard) will not run. Nothing on macOS fixes this.

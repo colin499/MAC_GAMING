@@ -97,7 +97,16 @@ int pool_fix_active(void) { return pool_active; }
 int pool_fix_srv(const D3D12_SHADER_RESOURCE_VIEW_DESC *d, D3D12_SHADER_RESOURCE_VIEW_DESC *out)
 {
     if (!d || d->ViewDimension != D3D12_SRV_DIMENSION_BUFFER || d->Buffer.NumElements <= WIDE_VIEW || (d->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW)) return 0;
-    if (d->Format != DXGI_FORMAT_R32_UINT && d->Format != DXGI_FORMAT_R32_SINT && d->Format != DXGI_FORMAT_R32_FLOAT) return 0;
+    if (d->Format != DXGI_FORMAT_R32_UINT && d->Format != DXGI_FORMAT_R32_SINT && d->Format != DXGI_FORMAT_R32_FLOAT) {
+        // LAYOVER_RAW_FORMATS=24[,28]: other 4-byte formats whose wide views become raw too. Every shader that
+        // reads such a view must then have a rewritten copy in the shader swap folder (in-place rewrite).
+        static int raw_fmt[4] = { -1, 0, 0, 0 };
+        if (raw_fmt[0] < 0) { char v[64]; int n = 0; char *q; raw_fmt[0] = 0; if (GetEnvironmentVariableA("LAYOVER_RAW_FORMATS", v, sizeof v) >= 1) for (q = v; *q && n < 4; ) { raw_fmt[n++] = atoi(q); q = strchr(q, ','); if (!q) break; q++; } }
+        if (!d->Format || (d->Format != raw_fmt[0] && d->Format != raw_fmt[1] && d->Format != raw_fmt[2] && d->Format != raw_fmt[3])) return 0;
+        *out = *d; out->Format = DXGI_FORMAT_R32_TYPELESS; out->Buffer.Flags |= D3D12_BUFFER_SRV_FLAG_RAW; out->Buffer.StructureByteStride = 0;
+        shim_note("pool fix: wide typed SRV (fmt %u, %u elements) created as a raw view (LAYOVER_RAW_FORMATS)", (unsigned)d->Format, d->Buffer.NumElements);
+        return 1;
+    }
     InterlockedIncrement(&c_wide_srv);
     if (!pool_active) return 0;
     *out = *d; out->Format = DXGI_FORMAT_R32_TYPELESS; out->Buffer.Flags |= D3D12_BUFFER_SRV_FLAG_RAW; out->Buffer.StructureByteStride = 0;

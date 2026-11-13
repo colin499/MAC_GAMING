@@ -176,3 +176,28 @@ void diag_install(void)
         if (GetEnvironmentVariableA("LAYOVER_SHOT_EVERY", v, sizeof v) >= 1 && atoi(v) > 0) shot_every_ms = (UINT)atoi(v) * 1000;
     }
 }
+
+// ---------------------------------------------------------------- view / texture survey (LAYOVER_VIEW_SURVEY=1)
+// One log line per distinct kind of texture view and texture the game creates: which formats are written by
+// compute, which views cast a resource to another format.
+static int survey_on = -1; static UINT64 sv_seen[4096]; static CRITICAL_SECTION sv_lock;
+static int sv_new(UINT64 key)
+{
+    UINT i; int is_new = 0;
+    if (survey_on < 0) { char v[8]; InitializeCriticalSection(&sv_lock); survey_on = GetEnvironmentVariableA("LAYOVER_VIEW_SURVEY", v, sizeof v) >= 1 && v[0] != '0'; }
+    if (!survey_on) return 0;
+    key = key * 0x9E3779B97F4A7C15ull + 1; if (!key) key = 1;
+    EnterCriticalSection(&sv_lock);
+    for (i = (UINT)(key >> 40) & 4095; ; i = (i + 1) & 4095) { if (sv_seen[i] == key) break; if (!sv_seen[i]) { sv_seen[i] = key; is_new = 1; break; } }
+    LeaveCriticalSection(&sv_lock);
+    return is_new;
+}
+void diag_view(int kind, ID3D12Resource *res, unsigned fmt, unsigned dim)
+{
+    D3D12_RESOURCE_DESC d; UINT64 key;
+    if (survey_on == 0 || !res) return;
+    res->lpVtbl->GetDesc(res, &d);
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return;
+    key = ((UINT64)kind << 60) ^ ((UINT64)fmt << 50) ^ ((UINT64)d.Format << 40) ^ ((UINT64)dim << 36) ^ ((UINT64)d.Width << 20) ^ ((UINT64)d.Height << 6) ^ ((UINT64)d.DepthOrArraySize << 2) ^ d.MipLevels ^ ((UINT64)d.Flags << 30);
+    if (sv_new(key)) shim_note("survey %s view fmt %u dim %u on texture fmt %u %llux%ux%u mips %u flags 0x%x", kind == 'U' ? "UAV" : "SRV", fmt, dim, (unsigned)d.Format, (unsigned long long)d.Width, d.Height, (unsigned)d.DepthOrArraySize, (unsigned)d.MipLevels, (unsigned)d.Flags);
+}

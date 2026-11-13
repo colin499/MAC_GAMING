@@ -663,6 +663,8 @@ def write_shim_env(cfg, game=None):
         os.makedirs(swap, exist_ok=True); os.makedirs(pending, exist_ok=True)
         env.update({"LAYOVER_SHADER_SWAP": win(swap), "LAYOVER_SHADER_PENDING": win(pending),
                     "LAYOVER_SHADER_WATCH": ",".join(f"{sp}:{reg}" for sp, reg in fix["watch"])})
+        if shaderfix_raw_ready(game):
+            env["LAYOVER_RAW_FORMATS"] = ",".join(str(x) for x in fix["raw_formats"])
     g = cfg["games"].get(str(game), {}) if game else {}
     for k, v in (g.get("env") or {}).items():   # per-game values replace the defaults (the shim keeps the first value it reads)
         if k.startswith(("LAYOVER_", "D3DM_", "HB_")):
@@ -2790,9 +2792,14 @@ def cmd_play(args):
     require_setup()
     apply_profile_if_pending(cfg, g["appid"])
     if g["appid"] in SHADERFIX:
+        seeded = shaderfix_seed(g["appid"], g)
         b, _, f = shaderfix_build(g["appid"])
+        if seeded:
+            b, f = b + seeded[0], f + seeded[2]
         if b or f:
             info(f"shader fixes: {b} built" + (f", {f} failed" if f else ""))
+        if SHADERFIX[g["appid"]].get("raw_formats") and not shaderfix_raw_ready(g["appid"], g):
+            warn("shader fixes are incomplete: distant ground and blocks may be missing this session (layover shaderfix)")
     battery_now = on_battery()
     if battery_now and battery_saver_on(cfg, g["appid"]):
         cap = effective_fps_cap(cfg, g["appid"], True)
@@ -3611,7 +3618,15 @@ SHADERFIX = {
     "2651280": {   # Marvel's Spider-Man 2
         "watch": [(1, 77), (1, 95)],
         "specs": ["1:77:rgba8:1:97", "1:95:rgb10a2:1:97"],
-        "what": "vertex paint and packed normals read through the pool's raw view (typed views stop at 1 GB under D3DMetal)",
+        # The impostor shaders (mid-distance city blocks: ground and low buildings in one mesh) read their
+        # packed vertices from t95 and have no raw view to switch to. For those the view itself becomes raw
+        # (shim: LAYOVER_RAW_FORMATS=24) and the shader reads it in place. That is only safe when every shader
+        # that reads t95 has a rewritten copy, so the copies are built from the game's executable before the
+        # first launch (shaderfix_seed) and the raw view is switched on only after that build was clean.
+        "inplace": ["1:95:rgb10a2"],
+        "raw_formats": [24],
+        "exe": "Spider-Man2.exe",
+        "what": "mid-distance city blocks (flat ground, missing streets and buildings), vertex paint and packed normals: read through raw views (typed views stop at 1 GB under D3DMetal)",
     },
 }
 TYPED2RAW = os.path.join(HERE, "tools", "typed2raw.py")
@@ -3644,6 +3659,79 @@ def _dxbc_uses(data, watch):
     return False
 
 
+def shaderfix_seed_stamp(appid):
+    return os.path.join(shaderfix_dirs(appid)[0], "seed.json")
+
+
+def shaderfix_raw_ready(appid, game=None):
+    """True when the copies were built from the installed executable without a failure: the shim may then
+    create the views named in raw_formats as raw views."""
+    fix = SHADERFIX.get(str(appid)) or {}
+    if not fix.get("raw_formats") or not fix.get("exe"):
+        return False
+    try:
+        with open(shaderfix_seed_stamp(appid)) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if st.get("failed") or not st.get("inplace"):
+        return False
+    game = game or find_any_game(str(appid))
+    root = game_root(game) if game else None
+    try:
+        e = os.stat(os.path.join(root, fix["exe"])) if root else None
+    except OSError:
+        e = None
+    return bool(e) and st.get("size") == e.st_size and st.get("mtime") == int(e.st_mtime)
+
+
+def shaderfix_seed(appid, game=None, quiet=True, force=False):
+    """Build the copies for every shader inside the game's executable that uses a watched register, once per
+    version of the executable. Returns (built, unchanged, failed) or None when there was nothing to do."""
+    fix = SHADERFIX.get(str(appid)) or {}
+    if not fix.get("exe") or not dxc_tools_present():
+        return None
+    game = game or find_any_game(str(appid))
+    root = game_root(game) if game else None
+    exe = os.path.join(root, fix["exe"]) if root else None
+    if not exe or not os.path.isfile(exe):
+        return None
+    e = os.stat(exe)
+    if not force and shaderfix_raw_ready(appid, game):
+        return None
+    import mmap, struct, tempfile
+    tmp = tempfile.mkdtemp(prefix="shaderseed-")
+    n = 0
+    try:
+        with open(exe, "rb") as f:
+            m = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            pos = 0
+            while True:
+                pos = m.find(b"DXBC", pos)
+                if pos < 0 or pos + 32 > len(m):
+                    break
+                ver, size = struct.unpack_from("<II", m, pos + 20)
+                if ver == 1 and 32 < size < 8_000_000 and pos + size <= len(m):
+                    data = m[pos:pos + size]
+                    if _dxbc_uses(data, fix["watch"]):
+                        with open(os.path.join(tmp, f"{n:05d}.dxbc"), "wb") as o:
+                            o.write(data)
+                        n += 1
+                    pos += size
+                else:
+                    pos += 4
+            m.close()
+        b, u, fl = shaderfix_build(appid, quiet=quiet, source=tmp) if n else (0, 0, 0)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    swap = shaderfix_dirs(appid)[0]
+    inplace = len([x for x in os.listdir(swap) if x.endswith(".inplace")]) if os.path.isdir(swap) else 0
+    os.makedirs(swap, exist_ok=True)
+    with open(shaderfix_seed_stamp(appid), "w") as f:
+        json.dump({"size": e.st_size, "mtime": int(e.st_mtime), "shaders": n, "failed": fl, "inplace": inplace}, f)
+    return (b, u, fl)
+
+
 def shaderfix_build(appid, quiet=True, source=None):
     """Build a replacement for every shader in the game's pending folder (or `source`, a folder of dumped
     .dxbc files). Returns (built, unchanged, failed)."""
@@ -3669,7 +3757,21 @@ def shaderfix_build(appid, quiet=True, source=None):
     for sp in fix["specs"]:
         f = sp.split(":")
         specs.append((int(f[0]), int(f[1]), f[2]) + tuple(int(x) for x in f[3:]))
+    inplace = []
+    for sp in fix.get("inplace", []):
+        f = sp.split(":")
+        inplace.append((int(f[0]), int(f[1]), f[2]))
     os.makedirs(swap, exist_ok=True)
+    if inplace:   # marks left by builds that had no in-place fallback yet
+        for name in os.listdir(swap):
+            if name.endswith(".skip"):
+                try:
+                    with open(os.path.join(swap, name)) as f:
+                        stale = f.read().startswith("no raw view")
+                    if stale:
+                        os.remove(os.path.join(swap, name))
+                except OSError:
+                    pass
     work = tempfile.mkdtemp(prefix="shaderfix-")
     env = dict(os.environ, DYLD_LIBRARY_PATH=os.path.join(DXC_DIR, "lib"))
     tool = lambda t: os.path.join(DXC_DIR, "bin", t)
@@ -3699,6 +3801,16 @@ def shaderfix_build(appid, quiet=True, source=None):
             why = "does not read through the typed views" if text is None else None
         except t2r.Unsupported as e:
             text, why = None, str(e)
+        in_place = False
+        if text is None and inplace and why and why.startswith("no raw view"):
+            try:   # no raw view in this shader: read the typed register in place (the shim makes that view raw)
+                with open(ll, encoding="utf-8", errors="surrogateescape") as f:
+                    text, stats = t2r.rewrite(f.read(), inplace)
+                in_place = text is not None
+                if text is None:
+                    why = "does not read through the typed views"
+            except t2r.Unsupported as e:
+                text, why = None, str(e)
         if text is None:
             with open(os.path.join(swap, h + ".skip"), "w") as f:
                 f.write(why + "\n")
@@ -3714,6 +3826,9 @@ def shaderfix_build(appid, quiet=True, source=None):
             if f.read(4) != b"DXBC":
                 return "failed"
         replace_file(out, os.path.join(swap, h + ".dxil"))
+        if in_place:
+            with open(os.path.join(swap, h + ".inplace"), "w") as f:
+                f.write("reads its typed register as a raw view\n")
         done()
         return "built"
 
@@ -3735,7 +3850,10 @@ def cmd_shaderfix(args):
             continue
         head(f"shader fix for {appid}: {fix['what']}")
         if not args.status:
+            seeded = None if args.source else shaderfix_seed(appid, quiet=False, force=True)
             b, u, f = shaderfix_build(appid, quiet=False, source=args.source)
+            if seeded:
+                b, u, f = b + seeded[0], u + seeded[1], f + seeded[2]
             if b or u or f:
                 (ok if not f else warn)(f"built {b}, needed no change {u}, failed {f}")
         c = shaderfix_counts(appid)
