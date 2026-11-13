@@ -522,6 +522,33 @@ static HRESULT STDMETHODCALLTYPE hook_CSC(IDXGIFactory *f, IUnknown *dev, DXGI_S
 static HRESULT STDMETHODCALLTYPE hook_CSCH(IDXGIFactory2 *f, IUnknown *dev, HWND w, const DXGI_SWAP_CHAIN_DESC1 *d, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fd, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCH(f, dev, w, d, fd, o, out); if (SUCCEEDED(hr)) diag_swapchain_queue(dev); if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
 static HRESULT STDMETHODCALLTYPE hook_CSCW(IDXGIFactory2 *f, IUnknown *dev, IUnknown *w, const DXGI_SWAP_CHAIN_DESC1 *d, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCW(f, dev, w, d, o, out); if (SUCCEEDED(hr)) diag_swapchain_queue(dev); if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
 static HRESULT STDMETHODCALLTYPE hook_CSCC(IDXGIFactory2 *f, IUnknown *dev, const DXGI_SWAP_CHAIN_DESC1 *d, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCC(f, dev, d, o, out); if (SUCCEEDED(hr)) diag_swapchain_queue(dev); if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
+// Window guard (2026-11-13, macOS 27.2.1): Spider-Man 2's borderless fullscreen window came up 72 px left of the
+// monitor (rect -72,0-3384,2234 on the 3456x2234 desktop; Mac window at x = -36 pt), so the picture was off centre
+// with a bare strip on the right. A plain WS_POPUP of the same size is placed correctly, so it is the game's own
+// start-up sequence under the new macOS; SetWindowPos back to the monitor origin sticks. Once a second: a visible,
+// caption-less top-level window of this process that is exactly monitor-sized but not at the monitor's origin is
+// moved onto it. Windowed play (caption, or any other size) is never touched. LAYOVER_WINDOW_GUARD=0 turns it off.
+static int guard_moves;
+static BOOL CALLBACK guard_enum(HWND h, LPARAM lp)
+{
+    DWORD pid = 0; RECT r; MONITORINFO mi = { sizeof mi };
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != GetCurrentProcessId() || !IsWindowVisible(h) || IsIconic(h)) return TRUE;
+    if ((GetWindowLongA(h, GWL_STYLE) & WS_CAPTION) == WS_CAPTION) return TRUE;
+    if (!GetWindowRect(h, &r) || !GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi)) return TRUE;
+    if (r.right - r.left != mi.rcMonitor.right - mi.rcMonitor.left || r.bottom - r.top != mi.rcMonitor.bottom - mi.rcMonitor.top) return TRUE;
+    if (r.left == mi.rcMonitor.left && r.top == mi.rcMonitor.top) return TRUE;
+    SetWindowPos(h, NULL, mi.rcMonitor.left, mi.rcMonitor.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    if (guard_moves++ < 20) NOTE("window guard: fullscreen window %p was at %ld,%ld, moved to the monitor origin %ld,%ld (%ldx%ld)", (void *)h, r.left, r.top, mi.rcMonitor.left, mi.rcMonitor.top, r.right - r.left, r.bottom - r.top);
+    return TRUE;
+}
+static DWORD WINAPI guard_thread(LPVOID arg) { for (;;) { Sleep(1000); EnumWindows(guard_enum, 0); } return 0; }
+static void install_window_guard(void)
+{
+    char v[16];
+    if (GetEnvironmentVariableA("LAYOVER_WINDOW_GUARD", v, sizeof v) && atoi(v) == 0) return;
+    CreateThread(NULL, 0, guard_thread, NULL, 0, NULL);
+}
 // LAYOVER_LIVE=<win path>: a small file the launcher rewrites while the game runs ("fps=40"; 0 = no cap). Read once
 // a second, so the cap follows the power source: unplug the Mac mid-game and the battery cap applies at once.
 static char live_path[MAX_PATH]; static int live_fps = -1;
@@ -1176,6 +1203,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         diag_install();
         shader_swap_install();
         { char exe[MAX_PATH]; GetModuleFileNameA(NULL, exe, sizeof exe); LOG("d3dlog loaded in %s (pid %lu) tsshim=%d verbose=%d", exe, (unsigned long)GetCurrentProcessId(), tsshim, verbose); }
+        install_window_guard();
         CreateThread(NULL, 0, stats_thread, NULL, 0, NULL);   // 5-second pool usage line always; the rest only when logging
     }
     return TRUE;

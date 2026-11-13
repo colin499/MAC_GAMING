@@ -120,6 +120,7 @@ DEFAULT_CONFIG = {
     # own lighter graphics settings for a battery launch and their normal ones back on the charger.
     "battery_fps_cap": 40,
     "battery_saver": True,     # the switch for all of the above
+    "launcher_click": True,    # click PLAY in a known launcher window (profiles with launcher.click; Fallout 4)
     "audiobuf": True,          # insert Highball's CoreAudio buffer fix (off if it causes trouble)
     "webhelper_wrapper": False,  # single-process CEF wrapper: needed on the old Wine Staging engine, not on this one
     # What D3DMetal calls the GPU. "apple": the adapter Wine registered in the prefix's registry
@@ -573,6 +574,12 @@ def effective_fps_cap(cfg, game=None, battery=None):
     """The cap for the current power source: fps_cap on the charger, the lower of fps_cap and battery_fps_cap
     on battery (battery_saver on)."""
     cap = game_fps_cap(cfg, game)
+    try:
+        ceiling = int((PROFILES.get(str(game)) or {}).get("max_fps") or 0)
+    except (TypeError, ValueError):
+        ceiling = 0
+    if ceiling and (not cap or cap > ceiling):
+        cap = ceiling          # a profile's hard ceiling (Fallout 4: physics break above 60 and its vsync is off)
     if battery is None:
         battery = on_battery()
     if not battery or not battery_saver_on(cfg, game):
@@ -849,6 +856,20 @@ MINGW_GCC = "/opt/homebrew/bin/x86_64-w64-mingw32-gcc"
 # can go into games.2651280.env in config.json or the prefix's windows/system32/d3d12shim.env.
 # (LAYOVER_MANAGED_MB=1022 was the earlier experiment: animates, but the city overflows 1 GB.)
 GAME_FIXES = {}
+
+
+def tool_exe(name):
+    """A small Windows helper from tools/dev/<name>.c, built with mingw into TOOLS when missing or older than
+    its source. Returns the path or None."""
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "dev", name + ".c")
+    exe = os.path.join(TOOLS, name + ".exe")
+    try:
+        os.makedirs(TOOLS, exist_ok=True)
+        if os.path.exists(MINGW_GCC) and os.path.isfile(src) and (not os.path.exists(exe) or os.path.getmtime(exe) < os.path.getmtime(src)):
+            subprocess.run([MINGW_GCC, "-O1", "-o", exe, src], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+    return exe if os.path.exists(exe) else None
 
 
 def d3d12_shim_binary():
@@ -2221,12 +2242,17 @@ PROFILES = {
                  "set": {"iSize W": "1728", "iSize H": "1117", "bFull Screen": "0", "bBorderless": "1", "bMaximizeWindow": "0",
                          "bVolumetricLightingEnable": "0", "iVolumetricLightingQuality": "1",
                          "fShadowDistance": "14000.0000", "fDirShadowDistance": "14000.0000", "iShadowMapResolution": "2048",
-                         "iPresentInterval": "1"}}],
-        "launcher": {"exe": "Fallout4Launcher.exe", "note": "click PLAY in the launcher window (a controller alone cannot)"},
+                         # 0: the game's own vsync stacked on DXMT's limiter gave HALF the cap (measured 2026-11-13 with the
+                         # Metal HUD log: cap 60 -> 33.3 ms frames, cap 40 -> 50 ms; with 0 -> 16.7 ms at cap 60)
+                         "iPresentInterval": "0"}}],
+        "max_fps": 60,   # vsync is off above, so DXMT's limiter is the only brake: never launch uncapped or above 60
+        "launcher": {"exe": "Fallout4Launcher.exe", "note": "Layover clicks PLAY in the launcher window for you",
+                     "class": "#32770", "title": "Fallout 4", "click": [697, 50]},
         "notes": [
             "Borderless 1728x1117 with god rays off and High shadows: the launcher's Ultra preset at the full panel played laggy and glitchy.",
             "If it is still laggy: launcher Options -> High preset (keep the resolution), then Medium shadows.",
-            "The Creation Engine's physics need 60 fps or less; keep the cap.",
+            "The Creation Engine's physics need 60 fps or less; Layover keeps the cap at 60 or below for this game.",
+            "The game's own vsync is off on purpose (it halved the frame rate together with the frame cap).",
         ],
     },
     "exe:*launcher*.exe": {
@@ -3526,11 +3552,38 @@ def cmd_watch(args):
         return
     shim = shim_log_path()
     w(f"watch: {name} is pid {pid}; shim log {shim or 'none'}")
-    try:
-        caf = subprocess.Popen(["caffeinate", "-d", "-i", "-w", str(pid)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    spec = (PROFILES.get(str(args.game)) or {}).get("launcher") or {}
+    if spec.get("click") and load_config().get("launcher_click", True):
+        # A launcher dialog with image buttons (Fallout 4): post a mouse click on PLAY so a controller is enough.
+        exe = tool_exe("clickwin")
+        if exe:
+            target = spec.get("class") or ("title=" + spec.get("title", ""))
+            for _ in range(30):
+                if wine(load_config(), [exe, target, str(spec["click"][0]), str(spec["click"][1]), "top"]) == 0:
+                    w(f"watch: clicked PLAY in the launcher ({spec.get('exe', '')})")
+                    break
+                time.sleep(2)
+            else:
+                w("watch: launcher window not found; click PLAY yourself")
+    def keep_awake(p):
+        try:
+            return subprocess.Popen(["caffeinate", "-d", "-i", "-w", str(p)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            return None
+
+    def successor():
+        """A launcher (Fallout4Launcher.exe) hands over to the game's own exe and exits: the watched pid dies
+        while the game goes on. Look for the game's process for a few seconds before calling it an exit."""
+        for _ in range(8):
+            p = game_host_pid()
+            if p and p != pid:
+                return p
+            time.sleep(1)
+        return None
+
+    caf = keep_awake(pid)
+    if caf:
         w("watch: display kept awake while the game runs (caffeinate)")
-    except OSError:
-        caf = None
     wcfg = load_config()
     live_cap = None
     last = None
@@ -3544,7 +3597,16 @@ def cmd_watch(args):
         try:
             os.kill(pid, 0)
         except OSError:
-            break
+            nxt = successor()
+            if not nxt:
+                break
+            w(f"watch: pid {pid} ended (launcher); {name} continues as pid {nxt}")
+            pid = nxt
+            if caf and caf.poll() is None:
+                caf.terminate()
+            caf = keep_awake(pid)
+            last = None; good = 0; stalled = False
+            continue
         batt = on_battery()
         cap = effective_fps_cap(wcfg, args.game, batt)
         if cap != live_cap:

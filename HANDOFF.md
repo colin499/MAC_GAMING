@@ -1,5 +1,70 @@
 # Handoff notes (2026-11-13: Spider-Man 2 flat ground fixed; 2026-11-12: battery saver + shader swap; 2026-11-01: library app + generic backend; 2026-10-31: symbiote stall root cause + pool fix)
 
+## macOS 27.2.1 (2026-11-13 afternoon): first run after the OS update
+
+The Mac went from macOS 15.7.9 to 27.2.1 (Darwin 27.2, build 26B131). Rosetta, Wine 10.0 Sikarugir, Steam login,
+D3DMetal 3.0 and every shim fix (pool fix, shader swap, fence hook, frame limiter) work unchanged; Spider-Man 2
+held the 40 fps battery cap from the first frames.
+
+**One regression: the fullscreen picture was off centre.** The game's borderless window (class `GameNxApp`,
+style 0x96080000) came up at rect -72,0-3384,2234 on the 3456x2234 Wine desktop (Mac window x = -36 pt), leaving
+a strip on the right. Not seen on macOS 15. A plain WS_POPUP of the same size is placed correctly (tested), and
+`SetWindowPos(0,0)` on the game's window sticks, so it comes from the game's own window start-up sequence under
+the new macOS; which step does it is NOT known. Fix: `guard_thread` in `shims/d3d12shim/d3d12.c` checks once a
+second and moves a caption-less, exactly monitor-sized window of the game back to the monitor origin (log line
+`window guard:`; `LAYOVER_WINDOW_GUARD=0` turns it off). Built 15:31; it loads at the next launch, so the guard
+itself is UNTESTED as of this note (the running session was corrected by hand with a throwaway exe). D3D11/DXMT
+games (Fallout 4) do not load this shim: if they show the same shift, the guard has to move somewhere generic.
+Mac-side window bounds can be read without Screen Recording permission through `CGWindowListCopyWindowInfo`
+(owner name "wine", bounds only).
+
+Second launch the same afternoon (15:41, through `layover play` + sendkey): the window came up at 0,0 by itself,
+so the guard had nothing to do (no `window guard:` line) and stays unexercised. The shift is intermittent; the
+first launch was started from the library app by the user.
+
+**Frame-rate drops with other apps in front are GPU sharing, not macOS 27.** Sampled every 5 s with the front
+app (`lsappinfo front`) and `ioreg -c IOAccelerator` "Device Utilization %": game in front = 40 fps in 42 of 42
+samples; Monk or Hubble in front = 34-40 fps; the user's cadgang app in front and rendering = GPU 100% and the
+game at 1-3 fps (shim prints STALL / RECOVERED around it, fence waits of 200-2000 ms). It recovers within
+seconds. So a STALL line on this Mac needs the front app checked before anything else.
+Also checked on 27.2.1: every read-only `layover` command, `layover shot`, `layover app --snapshot`, a rebuild of
+the Swift app with the 15.5 SDK, no Wine crash reports. NOT yet run on 27: the controller.
+
+Fallout 4 on 27.2.1 (15:49, launched by the user from the library app): Steam restarted for the DXMT fingerprint,
+DXMT created its device (feature level 11_0), the game window is 1728x1117 at 0,0 on both the Windows and the Mac
+side (centred, fills the screen), no crash report; about 23 W at the menu. Visual verdict from the user pending.
+**Watchdog bug fixed:** `layover watch` latched onto Fallout4Launcher.exe and logged "exited" when the launcher
+handed over to Fallout4.exe, so caffeinate and the live battery cap stopped 20 s into every Fallout 4 session.
+`cmd_watch` now looks for a successor game process for 8 s before calling it an exit (`successor()`); the handover
+path was exercised at 16:04 and 16:06 ("pid N ended (launcher); Fallout 4 continues as pid M").
+
+**Fallout 4 ran at HALF its frame cap (found and fixed 2026-11-13 16:00).** User: "some things seem slow".
+Measured with the Metal HUD log (see below): cap 40 (battery) -> every frame 50.0 ms = 20 fps; cap 60 -> 33.3 ms =
+30 fps, with only ~5 ms of GPU work per frame at the menu. Cause: the game's vsync (`iPresentInterval=1`) stacked
+on DXMT's `d3d11.preferredMaxFrameRate`. With `iPresentInterval=0` and cap 60: 16.7 ms frames, 59.8 fps. So the
+game had been at 30 fps since October and at 20 fps on battery since the battery saver (2026-11-12).
+`bAlwaysActive=1` made no difference (tried, reverted). Changes: PROFILES["377160"] sets `iPresentInterval=0`
+and `"max_fps": 60`, which `effective_fps_cap()` enforces as a ceiling (vsync off = DXMT's limiter is the only
+brake; physics break above 60). All of this was measured at the main menu with the game window BEHIND other apps;
+in-game, in front, is still to be measured (the user's play session with the HUD log on).
+
+**Measuring fps in DXMT games:** `layover game <id> env "MTL_HUD_ENABLED=1 MTL_HUD_LOG_ENABLED=1"`; the HUD then
+prints one line per second on the game's stderr = logs/steam-<stamp>.log:
+`metal-HUD: <first frame>,<?>,<memory MB>,<present interval ms>,<GPU ms>,...` (a pair per frame; in the unified
+log the pairs are <private>). `tools/dev/hud.py [seconds]` summarises fps, frame-time percentiles and GPU ms.
+Lines only appear while the game window is actually on screen (none while other apps cover it), and with
+MTL_HUD_LOG_ENABLED alone none appeared (window was covered then too, so that case is undecided). Remove the
+env again after measuring (`layover game 377160 env "MTL_HUD_ENABLED= MTL_HUD_LOG_ENABLED="`).
+
+**Launcher click automated.** `tools/dev/clickwin.c` (built into TOOLS by the new `tool_exe()`) posts
+WM_LBUTTONDOWN/UP to the launcher dialog itself (#32770 "Fallout 4", PLAY at client 697,50; the image buttons
+are Statics without SS_NOTIFY, so the dialog handles the click). `cmd_watch` does it when the profile's
+`launcher` has `click` (config `launcher_click`, default on); worked on three launches. A controller alone is
+now enough to get into Fallout 4.
+An agent cannot bring the game to the front on macOS 27: NSRunningApplication.activate returns true but does
+nothing, System Events is not authorised. Keys sent with sendkey.exe still reach the game in the background.
+A test run that loaded the save was closed with `taskkill /F` so the game wrote no exit save over the user's.
+
 Read this first if you are a new agent (or future me) picking up Layover.
 
 ## Spider-Man 2 flat ground / missing mid-distance blocks: FIXED 2026-11-13 (impostor shaders)
