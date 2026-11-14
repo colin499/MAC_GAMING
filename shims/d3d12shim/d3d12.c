@@ -39,6 +39,7 @@
 #include <stdint.h>
 
 void diag_view(int kind, ID3D12Resource *res, unsigned fmt, unsigned dim); void diag_install(void); void diag_present(IDXGISwapChain *sc); void diag_swapchain_queue(IUnknown *dev); void diag_shader(const void *code, SIZE_T len, const char *stage); void diag_shader_stream(const void *stream, SIZE_T size); int diag_dumping(void); long diag_dumped(void);
+int prof_active(void); void prof_install(void); void prof_cs_created(void *pso, unsigned long long hash, unsigned len); void prof_setpso(void *pso); int prof_dispatch(unsigned x, unsigned y, unsigned z); int prof_skip(int bit); void prof_live(const char *line); void prof_report(long frames);
 void shader_swap_install(void); const void *shader_swap_lookup(const void *code, SIZE_T len, SIZE_T *out_len); void shader_swap_result(int ok); int shader_swap_active(void); void shader_swap_stats(char *out, size_t cap);
 static int swap_bytecode(D3D12_SHADER_BYTECODE *b) { SIZE_T n; const void *alt = b->pShaderBytecode ? shader_swap_lookup(b->pShaderBytecode, b->BytecodeLength, &n) : NULL; if (!alt) return 0; b->pShaderBytecode = alt; b->BytecodeLength = n; return 1; }
 static HMODULE real_dll;
@@ -123,7 +124,7 @@ static UINT64 res_width(ID3D12Resource *r) { D3D12_RESOURCE_DESC d; if (!r) retu
 
 // ---- counters dumped periodically --------------------------------------------------------
 static ID3D12Resource *pool_res; static UINT64 pool_width; static volatile LONG64 pool_hw; static volatile LONG pool_oob, pool_copies;
-static volatile LONG c_present, c_present_paced, c_fence_sleeps; static volatile LONG64 c_fence_polls;   // polls overflow a LONG in an hour
+static volatile LONG c_present, c_present_paced, c_present_gpubound, c_fence_sleeps; static volatile LONG64 c_fence_polls;   // polls overflow a LONG in an hour
 static volatile LONG fence_hist[8]; static volatile LONG64 fence_episodes; static int fence_sleep = 3;   // fence wait hook (see below); 3 = event wait
 // frame timing per stats window (reset by stats_thread): ticks inside the real Present, inside
 // ExecuteCommandLists, the longest gap between two presents and the longest fence-wait episode
@@ -198,6 +199,7 @@ static DWORD WINAPI stats_thread(LPVOID arg)
         es = InterlockedExchange64(&t_execl_sum, 0); em = InterlockedExchange64(&t_execl_max, 0);
         gm = InterlockedExchange64(&t_gap_max, 0); fm = InterlockedExchange64(&t_fence_max, 0);
         fps10 = dp * 2;   // frames per 5 s = tenths of fps
+        prof_report(dp);
         if (qpc_freq && (dp || de)) LOG("frame: %ld.%ld fps | present avg %.2f max %.1f ms | gap max %.1f ms | execlists %ld avg %.2f max %.1f ms | fence wait max %.1f ms",
             fps10 / 10, fps10 % 10, dp ? ps * 1000.0 / qpc_freq / dp : 0.0, pm * 1000.0 / qpc_freq, gm * 1000.0 / qpc_freq, de, de ? es * 1000.0 / qpc_freq / de : 0.0, em * 1000.0 / qpc_freq, fm * 1000.0 / qpc_freq);
         // stall detector: the game ran at 20+ fps for 30 s and now does under 8 fps (LAYOVER_STALL_FPS) ->
@@ -207,8 +209,8 @@ static DWORD WINAPI stats_thread(LPVOID arg)
         if (pool_res) { char sk[300], pf[300]; sm2_skin_stats(sk, sizeof sk); NOTE("pool: high-water %llu MB of %llu, copies %ld, past-end %ld | %s", (unsigned long long)(pool_hw >> 20), (unsigned long long)(pool_width >> 20), pool_copies, pool_oob, sk); pool_fix_stats(pf, sizeof pf); NOTE("%s", pf); }
         { char sw[300]; shader_swap_stats(sw, sizeof sw); if (sw[0]) NOTE("%s", sw); }
         if (fence_sleep) LOG("fence waits: episodes=%lld hist(<50us %ld, <200us %ld, <1ms %ld, <4ms %ld, <16ms %ld, <64ms %ld, <256ms %ld, more %ld) polls=%lld slept=%ld", (long long)fence_episodes, fence_hist[0], fence_hist[1], fence_hist[2], fence_hist[3], fence_hist[4], fence_hist[5], fence_hist[6], fence_hist[7], (long long)c_fence_polls, c_fence_sleeps);
-        LOG("stats: presents=%ld (paced %ld) fence-polls=%lld (slept %ld) execlists=%ld dispatch=%ld dispatchmesh=%ld draw=%ld drawidx=%ld execind=%ld copybuf=%ld setpso=%ld map=%ld barrier=%ld | views srv_buf=%ld uav_buf=%ld srv_tex=%ld uav_tex=%ld | pso gfx=%ld cs=%ld gen=%ld FAIL=%ld | res buf=%ld tex=%ld",
-            c_present, c_present_paced, (long long)c_fence_polls, c_fence_sleeps, c_execlists, c_dispatch, c_dispatchmesh, c_draw, c_drawidx, c_execind, c_copybuf, c_setpso, c_map, c_barrier, c_srv_buf, c_uav_buf, c_srv_tex, c_uav_tex, c_pso_gfx, c_pso_cs, c_pso_gen, c_pso_fail, c_res_buf, c_res_tex);
+        LOG("stats: presents=%ld (paced %ld, under the cap %ld) fence-polls=%lld (slept %ld) execlists=%ld dispatch=%ld dispatchmesh=%ld draw=%ld drawidx=%ld execind=%ld copybuf=%ld setpso=%ld map=%ld barrier=%ld | views srv_buf=%ld uav_buf=%ld srv_tex=%ld uav_tex=%ld | pso gfx=%ld cs=%ld gen=%ld FAIL=%ld | res buf=%ld tex=%ld",
+            c_present, c_present_paced, c_present_gpubound, (long long)c_fence_polls, c_fence_sleeps, c_execlists, c_dispatch, c_dispatchmesh, c_draw, c_drawidx, c_execind, c_copybuf, c_setpso, c_map, c_barrier, c_srv_buf, c_uav_buf, c_srv_tex, c_uav_tex, c_pso_gfx, c_pso_cs, c_pso_gen, c_pso_fail, c_res_buf, c_res_tex);
     }
     return 0;
 }
@@ -458,13 +460,134 @@ static void install_vram_cap(void)
 static UINT64 fps_period;            // QPC ticks per frame; 0 = limiter off
 static UINT64 fps_next;              // QPC tick at which the next present may return
 static CRITICAL_SECTION fps_lock;
+// ---- auto pace (LAYOVER_AUTO_PACE=1; default OFF) ----------------------------------------------------
+// EXPERIMENT, off by default: it works as built (settles on 40 in a scene that cannot hold 60 and stays
+// there), but its premise only holds with the game's VSync ON. With VSync off (Layover's setting for
+// Spider-Man 2) the HUD log shows frame intervals that are NOT multiples of the 8.33 ms refresh, and the
+// game running free at ~47 fps had tighter frame times than the same scene capped to 40.
+// Premise: when presents land on the panel's refresh grid and the GPU cannot finish a frame inside the
+// cap's period, the picture alternates between 2, 3 and 4 refreshes per frame, which looks far worse than
+// the average fps says. So the cap steps down to the next rate that divides the refresh rate evenly
+// (60 -> 40 -> 30) while the game cannot hold it and back up when it can again:
+//   down: two 2 s windows in a row whose frame rate is more than 7% under the cap (single frame intervals
+//         are too uneven to judge by: at a GPU-bound 47 fps a 40 cap still has a third of them over 27 ms);
+//   up:   N windows in a row (N = 4; doubled, up to 64, each time a step up fails within 15 s) in which
+//         95% of the frames were finished ON THE GPU within 95% of the faster period, counted from the
+//         moment the game started on the frame. "Finished on the GPU" is a fence of our own signalled on
+//         the swapchain's queue after each Present and timed by pace_thread.
+#define PACE_RING 256
+static int pace_auto = 0, pace_tiers[4], pace_ntiers, pace_tier;
+static ID3D12CommandQueue *pace_q; static ID3D12Fence *pace_fence; static HANDLE pace_event;
+static volatile LONG64 pace_start[PACE_RING], pace_up_ticks;
+static volatile LONG pace_n, pace_done_n, pace_done_slow;
+static UINT64 pace_fence_value(void) { return real_GetCompletedValue ? real_GetCompletedValue(pace_fence) : pace_fence->lpVtbl->GetCompletedValue(pace_fence); }
+static DWORD WINAPI pace_thread(LPVOID arg)
+{
+    UINT64 seen = 0;
+    for (;;) {
+        UINT64 v, now; LONG64 start, up;
+        if (FAILED(pace_fence->lpVtbl->SetEventOnCompletion(pace_fence, seen + 1, pace_event))) { Sleep(500); continue; }
+        WaitForSingleObject(pace_event, 500);
+        v = pace_fence_value(); now = now_ticks();
+        if (v == ~(UINT64)0) { Sleep(1000); continue; }      // device removed
+        if (v <= seen) continue;
+        start = pace_start[v % PACE_RING]; up = pace_up_ticks; seen = v;
+        if (start && (LONG64)now > start) { InterlockedIncrement(&pace_done_n); if (up && (LONG64)now - start > up * 95 / 100) InterlockedIncrement(&pace_done_slow); }
+    }
+    return 0;
+}
+static void pace_queue(IUnknown *q)      // the queue the game's swapchain presents on
+{
+    ID3D12CommandQueue *cq = NULL; ID3D12Device *dev = NULL; ID3D12Fence *f = NULL;
+    if (!pace_auto || pace_q || !q) return;
+    if (FAILED(q->lpVtbl->QueryInterface(q, &IID_ID3D12CommandQueue, (void **)&cq)) || !cq) return;
+    if (FAILED(cq->lpVtbl->GetDevice(cq, &IID_ID3D12Device, (void **)&dev)) || !dev) { cq->lpVtbl->Release(cq); return; }
+    if (SUCCEEDED(dev->lpVtbl->CreateFence(dev, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&f)) && f && (pace_event = CreateEventA(NULL, FALSE, FALSE, NULL))) {
+        pace_fence = f; pace_q = cq; CreateThread(NULL, 0, pace_thread, NULL, 0, NULL);
+        NOTE("frame limiter: auto pace armed on queue %p (steps %d/%d/%d/%d fps)", (void *)cq, pace_tiers[0], pace_tiers[1], pace_tiers[2], pace_tiers[3]);
+    } else { if (f) f->lpVtbl->Release(f); cq->lpVtbl->Release(cq); }
+    dev->lpVtbl->Release(dev);
+}
+static void pace_rebase(int fps)         // the cap changed (launch, power source): the steps below it; call with fps_lock held or before threads start
+{
+    DEVMODEA dm; int hz = 0, n = 0, k;
+    memset(&dm, 0, sizeof dm); dm.dmSize = sizeof dm;
+    if (EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm)) hz = (int)dm.dmDisplayFrequency;
+    memset(pace_tiers, 0, sizeof pace_tiers);
+    if (fps > 0) {
+        pace_tiers[n++] = fps;
+        if (pace_auto && hz >= 50 && hz % fps == 0)
+            for (k = hz / fps + 1; n < 4 && hz / k >= 30; k++) if (hz % k == 0) pace_tiers[n++] = hz / k;
+    }
+    pace_ntiers = n; pace_tier = 0; pace_up_ticks = 0;
+}
+static void pace_set(int tier, int late, int frames, LONG done, LONG slow)
+{
+    int from = pace_tiers[pace_tier];
+    EnterCriticalSection(&fps_lock);
+    pace_tier = tier; fps_period = qpc_freq / (UINT64)pace_tiers[tier]; fps_next = 0;
+    pace_up_ticks = tier > 0 ? (LONG64)(qpc_freq / (UINT64)pace_tiers[tier - 1]) : 0;
+    LeaveCriticalSection(&fps_lock);
+    NOTE("frame limiter: auto pace %d -> %d fps (last 2 s: %d.%d fps over %d frames; %ld of %ld too slow on the GPU for the step above)", from, pace_tiers[tier], late / 10, late % 10, frames, slow, done);
+}
+static void pace_frame(UINT64 now)       // once per presented frame, on the presenting thread, before the limiter sleeps
+{
+    static UINT64 prev, win_t0, last_up, busy; static int frames, late, bad, good, need_good = 4, base_seen;
+    LONG dn, ds;
+    if (pace_ntiers < 2) return;
+    if (base_seen != pace_tiers[0]) { base_seen = pace_tiers[0]; prev = win_t0 = last_up = busy = 0; frames = late = bad = good = 0; need_good = 4; }
+    if (prev && now - prev < qpc_freq / 2) { frames++; busy += now - prev; }   // gaps over 0.5 s are loading, not pacing
+    prev = now;
+    if (!win_t0) win_t0 = now;
+    if (now - win_t0 < 2 * qpc_freq) return;
+    dn = InterlockedExchange(&pace_done_n, 0); ds = InterlockedExchange(&pace_done_slow, 0);
+    if (frames >= 20) {
+        late = (int)((UINT64)frames * qpc_freq * 10 / busy);            // achieved fps x 10 over the frames counted
+        if (late * 100 < pace_tiers[pace_tier] * 930) { bad++; good = 0; }
+        else { bad = 0; if (pace_tier > 0 && dn >= 20 && ds * 100 <= dn * 5) good++; else good = 0; }
+        if (bad >= 2 && pace_tier < pace_ntiers - 1) {
+            if (last_up && now - last_up < 15 * qpc_freq && need_good < 64) need_good *= 2;
+            last_up = 0; bad = 0; pace_set(pace_tier + 1, late, frames, dn, ds);
+        } else if (good >= need_good) { good = 0; last_up = now; pace_set(pace_tier - 1, late, frames, dn, ds); }
+        else if (last_up && now - last_up > 60 * qpc_freq) { last_up = 0; need_good = 4; }
+    }
+    frames = late = 0; busy = 0; win_t0 = now;
+}
+static void fps_pace_inner(void);
 static void fps_pace(void)
+{
+    fps_pace_inner();
+    if (pace_q) pace_start[(pace_n + 1) % PACE_RING] = (LONG64)now_ticks();   // the game starts on the next frame now
+}
+static void fps_pace_inner(void)
 {
     LARGE_INTEGER c; UINT64 now, target;
     if (!fps_period) return;
     QueryPerformanceCounter(&c); now = (UINT64)c.QuadPart;
+    // The cap only acts while the game really runs at the cap. In a scene that cannot reach it the game is paced
+    // by its own waits on the GPU, and a sleep here comes on top of those whenever one frame happens to be early:
+    // measured in a 46 fps fight under a 60 cap, frame times jumped by 7-8 ms from one frame to the next (pairs
+    // like 39 + 6 ms) where the same scene with no cap changed by 1-2 ms. So: half-second windows; under 93% of
+    // the cap = stand aside, over 102% while standing aside = pace again. (Tried first, no use: "is the previous
+    // frame still on the GPU at Present" through a fence of our own; the game has already waited for it by then.)
+    {
+        static UINT64 w_t0; static int w_n, standing_aside;
+        w_n++; if (!w_t0) w_t0 = now;
+        if (now - w_t0 >= qpc_freq / 2) {
+            UINT64 rate100 = (UINT64)w_n * qpc_freq * 100 / (now - w_t0), cap100 = qpc_freq * 100 / fps_period;
+            if (!standing_aside && rate100 * 100 < cap100 * 93) standing_aside = 1;
+            else if (standing_aside && rate100 * 100 > cap100 * 102) standing_aside = 0;
+            w_t0 = now; w_n = 0;
+        }
+        if (pace_q && pace_ntiers >= 2) { LONG n = InterlockedIncrement(&pace_n); pace_q->lpVtbl->Signal(pace_q, pace_fence, (UINT64)n); }
+        if (standing_aside && pace_ntiers < 2) { InterlockedIncrement(&c_present_gpubound); fps_next = 0; return; }
+    }
+    pace_frame(now);
     EnterCriticalSection(&fps_lock);
-    if (!fps_next || now > fps_next + fps_period) fps_next = now;   // first frame, or we are already slower than the cap: resync
+    // A frame that arrives after its slot starts a new grid from now: no debt. (Until 2026-11-13 a late frame
+    // shortened the waits after it to keep the average exact; measured in a fight that cannot hold the cap,
+    // that turned 43 ms + 25 ms into 43 + 18 + 16: frame times of 9-51 ms where the uncapped game gave 21-26.)
+    if (!fps_next || now >= fps_next) fps_next = now;
     target = fps_next; fps_next += fps_period;
     LeaveCriticalSection(&fps_lock);
     if (now >= target) return;
@@ -518,10 +641,10 @@ typedef HRESULT (STDMETHODCALLTYPE *PFN_CSCH)(IDXGIFactory2 *, IUnknown *, HWND,
 typedef HRESULT (STDMETHODCALLTYPE *PFN_CSCW)(IDXGIFactory2 *, IUnknown *, IUnknown *, const DXGI_SWAP_CHAIN_DESC1 *, IDXGIOutput *, IDXGISwapChain1 **);
 typedef HRESULT (STDMETHODCALLTYPE *PFN_CSCC)(IDXGIFactory2 *, IUnknown *, const DXGI_SWAP_CHAIN_DESC1 *, IDXGIOutput *, IDXGISwapChain1 **);
 static PFN_CSC real_CSC; static PFN_CSCH real_CSCH; static PFN_CSCW real_CSCW; static PFN_CSCC real_CSCC;
-static HRESULT STDMETHODCALLTYPE hook_CSC(IDXGIFactory *f, IUnknown *dev, DXGI_SWAP_CHAIN_DESC *d, IDXGISwapChain **out) { HRESULT hr = real_CSC(f, dev, d, out); if (SUCCEEDED(hr)) diag_swapchain_queue(dev); if (SUCCEEDED(hr) && out && *out) patch_swapchain(*out); return hr; }
-static HRESULT STDMETHODCALLTYPE hook_CSCH(IDXGIFactory2 *f, IUnknown *dev, HWND w, const DXGI_SWAP_CHAIN_DESC1 *d, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fd, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCH(f, dev, w, d, fd, o, out); if (SUCCEEDED(hr)) diag_swapchain_queue(dev); if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
-static HRESULT STDMETHODCALLTYPE hook_CSCW(IDXGIFactory2 *f, IUnknown *dev, IUnknown *w, const DXGI_SWAP_CHAIN_DESC1 *d, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCW(f, dev, w, d, o, out); if (SUCCEEDED(hr)) diag_swapchain_queue(dev); if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
-static HRESULT STDMETHODCALLTYPE hook_CSCC(IDXGIFactory2 *f, IUnknown *dev, const DXGI_SWAP_CHAIN_DESC1 *d, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCC(f, dev, d, o, out); if (SUCCEEDED(hr)) diag_swapchain_queue(dev); if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
+static HRESULT STDMETHODCALLTYPE hook_CSC(IDXGIFactory *f, IUnknown *dev, DXGI_SWAP_CHAIN_DESC *d, IDXGISwapChain **out) { HRESULT hr = real_CSC(f, dev, d, out); if (SUCCEEDED(hr)) { diag_swapchain_queue(dev); pace_queue(dev); } if (SUCCEEDED(hr) && out && *out) patch_swapchain(*out); return hr; }
+static HRESULT STDMETHODCALLTYPE hook_CSCH(IDXGIFactory2 *f, IUnknown *dev, HWND w, const DXGI_SWAP_CHAIN_DESC1 *d, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fd, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCH(f, dev, w, d, fd, o, out); if (SUCCEEDED(hr)) { diag_swapchain_queue(dev); pace_queue(dev); } if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
+static HRESULT STDMETHODCALLTYPE hook_CSCW(IDXGIFactory2 *f, IUnknown *dev, IUnknown *w, const DXGI_SWAP_CHAIN_DESC1 *d, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCW(f, dev, w, d, o, out); if (SUCCEEDED(hr)) { diag_swapchain_queue(dev); pace_queue(dev); } if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
+static HRESULT STDMETHODCALLTYPE hook_CSCC(IDXGIFactory2 *f, IUnknown *dev, const DXGI_SWAP_CHAIN_DESC1 *d, IDXGIOutput *o, IDXGISwapChain1 **out) { HRESULT hr = real_CSCC(f, dev, d, o, out); if (SUCCEEDED(hr)) { diag_swapchain_queue(dev); pace_queue(dev); } if (SUCCEEDED(hr) && out && *out) patch_swapchain((IDXGISwapChain *)*out); return hr; }
 // Window guard (2026-11-13, macOS 27.2.1): Spider-Man 2's borderless fullscreen window came up 72 px left of the
 // monitor (rect -72,0-3384,2234 on the 3456x2234 desktop; Mac window at x = -36 pt), so the picture was off centre
 // with a bare strip on the right. A plain WS_POPUP of the same size is placed correctly, so it is the game's own
@@ -563,8 +686,9 @@ static DWORD WINAPI live_thread(LPVOID arg)
             if (f) {
                 while (fgets(line, sizeof line, f)) {
                     int n;
+                    prof_live(line);
                     if (sscanf(line, "fps=%d", &n) == 1 && n != live_fps && (n == 0 || (n >= 15 && n <= 240))) {
-                        EnterCriticalSection(&fps_lock); fps_period = n ? qpc_freq / (UINT64)n : 0; fps_next = 0; LeaveCriticalSection(&fps_lock);
+                        EnterCriticalSection(&fps_lock); fps_period = n ? qpc_freq / (UINT64)n : 0; fps_next = 0; pace_rebase(n); LeaveCriticalSection(&fps_lock);
                         NOTE("frame limiter: live cap %d -> %d fps (%s)", live_fps, n, live_path); live_fps = n;
                     }
                 }
@@ -589,6 +713,8 @@ static void install_fps_limiter(void)
     if (fps <= 0 && !live && GetEnvironmentVariableA("LAYOVER_SHOT_DIR", NULL, 0) == 0) return;
     InitializeCriticalSection(&fps_lock);
     fps_period = fps > 0 ? qpc_freq / (UINT64)fps : 0; live_fps = fps;
+    if (GetEnvironmentVariableA("LAYOVER_AUTO_PACE", v, sizeof v)) pace_auto = atoi(v) != 0;
+    pace_rebase(fps);
     if (live) CreateThread(NULL, 0, live_thread, NULL, 0, NULL);
     dxgi = LoadLibraryA("dxgi.dll"); cdf1 = dxgi ? (PFN_CDF1_)GetProcAddress(dxgi, "CreateDXGIFactory1") : NULL;
     if (!cdf1 || FAILED(cdf1(&IID_IDXGIFactory1, (void **)&f)) || !f) { NOTE("frame limiter: no DXGI factory (dxgi %p); cap not applied", (void *)dxgi); fps_period = 0; return; }
@@ -786,7 +912,14 @@ static HRESULT STDMETHODCALLTYPE hook_CreateGraphicsPipelineState(ID3D12Device *
     else if (verbose && d) LOG("CreateGraphicsPipelineState ok vs=%016llx ps=%016llx", (unsigned long long)fnv(d->VS.pShaderBytecode, d->VS.BytecodeLength), (unsigned long long)fnv(d->PS.pShaderBytecode, d->PS.BytecodeLength));
     return hr;
 }
+static HRESULT STDMETHODCALLTYPE hook_CreateComputePipelineState_inner(ID3D12Device *dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC *d, REFIID riid, void **out);
 static HRESULT STDMETHODCALLTYPE hook_CreateComputePipelineState(ID3D12Device *dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC *d, REFIID riid, void **out)
+{
+    HRESULT hr = hook_CreateComputePipelineState_inner(dev, d, riid, out);
+    if (SUCCEEDED(hr) && d && out && *out && prof_active()) prof_cs_created(*out, (unsigned long long)fnv(d->CS.pShaderBytecode, d->CS.BytecodeLength), (unsigned)d->CS.BytecodeLength);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE hook_CreateComputePipelineState_inner(ID3D12Device *dev, const D3D12_COMPUTE_PIPELINE_STATE_DESC *d, REFIID riid, void **out)
 {
     HRESULT hr; const void *alt; SIZE_T alt_len; const char *alt_name = "?";
     if (d) diag_shader(d->CS.pShaderBytecode, d->CS.BytecodeLength, "cs");
@@ -997,9 +1130,9 @@ static void STDMETHODCALLTYPE hook_ResolveQueryData(ID3D12GraphicsCommandList *l
     memcpy(r->cpu + off, h->values + start, (size_t)bytes);
     list->lpVtbl->CopyBufferRegion(list, dst, offset, r->buffer, off, bytes);
 }
-static void STDMETHODCALLTYPE hook_Dispatch(ID3D12GraphicsCommandList *l, UINT x, UINT y, UINT z) { InterlockedIncrement(&c_dispatch); real_Dispatch(l, x, y, z); }
-static void STDMETHODCALLTYPE hook_DrawInstanced(ID3D12GraphicsCommandList *l, UINT a, UINT b, UINT c, UINT d) { InterlockedIncrement(&c_draw); real_DrawInstanced(l, a, b, c, d); }
-static void STDMETHODCALLTYPE hook_DrawIndexedInstanced(ID3D12GraphicsCommandList *l, UINT a, UINT b, UINT c, INT d, UINT e) { InterlockedIncrement(&c_drawidx); real_DrawIndexedInstanced(l, a, b, c, d, e); }
+static void STDMETHODCALLTYPE hook_Dispatch(ID3D12GraphicsCommandList *l, UINT x, UINT y, UINT z) { InterlockedIncrement(&c_dispatch); if (prof_dispatch(x, y, z)) return; real_Dispatch(l, x, y, z); }
+static void STDMETHODCALLTYPE hook_DrawInstanced(ID3D12GraphicsCommandList *l, UINT a, UINT b, UINT c, UINT d) { InterlockedIncrement(&c_draw); if (prof_skip(2)) return; real_DrawInstanced(l, a, b, c, d); }
+static void STDMETHODCALLTYPE hook_DrawIndexedInstanced(ID3D12GraphicsCommandList *l, UINT a, UINT b, UINT c, INT d, UINT e) { InterlockedIncrement(&c_drawidx); if (prof_skip(4)) return; real_DrawIndexedInstanced(l, a, b, c, d, e); }
 static void STDMETHODCALLTYPE hook_CopyBufferRegion(ID3D12GraphicsCommandList *l, ID3D12Resource *d, UINT64 doff, ID3D12Resource *s, UINT64 soff, UINT64 n)
 {
     InterlockedIncrement(&c_copybuf);
@@ -1014,7 +1147,7 @@ static void STDMETHODCALLTYPE hook_CopyBufferRegion(ID3D12GraphicsCommandList *l
     if (pool_res && s == pool_res && soff + n > pool_width) { LONG k = InterlockedIncrement(&pool_oob); if (k <= 10) NOTE("COPY FROM PAST POOL END: src offset %llu + %llu", (unsigned long long)soff, (unsigned long long)n); }
     real_CopyBufferRegion(l, d, doff, s, soff, n);
 }
-static void STDMETHODCALLTYPE hook_SetPipelineState(ID3D12GraphicsCommandList *l, ID3D12PipelineState *p) { InterlockedIncrement(&c_setpso); real_SetPipelineState(l, p); }
+static void STDMETHODCALLTYPE hook_SetPipelineState(ID3D12GraphicsCommandList *l, ID3D12PipelineState *p) { InterlockedIncrement(&c_setpso); prof_setpso(p); real_SetPipelineState(l, p); }
 static void STDMETHODCALLTYPE hook_ResourceBarrier(ID3D12GraphicsCommandList *l, UINT n, const D3D12_RESOURCE_BARRIER *b) { InterlockedIncrement(&c_barrier); real_ResourceBarrier(l, n, b); }
 static void STDMETHODCALLTYPE hook_DispatchMesh(ID3D12GraphicsCommandList6 *l, UINT x, UINT y, UINT z) { InterlockedIncrement(&c_dispatchmesh); real_DispatchMesh(l, x, y, z); }
 static struct { ID3D12CommandSignature *sig; LONG n; } sigs[64];
@@ -1200,7 +1333,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         install_logpoints();
         sm2_skin_install();
         pool_fix_install(inst);
-        diag_install();
+        diag_install(); prof_install();
         shader_swap_install();
         { char exe[MAX_PATH]; GetModuleFileNameA(NULL, exe, sizeof exe); LOG("d3dlog loaded in %s (pid %lu) tsshim=%d verbose=%d", exe, (unsigned long)GetCurrentProcessId(), tsshim, verbose); }
         install_window_guard();

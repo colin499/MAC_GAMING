@@ -2225,7 +2225,8 @@ PROFILES = {
     "2651280": {   # Marvel's Spider-Man 2 (DirectX 12 -> D3DMetal + Layover's d3d12 shim; see HANDOFF.md)
         "settings": {"fps_cap": 60},
         "notes": [
-            "In the game: preset Medium or High, FSR Quality (not Dynamic), dynamic resolution target off or 60, VSync off. The 60 fps cap comes from Layover.",
+            "In the game: resolution 1728x1117, FSR Quality, Medium shadows, VSync off (the 60 fps cap comes from Layover). Measured 2026-11-13 in a rainy fight: 47 fps; with 2992x1934 FSR Quality + Ultra shadows that part of the game played at 23-33.",
+            "About 14 ms of GPU time per frame does not depend on resolution on this Mac, so a higher output resolution costs frame rate fast: 2624x1640 FSR Performance = 41 fps, 2992x1934 FSR Performance = 34 fps in that fight. XeSS does not render under D3DMetal; no upscaling is the slowest of all.",
             "The first run of every area is slower while D3DMetal compiles shaders; it smooths out on the second visit.",
             "Symbiote scenes need the pool-fix shaders (layover sm2-shaders, once); `layover flight` says whether they are built.",
             "A game update changes the executable: the shim turns its patches off until it is updated for the new build (HANDOFF.md).",
@@ -3392,6 +3393,24 @@ def game_host_pid():
     return None
 
 
+def background_cpu():
+    """CPU % of macOS's own background workers (media analysis, Spotlight, text understanding, photo analysis).
+    They run when the Mac counts as idle and take CPU and GPU time from a game; see user_active() in cmd_watch."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pcpu=,comm="], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return 0.0
+    total = 0.0
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and re.search(r"mediaanalysisd|spotlightknowledged|textunderstandingd|photoanalysisd|/mdworker|/mds_stores", parts[1]):
+            try:
+                total += float(parts[0])
+            except ValueError:
+                pass
+    return total
+
+
 def metal_compiler_cpu():
     """CPU % of Apple's Metal shader compiler services right now (MTLCompilerService processes). High while
     the game runs = shaders being compiled (a stall with this high is a compile storm, not the GPU)."""
@@ -3571,6 +3590,17 @@ def cmd_watch(args):
         except OSError:
             return None
 
+    def user_active():
+        """Tell macOS the user is at the machine (IOPMAssertionDeclareUserActivity through caffeinate -u) for the
+        next few seconds. Controller input and keys sent inside Wine do not reset macOS's idle timer, and an "idle"
+        Mac on the charger starts its background work in the middle of a game: on 2026-11-13 (the day of the
+        macOS 27 update) mediaanalysisd + Spotlight ran at ~300% CPU with a GPU client during unattended test
+        runs and dropped to 0% within 20 s of this call. Called every 5 s while the game presents frames."""
+        try:
+            subprocess.Popen(["caffeinate", "-u", "-t", "7"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+
     def successor():
         """A launcher (Fallout4Launcher.exe) hands over to the game's own exe and exits: the watched pid dies
         while the game goes on. Look for the game's process for a few seconds before calling it an exit."""
@@ -3617,6 +3647,8 @@ def cmd_watch(args):
         cur = shim_presents(shim) if shim else None
         if cur and last and cur[1] != last[1]:
             fps = (cur[0] - last[0]) / 5.0
+            if fps >= 5:
+                user_active()
             if fps >= 20:
                 good = min(good + 1, 6)
                 if stalled:
@@ -3645,7 +3677,8 @@ def cmd_watch(args):
             pct, state = battery()
             thr = cpu_throttle()
             mtl = metal_compiler_cpu()
-            w(f"health: {fps:.1f} fps | game {process_rss_mb(pid)} MB | host free {free} MB | battery {pct}% {state or ''}" + (f" | cpu limit {thr}%" if thr not in (None, 100) else "") + (f" | shader compiler {mtl:.0f}%" if mtl >= 5 else ""))
+            bg = background_cpu()
+            w(f"health: {fps:.1f} fps | game {process_rss_mb(pid)} MB | host free {free} MB | battery {pct}% {state or ''}" + (f" | cpu limit {thr}%" if thr not in (None, 100) else "") + (f" | shader compiler {mtl:.0f}%" if mtl >= 5 else "") + (f" | macOS background work {bg:.0f}% CPU" if bg >= 50 else ""))
     w(f"watch: {name} exited")
     if str(args.game) in SHADERFIX:
         try:

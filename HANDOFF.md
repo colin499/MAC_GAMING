@@ -1,6 +1,6 @@
-# Handoff notes (2026-11-13: Spider-Man 2 flat ground fixed; 2026-11-12: battery saver + shader swap; 2026-11-01: library app + generic backend; 2026-10-31: symbiote stall root cause + pool fix)
+# Handoff notes (2026-11-13 evening: Spider-Man 2 freeze + frame-rate study; 2026-11-13: Spider-Man 2 flat ground fixed; 2026-11-12: battery saver + shader swap; 2026-11-01: library app + generic backend; 2026-10-31: symbiote stall root cause + pool fix)
 
-## Spider-Man 2 hard freeze + lag (2026-11-13 20:18, freeze cause NOT found)
+## Spider-Man 2 hard freeze + lag (2026-11-13 20:18; freeze cause NOT found, lag = resolution, see the table)
 
 User: "it just froze" (sound kept playing), and "a little laggy" before that.
 * Freeze: shim log d3d12-2026-11-13_19-39-58.log, FREEZE reports 1-3; presents and ExecuteCommandLists stop for
@@ -9,11 +9,61 @@ User: "it just froze" (sound kept playing), and "a little laggy" before that.
   `ucomiss; jbe` back to exe+0x518d480, which never exits on a NaN). So a game-side maths loop, not D3D, not the
   shim, not memory (13 GB free), not GPU sharing. First FREEZE line in any log. Whether Rosetta/our patches feed
   it the bad value is unknown. If it repeats: compare the tid 2580 RIPs and the place in the game.
-* Lag: on the charger at cap 60 the game ran 23-33 fps all evening with frame gaps over 1 s every few minutes
-  (fence waits of seconds). The user's settings were 2992x1934, FSR Quality, Ultra shadows, VSync on. Changed in
-  the registry at 20:22 (game closed): UpscaleQuality 3 -> 1, ShadowQuality 5 -> 2, VSync 1 -> 0 (the measured
-  battery-profile pair, now also on the charger). Result NOT measured yet. Saves backed up first:
-  backups/sm2-saves-2026-11-13_2022.
+* Lag: on the charger at cap 60 the game ran 23-33 fps all evening. The user's settings were 2992x1934, FSR
+  Quality, Ultra shadows, VSync on. Saves backed up first: backups/sm2-saves-2026-11-13_2022.
+
+### What the frame rate depends on (measured 2026-11-13 evening; tools/dev/bench.sh, mbench.sh)
+
+Method: `layover game 2651280 env "MTL_HUD_ENABLED=1 MTL_HUD_LOG_ENABLED=1"` works for D3DMetal too; the HUD log
+(logs/steam-*.log, tools/dev/hud.py) gives GPU ms per frame. `bench.sh TAG "Name=dword ..."` sets Graphics
+registry values, launches, Continues the autosave, measures and restores the saves; `mbench.sh` does the same at
+the main menu (a steady 3D scene, no save touched, 2 min per run). The autosave of that evening is a rainy fight
+("Wake Up: Defeat the Hunters"); unattended, the player dies and reloads every ~25 s (a 1.5 s gap each time,
+same model-load burst as the user's own 1 s hitches: those are deaths/checkpoint loads, not a fault).
+
+GPU ms per frame in that fight (median; the game is GPU-bound, GPU 85-97% busy, game CPU ~480%):
+| output | upscale | internal | GPU ms | fps |
+| 2992x1934 | FSR Performance | 1496x967 | 29.2 | 34 |
+| 2624x1640 | FSR Performance | 1312x820 | 24.2 | 41 |
+| 1728x1117 | FSR Quality | 1152x744 | 21.2 | 47 |
+| 1728x1117 | FSR Balanced | 1016x657 | 19.9 | 50 |
+| 1728x1117 | FSR Performance | 864x558 | 18.7 | 53 |
+Fits GPU ms = 14.3 + 6.7 x internal megapixels + 0.63 x output megapixels: **about 14 ms per frame is fixed**,
+so 60 fps is out of reach in heavy scenes at any resolution, and Ultra -> Medium shadows + Quality -> Performance
+alone bought only 26 -> 32 fps. Main menu: 24.5 ms at 2992 Performance, 16.6 ms at 1728 Performance, 49.8 ms
+with no upscaling at 2992 (UpscaleMethod 0 and 2 both log "None"), 26.9 ms WITHOUT the shim (so the shim, pool
+fix and shader swap cost nothing measurable). UpscaleMethod 3 = FSR, 4 = XeSS (renders nothing under D3DMetal).
+Where the fixed part goes (shims/d3d12shim/prof.c, `LAYOVER_PROF=1`, switches work off through live.env; menu at
+21.2 ms): no Dispatch 20.2, no DrawInstanced 19.9, no DrawIndexedInstanced 14.8, none of the three 5.6. So it is
+not the 320-620 compute dispatches per frame and not one pass; it is spread over the frame. Not pursued further.
+
+**Settings now in the registry (the user's own values, not a profile): 1728x1117, FSR Quality, Medium shadows,
+VSync off.** Fight: 47 fps (was 23-33). Before: FullscreenWidth/Height 2992x1934, UpscaleQuality 3,
+ShadowQuality 5, VSync 1.
+
+### macOS background work during play (fixed in `layover watch`)
+
+Unattended runs showed mediaanalysisd + Spotlight + textunderstandingd at ~300% CPU (mediaanalysisd holds a GPU
+client): macOS counted the Mac as idle (HIDIdleTime 985 s; keys sent inside Wine do not count, and a controller
+probably does not either) on the day of the OS update. `caffeinate -u` (declare user activity) brought them to 0%
+within 20 s. `cmd_watch` now calls `user_active()` every 5 s while the game presents frames; verified: 0% for a
+whole run. The health line shows "macOS background work N% CPU" when it is 50% or more. Whether this was part of
+the user's lag is NOT known (mediaanalysisd's CPU time that day fits the unattended runs alone).
+Pausing the daemons with SIGSTOP was refused by the permission system; do not retry.
+
+### Frame limiter changes (shim, built and installed)
+
+* A late frame starts a new grid (no debt). The old limiter shortened the waits after a late frame.
+* The cap stands aside while the game runs under 93% of it (half-second windows; back on over 102%). Stats line:
+  "presents=N (paced A, under the cap B)".
+* `LAYOVER_AUTO_PACE=1` (default OFF): steps the cap 60 -> 40 -> 30 while the game cannot hold it and back up
+  (GPU-finish time through a fence of our own on the swapchain queue). Works mechanically (settled on 40 at the
+  menu and in the fight, no flapping), but showed no benefit with VSync off, so it stays an experiment.
+* OPEN: frame-to-frame evenness. Three uncapped runs at 20:58-21:10 changed by ~1 ms from frame to frame (HUD
+  intervals); every run after 21:10 changed by 7-8 ms (pairs like 39 + 6 ms) at the same average fps, with the
+  old shim or the new one, cap 60 or no cap, indexing busy or at 0%. So it is not the limiter and not the
+  indexing; what changed at 21:10 is not known (machine state?). First thing to re-measure on a fresh boot:
+  `CAP=0 tools/dev/bench.sh X ""` then the frame-to-frame change of the HUD intervals.
 
 ## macOS 27.2.1 (2026-11-13 afternoon): first run after the OS update
 
