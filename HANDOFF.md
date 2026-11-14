@@ -1,5 +1,20 @@
 # Handoff notes (2026-11-13: Spider-Man 2 flat ground fixed; 2026-11-12: battery saver + shader swap; 2026-11-01: library app + generic backend; 2026-10-31: symbiote stall root cause + pool fix)
 
+## Spider-Man 2 hard freeze + lag (2026-11-13 20:18, freeze cause NOT found)
+
+User: "it just froze" (sound kept playing), and "a little laggy" before that.
+* Freeze: shim log d3d12-2026-11-13_19-39-58.log, FREEZE reports 1-3; presents and ExecuteCommandLists stop for
+  good at ~20:18:28, GPU idle, 95 threads waiting, ONE thread (tid 2580) spinning at 110% CPU inside the game's
+  own SSE float code (exe+0x518f99f / +0x518fa7d / +0x5190e35: a hull/support-point style loop whose exit test is
+  `ucomiss; jbe` back to exe+0x518d480, which never exits on a NaN). So a game-side maths loop, not D3D, not the
+  shim, not memory (13 GB free), not GPU sharing. First FREEZE line in any log. Whether Rosetta/our patches feed
+  it the bad value is unknown. If it repeats: compare the tid 2580 RIPs and the place in the game.
+* Lag: on the charger at cap 60 the game ran 23-33 fps all evening with frame gaps over 1 s every few minutes
+  (fence waits of seconds). The user's settings were 2992x1934, FSR Quality, Ultra shadows, VSync on. Changed in
+  the registry at 20:22 (game closed): UpscaleQuality 3 -> 1, ShadowQuality 5 -> 2, VSync 1 -> 0 (the measured
+  battery-profile pair, now also on the charger). Result NOT measured yet. Saves backed up first:
+  backups/sm2-saves-2026-11-13_2022.
+
 ## macOS 27.2.1 (2026-11-13 afternoon): first run after the OS update
 
 The Mac went from macOS 15.7.9 to 27.2.1 (Darwin 27.2, build 26B131). Rosetta, Wine 10.0 Sikarugir, Steam login,
